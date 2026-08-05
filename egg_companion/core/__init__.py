@@ -1,0 +1,1 @@
+"""Pure companion decision logic."""

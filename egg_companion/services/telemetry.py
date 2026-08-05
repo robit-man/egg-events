@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import numpy as np
+
+from egg_companion.config import CameraConfig, EggConfig
+from egg_companion.models import Observation
+from egg_companion.services.scene import SceneInventory
+
+
+@dataclass
+class CameraTelemetry:
+    camera_id: str
+    source: str
+    configured_rotation: int | str
+    resolved_rotation: int | None = None
+    frame_jpeg: bytes | None = None
+    frame_sequence: int = 0
+    frame_shape: tuple[int, int, int] | None = None
+    fps: float | None = None
+    detections: list[dict[str, object]] = field(default_factory=list)
+    detection_sequence: int = 0
+    inference_fps: float | None = None
+    last_detection_monotonic: float | None = None
+    semantic_labels: list[str] = field(default_factory=list)
+    updated_at: str | None = None
+    detections_updated_at: str | None = None
+
+
+class RuntimeTelemetry:
+    """Thread-safe, non-identifying state exposed by the local dashboard."""
+
+    def __init__(self, config: EggConfig) -> None:
+        self._lock = threading.RLock()
+        self._cameras = {
+            camera.id: CameraTelemetry(
+                camera.id,
+                camera.source,
+                camera.rotation_degrees,
+                camera.rotation_degrees if isinstance(camera.rotation_degrees, int) else None,
+            )
+            for camera in config.cameras
+            if camera.enabled
+        }
+        self._waveform: list[float] = []
+        self._waveform_sample_count = config.audio.waveform_samples
+        self._waveform_sequence = 0
+        self._waveform_updated_at: str | None = None
+        self._audio_rms: float | None = None
+        self._vad_speech = False
+        self._vad_speech_ratio = 0.0
+        self._vad_speech_ms = 0
+        self._latest_transcript: str | None = None
+        self._latest_transcript_at: str | None = None
+        self._transcript_count = 0
+        self._transcript_history: list[dict[str, object]] = []
+        self._asr = {
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+            "last_rejection": None,
+            "last_rejected_at": None,
+            "last_metadata": {},
+        }
+        self._latest_reply: str | None = None
+        self._runtime_errors: list[dict[str, str]] = []
+        self._object_learning = {
+            "stable_candidates": 0,
+            "duplicate_candidates": 0,
+            "clip_queries": 0,
+            "clip_recalls": 0,
+            "vlm_requests": 0,
+            "vlm_successes": 0,
+            "vlm_rejections": 0,
+            "vlm_errors": 0,
+            "speech_deferrals": 0,
+            "last_stage": "idle",
+            "last_detail": None,
+            "updated_at": None,
+        }
+        self._memory = {"accepted_events": 0, "closed_episodes": 0, "last_accepted": False, "last_closed": 0}
+        self._attention_decisions: list[dict[str, object]] = []
+        self._interaction_decisions: list[dict[str, object]] = []
+        self._consolidation: dict[str, object] = {}
+        self._retrieval_hits: list[dict[str, object]] = []
+        self._microphone_direction: float | None = None
+        self._scene = SceneInventory()
+
+    def set_rotation(self, camera_id: str, angle: int) -> None:
+        with self._lock:
+            self._cameras[camera_id].resolved_rotation = angle
+
+    def record_audio(self, rms: float, speech: bool, speech_ratio: float, speech_ms: int) -> None:
+        self.record_audio_state(rms, speech, speech_ratio, speech_ms)
+
+    def record_audio_state(self, rms: float, speech: bool, speech_ratio: float, speech_ms: int) -> None:
+        with self._lock:
+            self._audio_rms = round(rms, 5)
+            self._vad_speech = speech
+            self._vad_speech_ratio = round(speech_ratio, 3)
+            self._vad_speech_ms = speech_ms
+
+    def record_waveform(self, samples: np.ndarray) -> None:
+        if samples.size:
+            indices = np.linspace(0, samples.size - 1, num=min(self._waveform_sample_count, samples.size), dtype=int)
+            waveform = samples[indices].round(4).tolist()
+            rms = float(np.sqrt(np.mean(np.square(samples))))
+        else:
+            waveform = []
+            rms = 0.0
+        with self._lock:
+            self._waveform = waveform
+            self._audio_rms = round(rms, 5)
+            self._waveform_sequence += 1
+            self._waveform_updated_at = datetime.now(timezone.utc).isoformat()
+
+    def waveform_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "sequence": self._waveform_sequence,
+                "samples": list(self._waveform),
+                "rms": self._audio_rms,
+                "updated_at": self._waveform_updated_at,
+            }
+
+    def record_transcript(self, transcript: str, metadata: dict[str, object] | None = None) -> None:
+        with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            self._latest_transcript = transcript
+            self._latest_transcript_at = now
+            self._transcript_count += 1
+            self._asr["accepted"] = int(self._asr["accepted"]) + 1
+            self._asr["last_metadata"] = dict(metadata or {})
+            self._transcript_history.append(
+                {"text": transcript[:300], "at": now, "metadata": dict(metadata or {})}
+            )
+            self._transcript_history = self._transcript_history[-8:]
+
+    def record_asr_rejection(self, reason: str, metadata: dict[str, object] | None = None) -> None:
+        with self._lock:
+            self._asr["rejected"] = int(self._asr["rejected"]) + 1
+            self._asr["last_rejection"] = reason[:160]
+            self._asr["last_rejected_at"] = datetime.now(timezone.utc).isoformat()
+            self._asr["last_metadata"] = dict(metadata or {})
+
+    def record_asr_error(self, error: BaseException) -> None:
+        with self._lock:
+            self._asr["errors"] = int(self._asr["errors"]) + 1
+        self.record_runtime_error("asr", error)
+
+    def record_object_learning(self, stage: str, detail: object | None = None) -> None:
+        counter_by_stage = {
+            "stable_candidate": "stable_candidates",
+            "duplicate_candidate": "duplicate_candidates",
+            "clip_query": "clip_queries",
+            "clip_recall": "clip_recalls",
+            "vlm_request": "vlm_requests",
+            "vlm_success": "vlm_successes",
+            "vlm_rejection": "vlm_rejections",
+            "vlm_error": "vlm_errors",
+            "speech_deferral": "speech_deferrals",
+        }
+        with self._lock:
+            counter = counter_by_stage.get(stage)
+            if counter:
+                self._object_learning[counter] = int(self._object_learning[counter]) + 1
+            self._object_learning["last_stage"] = stage
+            self._object_learning["last_detail"] = None if detail is None else str(detail)[:160]
+            self._object_learning["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    def record_reply(self, reply: str) -> None:
+        with self._lock:
+            self._latest_reply = reply
+
+    def record_runtime_error(self, component: str, detail: str | BaseException) -> None:
+        if isinstance(detail, BaseException):
+            message = str(detail).strip()
+            formatted = f"{type(detail).__name__}: {message}" if message else type(detail).__name__
+        else:
+            formatted = detail.strip() or "unspecified error"
+        with self._lock:
+            self._runtime_errors.append(
+                {
+                    "component": component,
+                    "detail": formatted[:300],
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            self._runtime_errors = self._runtime_errors[-8:]
+
+    def record_memory(
+        self,
+        accepted: bool,
+        closed: int,
+        accepted_events: int,
+        closed_episodes: int,
+        lifecycle: dict[str, object] | None = None,
+    ) -> None:
+        with self._lock:
+            self._memory = {
+                "accepted_events": accepted_events,
+                "closed_episodes": closed_episodes,
+                "last_accepted": accepted,
+                "last_closed": closed,
+                "lifecycle": dict(lifecycle or {}),
+            }
+
+    def record_retrieval(self, hits: list[dict[str, object]]) -> None:
+        with self._lock:
+            self._retrieval_hits = [dict(hit) for hit in hits]
+
+    def record_attention(self, target_id: str, label: str, decision) -> None:
+        with self._lock:
+            self._attention_decisions.append(
+                {
+                    "target_id": target_id,
+                    "label": label,
+                    "capture_priority": decision.capture_priority,
+                    "allow_outward_speech": decision.allow_outward_speech,
+                    "components": dict(decision.components),
+                    "reason": decision.reason,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            self._attention_decisions = self._attention_decisions[-20:]
+
+    def record_interaction(self, allowed: bool, reason: str, transcript: str, response: str) -> None:
+        with self._lock:
+            self._interaction_decisions.append(
+                {
+                    "allowed": allowed,
+                    "reason": reason,
+                    "transcript": transcript[:160],
+                    "response": response[:160],
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            self._interaction_decisions = self._interaction_decisions[-20:]
+
+    def record_consolidation(self, result: dict[str, object]) -> None:
+        with self._lock:
+            self._consolidation = dict(result)
+            self._consolidation["at"] = datetime.now(timezone.utc).isoformat()
+
+    def record_observation(self, observation: Observation) -> None:
+        detections = [
+            {
+                "label": detection.label,
+                "confidence": round(detection.confidence, 3),
+                "bbox": [round(value, 1) for value in (detection.bbox.x1, detection.bbox.y1, detection.bbox.x2, detection.bbox.y2)],
+                "mask_polygon": detection.attributes.get("mask_polygon"),
+                "behavior": detection.attributes.get("behavior"),
+                "identity": detection.attributes.get("identity"),
+                "identity_confidence": detection.attributes.get("identity_confidence"),
+                "identity_recalled": detection.attributes.get("identity_recalled"),
+                "identity_sightings": detection.attributes.get("identity_sightings"),
+                "identity_outcome": detection.attributes.get("identity_outcome"),
+                "identity_confidence_components": detection.attributes.get("identity_confidence_components"),
+                "base_label": detection.attributes.get("base_label"),
+                "object_id": detection.attributes.get("object_id"),
+                "object_recall_confidence": detection.attributes.get("object_recall_confidence"),
+                "object_label_source": detection.attributes.get("object_label_source"),
+                "object_evidence_count": detection.attributes.get("object_evidence_count"),
+                "object_label_provenance": detection.attributes.get("object_label_provenance"),
+                "object_confidence_components": detection.attributes.get("object_confidence_components"),
+            }
+            for detection in observation.detections
+        ]
+        with self._lock:
+            camera = self._cameras[observation.camera_id]
+            now = time.monotonic()
+            if camera.last_detection_monotonic is not None:
+                camera.inference_fps = round(
+                    1 / max(now - camera.last_detection_monotonic, 0.001), 2
+                )
+            camera.last_detection_monotonic = now
+            camera.detection_sequence += 1
+            camera.detections = detections
+            camera.semantic_labels = list(observation.semantic_labels)
+            camera.detections_updated_at = datetime.now(timezone.utc).isoformat()
+            self._microphone_direction = observation.microphone_direction
+            self._scene.update(observation)
+
+    def record_frame(self, camera_id: str, frame_jpeg: bytes, frame_shape: tuple[int, int, int], fps: float) -> None:
+        with self._lock:
+            camera = self._cameras[camera_id]
+            camera.frame_jpeg = frame_jpeg
+            camera.frame_sequence += 1
+            camera.frame_shape = frame_shape
+            camera.fps = round(fps, 1)
+            camera.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def next_uncertain_observation(self) -> dict[str, object] | None:
+        with self._lock:
+            item = self._scene.next_uncertain()
+            if item is None:
+                return None
+            return {
+                "id": item.track_id,
+                "label": item.label,
+                "confidence": round(item.detection.confidence, 3),
+                "object_id": item.detection.attributes.get("object_id"),
+                "label_source": item.detection.attributes.get("object_label_source"),
+            }
+
+    def pending_observation(self) -> dict[str, object] | None:
+        with self._lock:
+            item = self._scene.pending()
+            if item is None:
+                return None
+            return {
+                "id": item.track_id,
+                "label": item.label,
+                "confidence": round(item.detection.confidence, 3),
+                "object_id": item.detection.attributes.get("object_id"),
+                "label_source": item.detection.attributes.get("object_label_source"),
+            }
+
+    def resolve_observation_correction(self, decision: str, label: str | None = None) -> dict[str, object] | None:
+        with self._lock:
+            item = self._scene.resolve_pending(decision, label)
+            if item is None:
+                return None
+            return {
+                "id": item.track_id,
+                "label": item.label,
+                "confidence": round(item.detection.confidence, 3),
+                "object_id": item.detection.attributes.get("object_id"),
+                "label_source": item.detection.attributes.get("object_label_source"),
+            }
+
+    def dismiss_pending_observation(self) -> None:
+        with self._lock:
+            self._scene.dismiss_pending()
+
+    def record_calibration_frame(
+        self, camera_id: str, frame_jpeg: bytes, frame_shape: tuple[int, int, int], fps: float
+    ) -> None:
+        with self._lock:
+            camera = self._cameras[camera_id]
+            camera.frame_jpeg = frame_jpeg
+            camera.frame_sequence += 1
+            camera.frame_shape = frame_shape
+            camera.fps = round(fps, 1)
+            camera.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def frame(self, camera_id: str) -> bytes | None:
+        with self._lock:
+            camera = self._cameras.get(camera_id)
+            return camera.frame_jpeg if camera else None
+
+    def frame_snapshot(self, camera_id: str) -> tuple[int, bytes] | None:
+        with self._lock:
+            camera = self._cameras.get(camera_id)
+            if camera is None or camera.frame_jpeg is None:
+                return None
+            return camera.frame_sequence, camera.frame_jpeg
+
+    def snapshot(self, config: EggConfig) -> dict[str, object]:
+        with self._lock:
+            cameras = [
+                {
+                    "id": camera.camera_id,
+                    "source": camera.source,
+                    "configured_rotation": camera.configured_rotation,
+                    "resolved_rotation": camera.resolved_rotation,
+                    "frame_shape": camera.frame_shape,
+                    "fps": camera.fps,
+                    "frame_sequence": camera.frame_sequence,
+                    "detection_sequence": camera.detection_sequence,
+                    "inference_fps": camera.inference_fps,
+                    "detections": camera.detections,
+                    "semantic_labels": camera.semantic_labels,
+                    "updated_at": camera.updated_at,
+                    "detections_updated_at": camera.detections_updated_at,
+                    "raw_frame_url": f"/api/cameras/{camera.camera_id}/raw.jpg",
+                    "raw_stream_url": f"/api/cameras/{camera.camera_id}/stream.mjpg",
+                    "frame_url": f"/api/cameras/{camera.camera_id}/raw.jpg",
+                }
+                for camera in self._cameras.values()
+            ]
+            seen = self._scene.snapshot()
+            return {
+                "cameras": cameras,
+                "waveform": self._waveform,
+                "waveform_sequence": self._waveform_sequence,
+                "waveform_updated_at": self._waveform_updated_at,
+                "audio_rms": self._audio_rms,
+                "microphone_direction": self._microphone_direction,
+                "vad": {
+                    "speech": self._vad_speech,
+                    "speech_ratio": self._vad_speech_ratio,
+                    "speech_ms": self._vad_speech_ms,
+                },
+                "latest_transcript": self._latest_transcript,
+                "latest_transcript_at": self._latest_transcript_at,
+                "transcript_count": self._transcript_count,
+                "transcript_history": list(self._transcript_history),
+                "asr": dict(self._asr),
+                "latest_reply": self._latest_reply,
+                "runtime_errors": list(self._runtime_errors),
+                "object_learning": dict(self._object_learning),
+                "memory": dict(self._memory),
+                "attention_decisions": list(self._attention_decisions),
+                "interaction_decisions": list(self._interaction_decisions),
+                "consolidation": dict(self._consolidation),
+                "retrieval_hits": list(self._retrieval_hits),
+                "seen": seen,
+                "pending_observation": (
+                    {"id": item.track_id, "label": item.label, "confidence": round(item.detection.confidence, 3)}
+                    if (item := self._scene.pending())
+                    else None
+                ),
+                "voice": {
+                    "asr_segment_seconds": config.transcription.segment_seconds,
+                    "asr_rms_threshold": config.transcription.rms_threshold,
+                    "asr_model": config.transcription.asr_model,
+                    "tts_model": config.omnius.voice_model,
+                    "tts_voice": config.omnius.voice_name,
+                    "asr_input": f"ReSpeaker DSP ASR channel {config.audio.asr_channel}",
+                },
+            }

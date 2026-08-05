@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$root_dir"
+if [[ -z "${EGG_OMNIUS_TOKEN:-}" && -r "$HOME/.omnius/api.key" ]]; then
+  export EGG_OMNIUS_TOKEN="$(tr -d '\r\n' < "$HOME/.omnius/api.key")"
+fi
+if [[ "${1:-}" == "bootstrap" ]]; then exec "$root_dir/scripts/bootstrap-jetson.sh"; fi
+gpu_runtime_status="unknown"
+for gpu_status_path in /sys/devices/platform/17000000.gpu/power/runtime_status /sys/devices/platform/gpu.0/power/runtime_status; do
+  if [[ -r "$gpu_status_path" ]]; then
+    gpu_runtime_status="$(<"$gpu_status_path")"
+    break
+  fi
+done
+if [[ "$gpu_runtime_status" == "error" || "$gpu_runtime_status" == "unsupported" ]]; then
+  echo "Jetson GPU runtime PM reports '$gpu_runtime_status'; continuing in degraded mode while the dashboard reports the diagnostic." >&2
+fi
+needs_bootstrap=0
+if [[ ! -x "$root_dir/.venv/bin/python" ]]; then
+  needs_bootstrap=1
+elif ! "$root_dir/.venv/bin/python" - <<'PY'
+import importlib.util
+import torch
+required = ("ultralytics", "open_clip", "sounddevice", "usb", "webrtcvad")
+raise SystemExit(not torch.cuda.is_available() or any(importlib.util.find_spec(name) is None for name in required))
+PY
+then
+  needs_bootstrap=1
+fi
+if [[ ! -s "$root_dir/models/sam2.1_t.pt" || ! -s "$root_dir/models/face_recognition_sface_2021dec.onnx" || ! -s "$root_dir/models/yoloe-11s-seg-pf.pt" || ! -s "$root_dir/models/yolo11n-pose.pt" ]]; then
+  needs_bootstrap=1
+fi
+if ! command -v ollama >/dev/null 2>&1 || ! ollama show robit/ornith-vision:9b >/dev/null 2>&1; then
+  needs_bootstrap=1
+fi
+asr_python="$HOME/.omnius/runtimes/asr/transcribe-cli-node/node_modules/transcribe-cli/.venv/bin/python"
+asr_library_path="$HOME/.local/opt/egg-ctranslate2-cuda/lib:/usr/local/cuda/targets/aarch64-linux/lib"
+if [[ ! -x "$asr_python" ]] || ! LD_LIBRARY_PATH="$asr_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$asr_python" - <<'PY'
+import ctranslate2
+raise SystemExit(ctranslate2.get_cuda_device_count() < 1)
+PY
+then
+  needs_bootstrap=1
+fi
+if [[ "$needs_bootstrap" == 1 ]]; then
+  if ! "$root_dir/scripts/bootstrap-jetson.sh"; then
+    echo "Bootstrap could not complete; continuing with installed components while the dashboard shows diagnostics." >&2
+  fi
+fi
+respeaker_ready=0
+for attempt in $(seq 1 15); do
+  if EGG_RESPEAKER_PYTHON="$root_dir/.venv/bin/python" "$root_dir/scripts/configure-respeaker-aec.sh"; then
+    respeaker_ready=1
+    break
+  fi
+  echo "ReSpeaker DSP route unavailable on attempt $attempt/15; retrying in 2 seconds." >&2
+  sleep 2
+done
+if [[ "$respeaker_ready" == 0 ]]; then
+  echo "ReSpeaker hardware DSP configuration failed; the hardware audit will report it." >&2
+fi
+if [[ $# -eq 0 ]]; then
+  exec "$root_dir/.venv/bin/python" -m egg_companion --config "$root_dir/config/egg.yaml" serve
+fi
+
+case "$1" in
+  test)
+    exec "$root_dir/.venv/bin/python" -m pytest -q
+    ;;
+  audit|run|serve|memory-audit|trace|evaluate|memory)
+    exec "$root_dir/.venv/bin/python" -m egg_companion --config "$root_dir/config/egg.yaml" "$@"
+    ;;
+  *)
+    exec "$root_dir/.venv/bin/python" -m egg_companion --config "$root_dir/config/egg.yaml" serve "$@"
+    ;;
+esac

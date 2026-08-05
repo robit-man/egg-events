@@ -1,0 +1,147 @@
+# All physical camera mounts are rotated 90 degrees clockwise before inference.
+cameras:
+  - id: camera-video1
+    source: /dev/video1
+    rotation_degrees: 90
+  - id: camera-video2
+    source: /dev/video2
+    rotation_degrees: 90
+  - id: camera-video3
+    source: /dev/video3
+    rotation_degrees: 90
+camera_discovery:
+  enabled: true
+  source_glob: /dev/video*
+  fps: 8
+  rotation_degrees: 90
+
+vision:
+  # YOLOE provides open-vocabulary instance segmentation, not rectangle-only detection.
+  detector_model: models/yoloe-11s-seg-pf.pt
+  pose_model: models/yolo11n-pose.pt
+  clip_model: ViT-B-32
+  clip_pretrained: laion2b_s34b_b79k
+  device: cuda
+  confidence_threshold: 0.45
+  sam_model: models/sam2.1_t.pt
+  sam_image_size: 640
+  sface_model: models/face_recognition_sface_2021dec.onnx
+  # Capture stays smooth while GPU inference is rate-limited per camera.
+  analysis_fps: 2
+  pose_fps: 0.75
+  semantic_fps: 0.25
+  dashboard_fps: 8
+  dashboard_max_width: 960
+  max_instances: 24
+  minimum_detector_classes: 1000
+
+audio:
+  # Pulse/PipeWire default source is the ReSpeaker 4 Mic Array multichannel input.
+  input_device: default
+  output_device: default
+  doa_mode: respeaker_usb
+  respeaker_vendor_id: 10374
+  respeaker_product_id: 24
+  sample_rate: 16000
+  channels: 6
+  # 6-channel firmware: channel 0 is the ReSpeaker DSP/AEC ASR stream.
+  asr_channel: 0
+  asr_target_rms: 0.12
+  asr_max_gain: 48
+  waveform_fps: 30
+  waveform_samples: 256
+
+transcription:
+  segment_seconds: 3
+  rms_threshold: 0.001
+  asr_model: medium
+  vad_aggressiveness: 1
+  vad_input_gain: 1
+  vad_min_speech_ms: 450
+  vad_min_speech_ratio: 0.15
+  vad_min_contiguous_ms: 180
+  vad_min_voiced_rms: 0.008
+
+omnius:
+  base_url: http://127.0.0.1:11435
+  model: omnius-qwen35-9b:latest
+  vision_model: robit/ornith-vision:9b
+  vision_base_url: http://127.0.0.1:11434
+  voice_model: supertonic
+  voice_name: F4
+  bearer_token_env: EGG_OMNIUS_TOKEN
+  timeout_seconds: 120
+
+attention:
+  max_targets: 1
+  track_ttl_seconds: 10
+  min_priority: 0.35
+  greeting_cooldown_seconds: 45
+  proactive_speech_enabled: false
+
+identity:
+  enabled: true
+  storage_dir: data/identity-library
+  similarity_threshold: 0.88
+  face_similarity_threshold: 0.45
+  sample_interval_seconds: 15
+
+object_learning:
+  enabled: true
+  storage_dir: data/object-library
+  similarity_threshold: 0.86
+  auto_label_enabled: true
+  auto_label_confidence_threshold: 0.68
+  auto_label_min_confidence: 0.70
+  auto_label_cooldown_seconds: 6
+  recall_interval_seconds: 0.75
+  recall_cache_seconds: 12
+  auto_label_max_retries: 2
+  auto_label_failure_backoff_seconds: 10
+  vlm_max_image_size: 512
+  stable_candidate_frames: 3
+  speech_priority_seconds: 8
+
+memory:
+  enabled: true
+  storage_dir: data/cognitive-memory
+  migration_mode: dual_write
+  retain_raw_media: true
+  raw_media_retention_hours: 72
+  episode_min_seconds: 1
+  episode_max_seconds: 90
+  retrieval_limit: 12
+  graph_max_hops: 2
+  graph_max_nodes: 80
+  context_max_characters: 5000
+  consolidation_interval_seconds: 300
+  consolidation_batch_size: 20
+
+event_segmentation:
+  inactivity_seconds: 8
+  entity_change_threshold: 0.45
+  semantic_change_threshold: 0.45
+  doa_change_degrees: 35
+  speech_boundary_seconds: 1
+
+cognitive_attention:
+  new_entity_weight: 0.35
+  action_change_weight: 0.20
+  speech_weight: 0.30
+  prediction_error_weight: 0.15
+  interruption_threshold: 0.75
+  proactive_rate_limit_seconds: 90
+  uncertainty_question_budget_per_hour: 4
+
+privacy:
+  persistent_identity_enabled: true
+  profile_retention_days: 30
+  evidence_retention_days: 30
+  export_enabled: true
+  deletion_enabled: true
+
+runtime:
+  event_queue_size: 8
+  speech_queue_size: 4
+  reasoning_queue_size: 4
+  log_level: INFO

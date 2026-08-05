@@ -1,0 +1,37 @@
+{
+  "event_boundaries": {
+    "expected": [10.0, 30.0, 55.0],
+    "predicted": [10.1, 29.8, 55.2],
+    "tolerance_seconds": 0.5,
+    "static_event_count": 1,
+    "static_duration_seconds": 300
+  },
+  "identity": [
+    {"truth_id": "person-a", "predicted_id": "person-001", "confirmed": true},
+    {"truth_id": "person-a", "predicted_id": "person-001", "confirmed": true},
+    {"truth_id": "person-b", "predicted_id": "person-002", "confirmed": true}
+  ],
+  "retrieval": [
+    {
+      "relevant_ids": ["episode-mug"],
+      "hits": [{"owner_id": "episode-mug", "provenance": ["evidence-mug"]}],
+      "latency_ms": 4.2
+    }
+  ],
+  "interactions": [
+    {"directed": false, "spoken": false, "response": "[[SILENT]]"},
+    {"directed": true, "spoken": true, "response": "That is your ceramic mug."},
+    {"directed": true, "spoken": true, "response": "Correction saved.", "correction_required": true, "correction_retained": true}
+  ],
+  "object_learning": [
+    {"expected_label": "ceramic mug", "recalled_label": "ceramic mug", "mask_checksum": "sha256:fixture"}
+  ],
+  "asr": [
+    {"accepted": false, "vad": false, "rms": 0.0002, "echo": false},
+    {"accepted": true, "vad": true, "rms": 0.08, "echo": false, "evidence_id": "speech-1"}
+  ],
+  "runtime": [
+    {"camera_fps": 8.0, "asr_delay_ms": 420, "gpu_memory_mb": 2048, "ram_mb": 4096, "db_bytes": 1000, "media_bytes": 2000},
+    {"camera_fps": 7.8, "asr_delay_ms": 450, "gpu_memory_mb": 2100, "ram_mb": 4120, "db_bytes": 1200, "media_bytes": 2400}
+  ]
+}

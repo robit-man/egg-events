@@ -1,0 +1,1 @@
+"""Operational services for Egg."""

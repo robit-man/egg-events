@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "egg-companion"
+version = "0.1.0"
+description = "Real-hardware companion runtime for the Egg Jetson platform"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp>=3.9",
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "open-clip-torch>=2.24",
+  "pydantic>=2.6",
+  "PyYAML>=6.0",
+  "pyusb>=1.2",
+  "sounddevice>=0.4",
+  "webrtcvad-wheels>=2.0.14",
+  "torch>=2.1",
+  "ultralytics>=8.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+egg-companion = "egg_companion.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.setuptools.packages.find]
+include = ["egg_companion*"]
