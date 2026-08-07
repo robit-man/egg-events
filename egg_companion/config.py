@@ -159,6 +159,10 @@ class ObjectLearningConfig(BaseModel):
     vlm_max_image_size: int = Field(default=512, ge=224, le=1024)
     stable_candidate_frames: int = Field(default=3, ge=2, le=20)
     speech_priority_seconds: float = Field(default=8, ge=0, le=120)
+    review_sweep_interval_seconds: float = Field(default=900, gt=0, le=86400)
+    review_stale_after_seconds: float = Field(default=21600, gt=0, le=604800)
+    confidence_audit_enabled: bool = True
+    confidence_audit_batch_size: int = Field(default=5, ge=1, le=50)
 
 
 class MemoryConfig(BaseModel):

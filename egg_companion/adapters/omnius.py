@@ -385,6 +385,32 @@ class OmniusClient:
             return None
         return normalized, float(confidence)
 
+    async def audit_object_label(self, profile: dict[str, object]) -> dict[str, object] | None:
+        """Cheap, text-only confidence audit of an already-labelled object.
+
+        Uses the cognition model rather than the vision model: it triages which
+        profiles are worth a real image-grounded VLM re-classification instead of
+        overwriting a label itself. Returns None on any malformed response so the
+        caller always falls back to the VLM path rather than trusting a silent pass.
+        """
+        raw = await self._structured_chat(
+            "Audit whether a previously assigned object label is still plausible, given its history. "
+            f"Profile: {json.dumps(profile)}\n"
+            "Return only JSON: {\"consistent\": bool, \"confidence\": number, \"reason\": string}. "
+            "Mark consistent=false if the label history shows repeated flip-flopping, the label reads "
+            "as implausible for a hand-held or nearby object, or confidence is low with few samples."
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        consistent, confidence, reason = parsed.get("consistent"), parsed.get("confidence"), parsed.get("reason")
+        if not isinstance(consistent, bool) or not isinstance(confidence, (int, float)) or not isinstance(reason, str):
+            return None
+        if not 0 <= float(confidence) <= 1 or not reason.strip() or len(reason) > 200:
+            return None
+        return {"consistent": consistent, "confidence": float(confidence), "reason": reason.strip()}
+
     async def synthesize(self, text: str) -> bytes:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:

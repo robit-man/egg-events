@@ -77,6 +77,10 @@ class RuntimeTelemetry:
             "vlm_rejections": 0,
             "vlm_errors": 0,
             "speech_deferrals": 0,
+            "review_queued": 0,
+            "audit_consistent": 0,
+            "audit_flagged": 0,
+            "review_queue_depth": 0,
             "last_stage": "idle",
             "last_detail": None,
             "updated_at": None,
@@ -162,6 +166,9 @@ class RuntimeTelemetry:
             "vlm_rejection": "vlm_rejections",
             "vlm_error": "vlm_errors",
             "speech_deferral": "speech_deferrals",
+            "review_queued": "review_queued",
+            "audit_consistent": "audit_consistent",
+            "audit_flagged": "audit_flagged",
         }
         with self._lock:
             counter = counter_by_stage.get(stage)
@@ -170,6 +177,10 @@ class RuntimeTelemetry:
             self._object_learning["last_stage"] = stage
             self._object_learning["last_detail"] = None if detail is None else str(detail)[:160]
             self._object_learning["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    def set_review_queue_depth(self, depth: int) -> None:
+        with self._lock:
+            self._object_learning["review_queue_depth"] = int(depth)
 
     def record_reply(self, reply: str) -> None:
         with self._lock:

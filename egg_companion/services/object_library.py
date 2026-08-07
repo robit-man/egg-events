@@ -29,6 +29,9 @@ class ObjectProfile:
     label_history: list[dict[str, object]] = field(default_factory=list)
     label_provenance: dict[str, object] = field(default_factory=dict)
     last_match_state: str | None = None
+    last_reviewed_at: datetime | None = None
+    audit_state: str | None = None
+    audit_notes: str | None = None
 
 
 class ObjectLibrary:
@@ -61,6 +64,7 @@ class ObjectLibrary:
                     label_source=label_source, label_confidence=label_confidence,
                     review_state=self._verified_state(label_source),
                     label_provenance=dict(label_provenance or {}),
+                    last_reviewed_at=now if label_source in {"user", "ornith-vlm"} else None,
                 )
                 self._profiles[profile_id] = profile
             else:
@@ -74,6 +78,7 @@ class ObjectLibrary:
                 profile.label_provenance = dict(label_provenance or profile.label_provenance)
                 if label_source in {"user", "ornith-vlm"}:
                     profile.review_state = self._verified_state(label_source)
+                    profile.last_reviewed_at = now
             self._save(profile, segmented.image, segmented.mask)
             return profile
 
@@ -93,14 +98,6 @@ class ObjectLibrary:
             profile.last_seen = datetime.now(timezone.utc)
             profile.last_match_state = "recalled"
             return profile, similarity
-
-    def profiles_for_review(self) -> list[tuple[str, str, bytes]]:
-        with self._lock:
-            return [
-                (profile.profile_id, profile.label, profile.thumbnail)
-                for profile in self._profiles.values()
-                if profile.thumbnail and profile.review_state not in {"vlm_verified", "user_corrected"}
-            ]
 
     def relabel(
         self, profile_id: str, label: str, confidence: float, source: str, model_id: str,
@@ -132,6 +129,7 @@ class ObjectLibrary:
                 "accepted_at": datetime.now(timezone.utc).isoformat(),
             }
             profile.review_state = self._verified_state(source)
+            profile.last_reviewed_at = datetime.now(timezone.utc)
             self._save_metadata(profile)
             return profile
 
@@ -140,7 +138,38 @@ class ObjectLibrary:
             profile = self._profiles.get(profile_id)
             if profile:
                 profile.review_state = "failed"
+                profile.last_reviewed_at = datetime.now(timezone.utc)
                 self._save_metadata(profile)
+
+    def mark_audited(self, profile_id: str, audit_state: str, notes: str | None = None) -> ObjectProfile | None:
+        with self._lock:
+            profile = self._profiles.get(profile_id)
+            if profile is None:
+                return None
+            profile.audit_state = audit_state
+            profile.audit_notes = notes
+            profile.last_reviewed_at = datetime.now(timezone.utc)
+            self._save_metadata(profile)
+            return profile
+
+    def profiles_due_for_review(self, stale_after_seconds: float) -> list[tuple[str, str, float]]:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            due = []
+            for profile in self._profiles.values():
+                if not profile.thumbnail:
+                    continue
+                if profile.review_state in {"pending", "failed"}:
+                    due.append(profile)
+                    continue
+                if profile.last_reviewed_at is None:
+                    due.append(profile)
+                    continue
+                age = (now - profile.last_reviewed_at).total_seconds()
+                if age >= stale_after_seconds:
+                    due.append(profile)
+            due.sort(key=lambda item: item.last_reviewed_at or datetime.min.replace(tzinfo=timezone.utc))
+            return [(profile.profile_id, profile.label, profile.label_confidence) for profile in due]
 
     def snapshot(self) -> list[dict[str, object]]:
         with self._lock:
@@ -235,6 +264,13 @@ class ObjectLibrary:
                     review_state=str(metadata.get("review_state", "pending")),
                     label_history=list(metadata.get("label_history", [])),
                     label_provenance=dict(metadata.get("label_provenance", {})),
+                    last_reviewed_at=(
+                        datetime.fromisoformat(metadata["last_reviewed_at"])
+                        if metadata.get("last_reviewed_at")
+                        else None
+                    ),
+                    audit_state=metadata.get("audit_state"),
+                    audit_notes=metadata.get("audit_notes"),
                 )
             except (KeyError, OSError, TypeError, ValueError):
                 continue
@@ -271,6 +307,9 @@ class ObjectLibrary:
                     "review_state": profile.review_state,
                     "label_history": profile.label_history,
                     "label_provenance": profile.label_provenance,
+                    "last_reviewed_at": profile.last_reviewed_at.isoformat() if profile.last_reviewed_at else None,
+                    "audit_state": profile.audit_state,
+                    "audit_notes": profile.audit_notes,
                 },
                 indent=2,
             ),

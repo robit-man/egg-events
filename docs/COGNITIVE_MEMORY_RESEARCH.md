@@ -1,7 +1,7 @@
 # Egg Cognitive Memory Research Ledger
 
 **Status:** research baseline
-**Last reviewed:** 2026-08-04
+**Last reviewed:** 2026-08-06
 **Purpose:** preserve the research rationale, target architecture, and implementation decisions for making Egg a grounded, multimodal companion with durable, evidence-based memory.
 
 ## Operating Definition
@@ -215,6 +215,15 @@ User corrections should create a revision record rather than silently rewrite hi
 | [eMEM (arXiv 2026)](https://arxiv.org/abs/2606.03374) | SQL plus graph/vector/spatial data structures | start SQLite; consider spatial index only after camera calibration | research reviewed; experimental |
 | [POLAR (arXiv 2026)](https://arxiv.org/abs/2605.26256) | personalized embodied multimodal graph memory | retain multimodal evidence and personalized links | research reviewed; experimental |
 | [C-CLIP (ICLR 2025)](https://mlanthology.org/iclr/2025/liu2025iclr-cclip/) | continual learning considerations for CLIP-like models | avoid unvalidated online finetuning; retain replay/evaluation data first | research reviewed |
+| [World Models: A Comprehensive Survey of Architectures, Methodologies, Reasoning Paradigms, and Applications (arXiv 2606.00133, 2026)](https://arxiv.org/pdf/2606.00133) | three-axis taxonomy for embodied world models: functionality (decision-coupled vs. general-purpose), temporal modeling, spatial representation | classifies `WorldStatePredictor` as a lightweight decision-coupled world model; confirms the existing design point rather than requiring a rewrite | research reviewed; validated existing design |
+| [A Comprehensive Survey on World Models for Embodied AI (arXiv 2510.16732, 2025)](https://arxiv.org/pdf/2510.16732) | broad taxonomy of embodied world models and evaluation protocols | corroborates the decision-coupled framing above | research reviewed |
+| [World Model for Robot Learning: A Comprehensive Survey (arXiv 2605.00080, 2026)](https://arxiv.org/html/2605.00080v1) | survey of world models specifically for robot learning and control | no immediate Egg change; useful reference if manipulation/planning is added later | research reviewed |
+| [V-JEPA 2 / V-JEPA-2-AC (arXiv 2506.09985, 2025)](https://arxiv.org/abs/2506.09985) | self-supervised video world model enabling zero-shot robot manipulation via MPC, trained on 1M hours of video + 62 hours of robot data | evaluated and **deferred**: would compete with the Jetson's already-budgeted unified memory (single Ollama model, YOLOE+SAM+CLIP+SFace+ASR+TTS resident); Egg has no manipulator, so MPC-style action planning is not currently applicable | research reviewed; deferred, not adopted |
+| [Neural Brain: A Neuroscience-inspired Framework for Embodied Agents (arXiv 2505.07634, 2025)](https://arxiv.org/pdf/2505.07634) | frames an embodied agent as sensing + a tightly coupled perception-cognition-action loop + adaptive short/long-term memory | direct model for `cognition/architecture.py`'s `CognitiveArchitecture`, which explicitly composes attention (perception), prediction-error evaluation (cognition), and evidence association into one perceive/associate loop instead of leaving it implicit across `runtime.py` | research reviewed; adopted as design basis |
+| [CraniMem: Cranial Inspired Gated and Bounded Memory for Agentic Systems (arXiv 2603.15642, 2026)](https://arxiv.org/pdf/2603.15642) | bounded, gated memory to prevent unbounded agent context growth | Egg's `MemoryConfig` already bounds perceptual buffers (`buffer_frames_per_camera`, `buffer_ttl_seconds`, `buffer_max_bytes`) and context assembly (`context_max_characters`); no code change needed, already aligned | research reviewed; already aligned |
+| [Generate, but Verify: Reducing Hallucination in VLMs with Retrospective Resampling (arXiv 2504.13169, 2025)](https://arxiv.org/pdf/2504.13169) | plain LLM/VLM self-verification has a high no-op/unreliable rate and should not silently overwrite outputs | the new object confidence-audit pass (`OmniusClient.audit_object_label`) only *routes* a profile to the existing image-grounded Ornith VLM correction path; it never rewrites a label itself | research reviewed; shaped audit routing design |
+
+Two consequences of this pass are recorded explicitly so they don't read as oversights later: (1) Egg's existing `WorldStatePredictor` is intentionally a small decision-coupled prediction model rather than a generative world model — this matches, not lags, current best practice for a resource-constrained edge device with no manipulator. (2) A generative video world model (V-JEPA 2 class) was evaluated and consciously deferred, not silently skipped, because it would contend with the Jetson AGX Orin's already tightly budgeted unified memory (see README: one Ollama model, one parallel request, 4096-token context) and Egg currently has no action space for it to plan over.
 
 ## Query Log
 

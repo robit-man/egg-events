@@ -17,16 +17,16 @@ from egg_companion.adapters.omnius import OmniusClient
 from egg_companion.adapters.speaker import Speaker
 from egg_companion.adapters.system_service import SystemServiceClient
 from egg_companion.adapters.vision import SegmentedObject, VisionEngine
+from egg_companion.cognition.architecture import CognitiveArchitecture
 from egg_companion.cognition.dialogue import DialogueClassifier, DialogueEvidence
 from egg_companion.config import EggConfig
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
 from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.buffer import BufferedMediaRef, PerceptualBuffer
-from egg_companion.memory.fusion import EvidenceFusion
 from egg_companion.memory.migrate_legacy import LegacyMemoryMigrator
 from egg_companion.memory.store import MemoryStore
-from egg_companion.models import AttentionTarget, Detection, EvidenceRef, Observation, PerceptualEvent
+from egg_companion.models import AttentionDecision, AttentionTarget, Detection, EvidenceRef, Observation, PerceptualEvent
 from egg_companion.services.telemetry import RuntimeTelemetry
 from egg_companion.services.identity import IdentityLibrary
 from egg_companion.services.object_library import ObjectLibrary
@@ -89,6 +89,7 @@ class CompanionRuntime:
             except Exception as error:
                 logger.exception("cognitive memory unavailable; live sensing remains active")
                 self.telemetry.record_runtime_error("cognitive-memory", error)
+        self._brain = CognitiveArchitecture(self._attention, self._cognitive_attention, self._memory)
         self._last_greeting: datetime | None = None
         self._latest_observation: Observation | None = None
         self._speaking = False
@@ -229,6 +230,7 @@ class CompanionRuntime:
             ("speech-recognition", self._process_speech),
             ("conversation-reasoning", self._reason_about_transcript),
             ("ornith-object-labeler", self._auto_label_objects),
+            ("object-review-scheduler", self._object_review_scheduler),
         ]
         tasks = camera_tasks + [
             asyncio.create_task(self._run_component(name, component), name=name)
@@ -442,8 +444,9 @@ class CompanionRuntime:
     async def _attend(self) -> None:
         while True:
             observation = await self._observations.get()
-            for target in self._attention.select(observation):
-                await self._handle_target(target, observation)
+            tick = self._brain.perceive(observation)
+            for target, decision in tick.decisions:
+                await self._handle_target(target, decision, observation)
 
     async def _stream_waveform(self) -> None:
         pending = np.empty(0, dtype=np.float32)
@@ -731,11 +734,6 @@ class CompanionRuntime:
         while self._vision is None:
             await asyncio.sleep(1)
         vision = self._vision
-        for profile_id, previous_label, _ in self.objects.profiles_for_review():
-            segmented = await asyncio.to_thread(self.objects.segmented_profile, profile_id)
-            if segmented is None:
-                continue
-            await self._review_existing_object(profile_id, previous_label, segmented)
         while True:
             camera_id, detection, segmented, fingerprint, attempt = await self._object_candidates.get()
             try:
@@ -837,9 +835,56 @@ class CompanionRuntime:
             self.telemetry.record_object_learning("vlm_error", error)
             self.telemetry.record_runtime_error("ornith-review", error)
 
+    async def _object_review_scheduler(self) -> None:
+        while self._vision is None or self._omnius is None:
+            await asyncio.sleep(1)
+        while True:
+            try:
+                await self._sweep_object_reviews()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("Object review sweep failed")
+                self.telemetry.record_runtime_error("object-review-sweep", error)
+            await asyncio.sleep(self.config.object_learning.review_sweep_interval_seconds)
+
+    async def _sweep_object_reviews(self) -> None:
+        learning = self.config.object_learning
+        due = await asyncio.to_thread(self.objects.profiles_due_for_review, learning.review_stale_after_seconds)
+        self.telemetry.set_review_queue_depth(len(due))
+        for profile_id, label, _confidence in due[: learning.confidence_audit_batch_size]:
+            self.telemetry.record_object_learning("review_queued", f"{profile_id}:{label}")
+            segmented = await asyncio.to_thread(self.objects.segmented_profile, profile_id)
+            if segmented is None:
+                continue
+            audit = None
+            if learning.confidence_audit_enabled:
+                profile_record = await asyncio.to_thread(self.objects.profile_record, profile_id)
+                if profile_record is not None:
+                    audit_payload = {
+                        "label": profile_record["label"],
+                        "label_confidence": profile_record["label_confidence"],
+                        "samples": profile_record["samples"],
+                        "review_state": profile_record["review_state"],
+                        "label_history": profile_record["label_history"],
+                    }
+                    try:
+                        audit = await self._omnius.audit_object_label(audit_payload)
+                    except Exception as error:
+                        logger.exception("Object confidence audit failed")
+                        self.telemetry.record_runtime_error("confidence-audit", error)
+            if audit is not None and audit["consistent"] and audit["confidence"] >= learning.auto_label_min_confidence:
+                await asyncio.to_thread(self.objects.mark_audited, profile_id, "consistent", audit["reason"])
+                self.telemetry.record_object_learning("audit_consistent", f"{profile_id}:{audit['reason']}")
+                continue
+            self.telemetry.record_object_learning(
+                "audit_flagged", f"{profile_id}:{(audit or {}).get('reason', 'no-audit')}"
+            )
+            await self._review_existing_object(profile_id, label, segmented)
+
     def _cache_object_recall(self, camera_id: str, detection: Detection, profile, similarity: float) -> None:
         expires_at = time.monotonic() + self.config.object_learning.recall_cache_seconds
-        fusion = EvidenceFusion.object(similarity)
+        fusion = self._brain.associate_object(similarity)
         item = {
             "bbox": detection.bbox,
             "profile_id": profile.profile_id,
@@ -1123,8 +1168,7 @@ class CompanionRuntime:
         words = {word.strip(".,!?;:\"'").casefold() for word in transcript.split()}
         return bool(words & {"this", "that", "object", "holding", "called", "name"})
 
-    async def _handle_target(self, target: AttentionTarget, observation: Observation) -> None:
-        decision = self._cognitive_attention.evaluate(target, observation)
+    async def _handle_target(self, target: AttentionTarget, decision: AttentionDecision, observation: Observation) -> None:
         self.telemetry.record_attention(target.track_id, target.detection.label, decision)
         self._queue_attention_memory(target, decision)
         event = {
