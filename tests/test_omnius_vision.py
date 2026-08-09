@@ -26,3 +26,20 @@ def test_asr_grounding_rejects_no_speech_low_probability_and_repetition() -> Non
     assert OmniusClient.transcription_rejection_reason(grounded) is None
     assert not OmniusClient.transcription_is_grounded(silence)
     assert OmniusClient.transcription_is_grounded(grounded)
+
+
+def test_asr_grounding_falls_back_to_text_repetition_when_engine_omits_quality_metadata() -> None:
+    # Engines such as transcribe-cli never populate no_speech_prob/avg_logprob/
+    # compression_ratio on segments, which would otherwise make the checks
+    # above silently unreachable and accept any non-empty hallucinated text.
+    repetition_loop = {
+        "text": "Allah Allah Allah Allah Allah Allah",
+        "segments": [{"id": 0, "start": 0, "end": 3, "text": "Allah Allah Allah Allah Allah Allah"}],
+    }
+    real_sentence = {
+        "text": "Can you turn on the kitchen light",
+        "segments": [{"id": 0, "start": 0, "end": 2, "text": "Can you turn on the kitchen light"}],
+    }
+
+    assert OmniusClient.transcription_rejection_reason(repetition_loop) == "repetitive transcript compression"
+    assert OmniusClient.transcription_rejection_reason(real_sentence) is None

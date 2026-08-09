@@ -225,6 +225,9 @@ def test_sweep_falls_back_to_vlm_when_audit_flags_or_fails() -> None:
             async def classify_masked_object(self, image, label, confidence):
                 return "ceramic mug", 0.95
 
+            async def ocr_advanced(self, image_path):
+                return None
+
         library = _SweepLibrary(due=[("object-001", "mug", 0.5)])
         runtime = _sweep_runtime(config, library, FlaggingAuditOmnius())
 
@@ -254,6 +257,9 @@ def test_sweep_falls_back_to_vlm_when_audit_call_raises() -> None:
 
             async def classify_masked_object(self, image, label, confidence):
                 return "ceramic mug", 0.95
+
+            async def ocr_advanced(self, image_path):
+                return None
 
         library = _SweepLibrary(due=[("object-001", "mug", 0.5)])
         runtime = _sweep_runtime(config, library, RaisingAuditOmnius())

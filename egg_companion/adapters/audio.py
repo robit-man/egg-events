@@ -130,6 +130,94 @@ class ReSpeakerDirection:
                     self._angles.append(float(angle) % 360)
 
 
+class UtteranceSegmenter:
+    """Buffers continuous mono audio into complete, VAD-bounded utterances instead
+    of a fixed-length tumbling window. A blind fixed window routinely truncates
+    speech mid-word at its boundary, which is a well-documented trigger for
+    Whisper repetition-loop hallucinations; this instead starts an utterance on
+    confirmed voice onset (with a pre-roll so the first syllable isn't clipped
+    while onset is being confirmed) and ends it on a trailing-silence hangover or
+    a hard `segment_seconds` cap, so speech is never split mid-utterance."""
+
+    _FRAME_MS = 30  # webrtcvad requires exact 10/20/30ms frames
+
+    def __init__(self, audio: AudioConfig, transcription: TranscriptionConfig) -> None:
+        import webrtcvad
+
+        self.audio = audio
+        self.transcription = transcription
+        self._detector = webrtcvad.Vad(transcription.vad_aggressiveness)
+        self._frame_samples = audio.sample_rate * self._FRAME_MS // 1000
+        pre_roll_frames = max(1, round(transcription.vad_pre_roll_ms / self._FRAME_MS))
+        self._pre_roll: deque[np.ndarray] = deque(maxlen=pre_roll_frames)
+        self._onset_frames_required = max(1, round(transcription.vad_min_contiguous_ms / self._FRAME_MS))
+        self._hangover_frames_required = max(1, round(transcription.vad_hangover_ms / self._FRAME_MS))
+        self._max_frames = max(
+            self._onset_frames_required,
+            round(transcription.segment_seconds * 1000 / self._FRAME_MS),
+        )
+        self._carry = np.empty(0, dtype=np.float32)
+        self.reset()
+
+    def reset(self) -> None:
+        self._recording = False
+        self._utterance_frames: list[np.ndarray] = []
+        self._voiced_streak = 0
+        self._silence_streak = 0
+        self._pre_roll.clear()
+        self._carry = np.empty(0, dtype=np.float32)
+
+    def feed(self, samples: np.ndarray) -> list[np.ndarray]:
+        """Consume newly captured raw samples; return zero or more completed
+        utterances (raw, ungained mono float32 arrays) finalized by this call."""
+        combined = np.concatenate((self._carry, samples.astype(np.float32, copy=False)))
+        frame_count = combined.size // self._frame_samples
+        self._carry = combined[frame_count * self._frame_samples:]
+        completed: list[np.ndarray] = []
+        for index in range(frame_count):
+            frame = combined[index * self._frame_samples: (index + 1) * self._frame_samples]
+            utterance = self._consume_frame(frame)
+            if utterance is not None:
+                completed.append(utterance)
+        return completed
+
+    def _consume_frame(self, frame: np.ndarray) -> np.ndarray | None:
+        voiced = self._is_voiced(frame)
+        if not self._recording:
+            self._pre_roll.append(frame)
+            self._voiced_streak = self._voiced_streak + 1 if voiced else 0
+            if self._voiced_streak < self._onset_frames_required:
+                return None
+            self._recording = True
+            self._utterance_frames = list(self._pre_roll)
+            self._silence_streak = 0
+            return None
+        self._utterance_frames.append(frame)
+        self._silence_streak = 0 if voiced else self._silence_streak + 1
+        if self._silence_streak >= self._hangover_frames_required or len(self._utterance_frames) >= self._max_frames:
+            return self._finalize()
+        return None
+
+    def _finalize(self) -> np.ndarray:
+        utterance = (
+            np.concatenate(self._utterance_frames) if self._utterance_frames else np.empty(0, dtype=np.float32)
+        )
+        self._recording = False
+        self._utterance_frames = []
+        self._voiced_streak = 0
+        self._silence_streak = 0
+        self._pre_roll.clear()
+        return utterance
+
+    def _is_voiced(self, frame: np.ndarray) -> bool:
+        gained = np.clip(frame * self.transcription.vad_input_gain, -1, 1)
+        rms = float(np.sqrt(np.mean(np.square(gained))))
+        if rms < self.transcription.vad_min_voiced_rms:
+            return False
+        pcm = (gained * 32767).astype("<i2")
+        return self._detector.is_speech(pcm.tobytes(), self.audio.sample_rate)
+
+
 class ReSpeakerCapture:
     """Captures a real voiced ReSpeaker segment as a mono 16-bit WAV payload."""
 

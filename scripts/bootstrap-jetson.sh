@@ -41,8 +41,8 @@ ensure_companion_service() {
   cat > "$unit_dir/egg-companion.service" <<EOF
 [Unit]
 Description=Egg embodied companion runtime and dashboard
-After=network-online.target omnius-daemon.service
-Wants=network-online.target omnius-daemon.service
+After=network-online.target omnius-daemon.service pulseaudio.service sound.target
+Wants=network-online.target omnius-daemon.service pulseaudio.service
 
 [Service]
 Type=simple

@@ -76,6 +76,8 @@ class RuntimeTelemetry:
             "vlm_successes": 0,
             "vlm_rejections": 0,
             "vlm_errors": 0,
+            "ocr_requests": 0,
+            "ocr_hits": 0,
             "speech_deferrals": 0,
             "review_queued": 0,
             "audit_consistent": 0,
@@ -92,6 +94,8 @@ class RuntimeTelemetry:
         self._retrieval_hits: list[dict[str, object]] = []
         self._microphone_direction: float | None = None
         self._scene = SceneInventory()
+        self._brain: dict[str, object] = {}
+        self._gpu: dict[str, object] = {}
 
     def set_rotation(self, camera_id: str, angle: int) -> None:
         with self._lock:
@@ -165,6 +169,8 @@ class RuntimeTelemetry:
             "vlm_success": "vlm_successes",
             "vlm_rejection": "vlm_rejections",
             "vlm_error": "vlm_errors",
+            "ocr_request": "ocr_requests",
+            "ocr_hit": "ocr_hits",
             "speech_deferral": "speech_deferrals",
             "review_queued": "review_queued",
             "audit_consistent": "audit_consistent",
@@ -250,6 +256,67 @@ class RuntimeTelemetry:
                 }
             )
             self._interaction_decisions = self._interaction_decisions[-20:]
+
+    def record_brain_tick(self, tick) -> None:
+        """Sensing/cognition regions of the composed CognitiveArchitecture perceive
+        pass (egg_companion/cognition/architecture.py). The memory region is not
+        duplicated here; snapshot() folds in the existing self._memory state."""
+        top_target = tick.targets[0] if tick.targets else None
+        top_decision = tick.decisions[0][1] if tick.decisions else None
+        with self._lock:
+            self._brain = {
+                "sensing": {
+                    "target_count": len(tick.targets),
+                    "top_label": top_target.detection.label if top_target else None,
+                    "top_priority": round(top_target.priority, 4) if top_target else None,
+                    "top_reason": top_target.reason if top_target else None,
+                    "novelty": round(tick.novelty, 4),
+                },
+                "cognition": {
+                    "capture_priority": top_decision.capture_priority if top_decision else None,
+                    "allow_outward_speech": top_decision.allow_outward_speech if top_decision else None,
+                    "components": dict(top_decision.components) if top_decision else {},
+                    "reason": top_decision.reason if top_decision else "idle",
+                },
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def record_gpu_state(
+        self,
+        ram_used_mb: float | None,
+        ram_total_mb: float | None,
+        gpu_load_percent: float | None,
+        processes: list,
+    ) -> None:
+        """Real, OS-level GPU/VRAM occupancy: aggregate RAM/GPU-load from `tegrastats`
+        directly, per-process breakdown from jetson-stats. Independent of any daemon's
+        self-reported model state (which record_object_learning/asr telemetry cannot
+        verify on its own)."""
+        top_processes = sorted(
+            (
+                {
+                    "pid": row[0],
+                    "user": row[1],
+                    "name": row[9],
+                    "state": row[5],
+                    "cpu_percent": round(float(row[6]), 1),
+                    "memory_mb": round(row[7] / 1024, 1),
+                    "gpu_memory_mb": round(row[8] / 1024, 1),
+                }
+                for row in processes
+                if isinstance(row, (list, tuple)) and len(row) >= 10 and row[8]
+            ),
+            key=lambda item: item["gpu_memory_mb"],
+            reverse=True,
+        )[:8]
+        with self._lock:
+            self._gpu = {
+                "ram_total_mb": ram_total_mb,
+                "ram_used_mb": ram_used_mb,
+                "gpu_load_percent": gpu_load_percent,
+                "processes": top_processes,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
     def record_consolidation(self, result: dict[str, object]) -> None:
         with self._lock:
@@ -415,6 +482,8 @@ class RuntimeTelemetry:
                 "runtime_errors": list(self._runtime_errors),
                 "object_learning": dict(self._object_learning),
                 "memory": dict(self._memory),
+                "brain": {**self._brain, "memory": dict(self._memory)},
+                "gpu": dict(self._gpu),
                 "attention_decisions": list(self._attention_decisions),
                 "interaction_decisions": list(self._interaction_decisions),
                 "consolidation": dict(self._consolidation),

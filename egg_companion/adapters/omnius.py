@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import json
+import zlib
 
 import os
 
@@ -104,7 +105,9 @@ class OmniusClient:
                 json={"modelId": model_id},
                 headers=self._headers(),
             ) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(f"Omnius ASR model switch HTTP {response.status}: {detail}")
 
     async def configure_supertonic_voice(self, voice_name: str | None) -> bool:
         if self.config.voice_model != "supertonic" or not voice_name:
@@ -121,28 +124,32 @@ class OmniusClient:
                 response.raise_for_status()
         return True
 
-    async def ensure_voice_ready(self) -> None:
+    async def ensure_voice_ready(self, model_id: str | None = None) -> None:
+        model_id = model_id or self.config.voice_model
         state = await self.voice_state()
-        if state.get("voiceReady") is True and state.get("voiceModelId") == self.config.voice_model:
+        if state.get("voiceReady") is True and state.get("voiceModelId") == model_id:
             return
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 f"{str(self.config.base_url).rstrip('/')}/v1/voice/models/switch",
-                json={"modelId": self.config.voice_model, "enable": True},
+                json={"modelId": model_id, "enable": True},
                 headers=self._headers(),
             ) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(f"Omnius voice model switch HTTP {response.status}: {detail}")
         state = await self.voice_state()
         if state.get("voiceReady") is not True:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/voice/start",
-                    json={"modelId": self.config.voice_model},
+                    json={"modelId": model_id},
                     headers=self._headers(),
                 ) as response:
-                    if response.status != 404:
-                        response.raise_for_status()
+                    if response.status not in {200, 404}:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(f"Omnius voice start HTTP {response.status}: {detail}")
             state = await self.voice_state()
         if state.get("voiceReady") is not True:
             raise RuntimeError(f"Omnius voice did not become ready: {state}")
@@ -330,7 +337,55 @@ class OmniusClient:
             return "low average token probability"
         if compression and max(compression) >= 2.4:
             return "repetitive transcript compression"
+        if not compression:
+            # Some ASR engines (e.g. transcribe-cli) never populate segment-level
+            # quality metadata, silently making the checks above unreachable, so
+            # every non-empty transcript would otherwise be accepted regardless
+            # of quality. Recompute the same repetition signal directly from the
+            # transcript text, using Whisper's own algorithm and threshold, to
+            # still catch its most common hallucination class: word/phrase
+            # repetition loops (e.g. "Allah Allah Allah Allah Allah Allah").
+            text = payload.get("text")
+            if isinstance(text, str) and OmniusClient._text_compression_ratio(text) >= 2.4:
+                return "repetitive transcript compression"
         return None
+
+    @staticmethod
+    def _text_compression_ratio(text: str) -> float:
+        data = text.strip().encode("utf-8")
+        if not data:
+            return 0.0
+        compressor = zlib.compressobj(level=9, wbits=-15)
+        compressed = compressor.compress(data) + compressor.flush()
+        return len(data) / max(len(compressed), 1)
+
+    async def ocr_advanced(self, image_path: str) -> dict[str, object] | None:
+        """Read text from a local image path via Omnius's multi-PSM tesseract + optional
+        vision-refinement OCR pipeline. Returns None when the tool is unavailable (501)
+        or the response is malformed, so callers can treat it as purely corroborating
+        evidence alongside the Ornith VLM classification rather than a hard dependency."""
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{str(self.config.base_url).rstrip('/')}/v1/ocr/advanced",
+                json={"imagePath": image_path},
+                headers=self._headers(),
+            ) as response:
+                if response.status == 501:
+                    return None
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(f"Omnius OCR HTTP {response.status}: {detail}")
+                result = await response.json()
+        if not isinstance(result, dict) or not result.get("success"):
+            return None
+        text = result.get("ocrText")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        return {
+            "text": text.strip()[:500],
+            "vision_used": bool(result.get("visionUsed")),
+        }
 
     async def classify_masked_object(self, image_png: bytes, detector_label: str, detector_confidence: float) -> tuple[str, float] | None:
         """Classify a real transparent-mask crop with the configured local Ornith VLM."""

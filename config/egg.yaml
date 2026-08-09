@@ -52,6 +52,9 @@ audio:
   waveform_samples: 256
 
 transcription:
+  # segment_seconds is a hard cap on utterance length, not a fixed capture window:
+  # utterances are bounded by VAD onset (vad_min_contiguous_ms) and trailing
+  # silence (vad_hangover_ms), so speech is never chopped mid-word.
   segment_seconds: 3
   rms_threshold: 0.001
   asr_model: medium
@@ -61,6 +64,8 @@ transcription:
   vad_min_speech_ratio: 0.15
   vad_min_contiguous_ms: 180
   vad_min_voiced_rms: 0.008
+  vad_pre_roll_ms: 300
+  vad_hangover_ms: 600
 
 omnius:
   base_url: http://127.0.0.1:11435

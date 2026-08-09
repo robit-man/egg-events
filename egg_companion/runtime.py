@@ -7,11 +7,17 @@ import threading
 import time
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 
-from egg_companion.adapters.audio import ReSpeakerCapture, ReSpeakerDirection, ReSpeakerWaveformCapture
+from egg_companion.adapters.audio import (
+    ReSpeakerCapture,
+    ReSpeakerDirection,
+    ReSpeakerWaveformCapture,
+    UtteranceSegmenter,
+)
 from egg_companion.adapters.camera import CameraStream
 from egg_companion.adapters.omnius import OmniusClient
 from egg_companion.adapters.speaker import Speaker
@@ -54,6 +60,7 @@ class CompanionRuntime:
             config.audio,
             config.transcription,
         )
+        self._segmenter = UtteranceSegmenter(config.audio, config.transcription)
         self._waveform_capture = ReSpeakerWaveformCapture(config.audio)
         self._speaker = Speaker(config.audio)
         self._omnius = OmniusClient(config.omnius)
@@ -123,15 +130,17 @@ class CompanionRuntime:
             self.config.audio,
             self.config.transcription,
         )
+        self._segmenter = UtteranceSegmenter(self.config.audio, self.config.transcription)
         if voice_model and voice_model != self.config.omnius.voice_model:
+            await self._omnius.ensure_voice_ready(voice_model)
             self.config.omnius.voice_model = voice_model
-            await self._omnius.ensure_voice_ready()
         if voice_name is not None:
-            self.config.omnius.voice_name = voice_name or None
-            await self._omnius.configure_supertonic_voice(self.config.omnius.voice_name)
+            normalized_voice_name = voice_name or None
+            await self._omnius.configure_supertonic_voice(normalized_voice_name)
+            self.config.omnius.voice_name = normalized_voice_name
         if asr_model and asr_model != self.config.transcription.asr_model:
-            self.config.transcription.asr_model = asr_model
             await self._omnius.ensure_asr_model(asr_model)
+            self.config.transcription.asr_model = asr_model
 
     def memory_snapshot(self) -> dict[str, object]:
         snapshot = self._memory.governance_snapshot() if self._memory else {}
@@ -231,6 +240,7 @@ class CompanionRuntime:
             ("conversation-reasoning", self._reason_about_transcript),
             ("ornith-object-labeler", self._auto_label_objects),
             ("object-review-scheduler", self._object_review_scheduler),
+            ("gpu-telemetry", self._maintain_gpu_telemetry),
         ]
         tasks = camera_tasks + [
             asyncio.create_task(self._run_component(name, component), name=name)
@@ -292,6 +302,52 @@ class CompanionRuntime:
         if self._vision is None:
             self._vision = await asyncio.to_thread(VisionEngine, self.config.vision)
         await asyncio.Event().wait()
+
+    async def _maintain_gpu_telemetry(self) -> None:
+        """Real, OS-level GPU/VRAM occupancy — independent of any daemon's
+        self-reported "which model is active" state, which can be stale or wrong.
+        Ground truth for what is actually resident and consuming memory.
+
+        Aggregate RAM/GPU-load comes from `tegrastats` directly: jetson-stats'
+        pushed gpu/memory properties were found to read back empty when polled from
+        inside this busy asyncio runtime (even via asyncio.to_thread), while its
+        per-process breakdown does not have that problem, so per-process data still
+        comes from jetson-stats."""
+        import re
+
+        from jtop import jtop
+
+        def read_processes(jetson: "jtop") -> list:
+            return jetson.processes
+
+        jetson = jtop()
+        jetson.start()
+        process = await asyncio.create_subprocess_exec(
+            "tegrastats", "--interval", "2000",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    raise RuntimeError("tegrastats stream ended unexpectedly")
+                text = line.decode("utf-8", errors="replace")
+                ram_match = re.search(r"RAM (\d+)/(\d+)MB", text)
+                gpu_match = re.search(r"GR3D_FREQ (\d+)%", text)
+                processes = await asyncio.to_thread(read_processes, jetson) if jetson.ok() else []
+                self.telemetry.record_gpu_state(
+                    ram_used_mb=float(ram_match.group(1)) if ram_match else None,
+                    ram_total_mb=float(ram_match.group(2)) if ram_match else None,
+                    gpu_load_percent=float(gpu_match.group(1)) if gpu_match else None,
+                    processes=processes,
+                )
+        finally:
+            jetson.close()
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                process.kill()
 
     async def _observe_camera(self, camera: CameraStream) -> None:
         latest_observation: Observation | None = None
@@ -445,11 +501,12 @@ class CompanionRuntime:
         while True:
             observation = await self._observations.get()
             tick = self._brain.perceive(observation)
+            self.telemetry.record_brain_tick(tick)
             for target, decision in tick.decisions:
                 await self._handle_target(target, decision, observation)
 
     async def _stream_waveform(self) -> None:
-        pending = np.empty(0, dtype=np.float32)
+        preview_buffer = np.empty(0, dtype=np.float32)
         next_vad_preview_at = 0.0
         while True:
             try:
@@ -463,12 +520,13 @@ class CompanionRuntime:
                 continue
             self.telemetry.record_waveform(samples)
             if self._speaking or time.monotonic() < self._asr_holdoff_until:
-                pending = np.empty(0, dtype=np.float32)
+                self._segmenter.reset()
+                preview_buffer = np.empty(0, dtype=np.float32)
                 continue
-            pending = np.concatenate((pending, samples))
+            preview_buffer = np.concatenate((preview_buffer, samples))
             now = time.monotonic()
-            if pending.size >= self.config.audio.sample_rate and now >= next_vad_preview_at:
-                preview = pending[-self.config.audio.sample_rate:]
+            if preview_buffer.size >= self.config.audio.sample_rate and now >= next_vad_preview_at:
+                preview = preview_buffer[-self.config.audio.sample_rate:]
                 preview_rms = await asyncio.to_thread(self._capture.analyze_samples, preview)
                 self.telemetry.record_audio_state(
                     preview_rms,
@@ -477,12 +535,16 @@ class CompanionRuntime:
                     self._capture.last_speech_ms,
                 )
                 next_vad_preview_at = now + 0.1
-            segment_samples = round(
-                self.config.audio.sample_rate * self.config.transcription.segment_seconds
-            )
-            while pending.size >= segment_samples:
-                segment = pending[:segment_samples]
-                pending = pending[segment_samples:]
+                preview_buffer = preview_buffer[-self.config.audio.sample_rate:]
+            try:
+                completed_utterances = await asyncio.to_thread(self._segmenter.feed, samples)
+            except Exception as error:
+                logger.exception("ReSpeaker utterance segmentation failed")
+                self.telemetry.record_runtime_error("audio-segmentation", error)
+                continue
+            for segment in completed_utterances:
+                if segment.size == 0:
+                    continue
                 try:
                     audio, rms = await asyncio.to_thread(self._capture.process_samples, segment)
                 except Exception as error:
@@ -730,6 +792,34 @@ class CompanionRuntime:
         )
         self._object_candidates.put_nowait((observation.camera_id, candidate, segmented, fingerprint, 0))
 
+    async def _classify_with_ocr(
+        self, image_png: bytes, detector_label: str, detector_confidence: float
+    ) -> tuple[tuple[str, float] | None, dict[str, object] | None]:
+        """Run the Ornith VLM classification and Omnius's OCR-advanced endpoint
+        concurrently on the same crop. OCR is always attempted alongside the VLM as
+        corroborating evidence; it never blocks or fails the VLM classification."""
+        scratch_path = Path(self.config.object_learning.storage_dir) / ".ocr-scratch" / f"{uuid4().hex}.png"
+        scratch_path.parent.mkdir(parents=True, exist_ok=True)
+        scratch_path.write_bytes(image_png)
+        try:
+            vlm_result, ocr_result = await asyncio.gather(
+                self._omnius.classify_masked_object(image_png, detector_label, detector_confidence),
+                self._omnius.ocr_advanced(str(scratch_path)),
+                return_exceptions=True,
+            )
+        finally:
+            scratch_path.unlink(missing_ok=True)
+        if isinstance(vlm_result, BaseException):
+            raise vlm_result
+        self.telemetry.record_object_learning("ocr_request")
+        if isinstance(ocr_result, BaseException):
+            logger.warning("Omnius OCR failed; continuing with VLM result only", exc_info=ocr_result)
+            self.telemetry.record_runtime_error("ocr-advanced", ocr_result)
+            ocr_result = None
+        elif ocr_result is not None:
+            self.telemetry.record_object_learning("ocr_hit", ocr_result["text"][:80])
+        return vlm_result, ocr_result
+
     async def _auto_label_objects(self) -> None:
         while self._vision is None:
             await asyncio.sleep(1)
@@ -764,7 +854,7 @@ class CompanionRuntime:
                     self.config.object_learning.vlm_max_image_size,
                 )
                 self.telemetry.record_object_learning("vlm_request", detection.label)
-                result = await self._omnius.classify_masked_object(image_png, detection.label, detection.confidence)
+                result, ocr_result = await self._classify_with_ocr(image_png, detection.label, detection.confidence)
                 if result is None or result[1] < self.config.object_learning.auto_label_min_confidence:
                     detail = "invalid response" if result is None else f"{result[0]}:{result[1]:.3f}"
                     self.telemetry.record_object_learning("vlm_rejection", detail)
@@ -777,6 +867,8 @@ class CompanionRuntime:
                     "mask_checksum": hashlib.sha256(image_png).hexdigest(),
                     "classified_at": datetime.now(timezone.utc).isoformat(),
                 }
+                if ocr_result is not None:
+                    provenance["ocr"] = ocr_result
                 profile = await asyncio.to_thread(
                     self.objects.learn, label, segmented, vision, "ornith-vlm", confidence, provenance
                 )
@@ -810,7 +902,7 @@ class CompanionRuntime:
                 self.config.object_learning.vlm_max_image_size,
             )
             self.telemetry.record_object_learning("vlm_request", f"review:{previous_label}")
-            result = await self._omnius.classify_masked_object(image_png, previous_label, segmented.confidence)
+            result, ocr_result = await self._classify_with_ocr(image_png, previous_label, segmented.confidence)
             if result is None or result[1] < self.config.object_learning.auto_label_min_confidence:
                 self.telemetry.record_object_learning("vlm_rejection", f"review:{previous_label}")
                 await asyncio.to_thread(self.objects.mark_review_failed, profile_id)
@@ -821,6 +913,8 @@ class CompanionRuntime:
                 "mask_checksum": hashlib.sha256(image_png).hexdigest(),
                 "classified_at": datetime.now(timezone.utc).isoformat(),
             }
+            if ocr_result is not None:
+                provenance["ocr"] = ocr_result
             profile = await asyncio.to_thread(
                 self.objects.relabel, profile_id, result[0], result[1], "ornith-vlm",
                 self.config.omnius.vision_model, provenance,

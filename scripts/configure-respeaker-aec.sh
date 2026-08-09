@@ -2,11 +2,22 @@
 set -euo pipefail
 
 raw_source="alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.multichannel-input"
-hardware_sink="alsa_output.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.analog-stereo"
+respeaker_sink_prefix="alsa_output.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00."
 respeaker_python="${EGG_RESPEAKER_PYTHON:-python3}"
 
-pactl list sources short | awk '{print $2}' | grep -qx "$raw_source"
-pactl list sinks short | awk '{print $2}' | grep -qx "$hardware_sink"
+if ! pactl list sources short | awk '{print $2}' | grep -qx "$raw_source"; then
+  echo "configure-respeaker-aec: PulseAudio source '$raw_source' not present yet (USB enumeration or PulseAudio card creation still pending)" >&2
+  exit 1
+fi
+# The card negotiates between an analog-stereo and an iec958-stereo output
+# profile across boots/re-enumerations; discover whichever one is actually
+# active instead of assuming one, which previously failed silently whenever
+# the other profile won.
+hardware_sink="$(pactl list sinks short | awk -v prefix="$respeaker_sink_prefix" 'index($2, prefix) == 1 {print $2; exit}')"
+if [[ -z "$hardware_sink" ]]; then
+  echo "configure-respeaker-aec: no PulseAudio sink with prefix '$respeaker_sink_prefix' present yet (USB enumeration or PulseAudio card creation still pending)" >&2
+  exit 1
+fi
 
 for module in $(pactl list modules short | awk '$2 == "module-echo-cancel" {print $1}'); do
   pactl unload-module "$module" || true
@@ -14,12 +25,14 @@ done
 
 "$respeaker_python" - <<'PY'
 import struct
+import sys
 import usb.core
 import usb.util
 
 device = usb.core.find(idVendor=0x2886, idProduct=0x0018)
 if device is None:
-    raise SystemExit("ReSpeaker 4 Mic Array is unavailable")
+    print("configure-respeaker-aec: ReSpeaker USB device 2886:0018 not enumerated yet", file=sys.stderr)
+    raise SystemExit(1)
 
 parameters = {
     "AGCONOFF": (19, 0, "int", 1),

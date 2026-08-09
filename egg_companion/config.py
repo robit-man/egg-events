@@ -99,6 +99,9 @@ class AudioConfig(BaseModel):
 
 
 class TranscriptionConfig(BaseModel):
+    # segment_seconds is the hard cap on a single utterance's length, not a fixed
+    # capture window: utterances are bounded by VAD onset/hangover (see
+    # vad_min_contiguous_ms / vad_hangover_ms) so speech is never chopped mid-word.
     segment_seconds: float = Field(default=3.0, gt=0, le=15)
     rms_threshold: float = Field(default=0.012, gt=0, le=1)
     asr_model: str = "medium"
@@ -108,6 +111,8 @@ class TranscriptionConfig(BaseModel):
     vad_min_speech_ratio: float = Field(default=0.12, ge=0, le=1)
     vad_min_contiguous_ms: int = Field(default=180, ge=30, le=3000)
     vad_min_voiced_rms: float = Field(default=0.008, gt=0, le=1)
+    vad_pre_roll_ms: float = Field(default=300, ge=0, le=2000)
+    vad_hangover_ms: float = Field(default=600, ge=100, le=5000)
 
 
 class OmniusConfig(BaseModel):
