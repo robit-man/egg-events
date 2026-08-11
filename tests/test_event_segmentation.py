@@ -11,6 +11,7 @@ def event(
     event_type: str = "vision",
     labels: tuple[str, ...] = ("person",),
     scene_labels: tuple[str, ...] = (),
+    entity_ids: tuple[str, ...] = (),
 ) -> PerceptualEvent:
     evidence = EvidenceRef(event_id, event_type, at, "camera", "camera-0")
     return PerceptualEvent(
@@ -19,6 +20,7 @@ def event(
         at,
         "camera-0",
         (evidence,),
+        entity_ids,
         payload={"labels": labels, "scene_labels": scene_labels},
     )
 
@@ -68,3 +70,36 @@ def test_transient_detector_labels_do_not_split_episode() -> None:
         accepted, closed = segmenter.ingest(event(str(index), start + timedelta(seconds=index), labels=(label,)))
         assert not accepted and not closed
     assert len(segmenter.flush(start + timedelta(seconds=5))) == 1
+
+
+def test_single_frame_entity_blink_does_not_split_static_episode() -> None:
+    start = datetime.now(timezone.utc)
+    segmenter = EventSegmenter(MemoryConfig(), EventSegmentationConfig())
+    segmenter.ingest(event("initial", start, entity_ids=("object-1",)))
+
+    accepted, closed = segmenter.ingest(
+        event("missed-mask", start + timedelta(seconds=1), entity_ids=())
+    )
+    assert not accepted and not closed
+    accepted, closed = segmenter.ingest(
+        event("recovered", start + timedelta(seconds=2), entity_ids=("object-1",))
+    )
+    assert not accepted and not closed
+    assert segmenter.snapshot()["accepted_by_context"] == {"camera-0": 1}
+
+
+def test_object_recall_ids_remain_evidence_but_do_not_drive_visual_boundaries() -> None:
+    start = datetime.now(timezone.utc)
+    segmenter = EventSegmenter(MemoryConfig(), EventSegmentationConfig())
+    first = event("first", start, labels=("keyboard",), entity_ids=("object-1",))
+    first.payload["boundary_entity_ids"] = []
+    segmenter.ingest(first)
+    for offset, object_id in enumerate(("object-2", "object-1", "object-3"), start=1):
+        changed = event(
+            f"object-{offset}", start + timedelta(seconds=offset),
+            labels=("monitor",), entity_ids=(object_id,),
+        )
+        changed.payload["boundary_entity_ids"] = []
+        accepted, closed = segmenter.ingest(changed)
+        assert not accepted and not closed
+    assert segmenter.snapshot()["accepted_by_context"] == {"camera-0": 1}

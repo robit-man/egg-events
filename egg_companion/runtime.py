@@ -76,6 +76,16 @@ class _PendingIdentityQuestion:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class _PendingCuriosityQuestion:
+    subject_id: str
+    subject_label: str
+    predicate: str
+    question: str
+    asked_at: datetime
+    expires_at: float
+
+
 class CompanionRuntime:
     def __init__(self, config: EggConfig) -> None:
         self.config = config
@@ -100,7 +110,7 @@ class CompanionRuntime:
         self._waveform_capture = ReSpeakerWaveformCapture(config.audio)
         self._speaker = Speaker(config.audio)
         self._omnius = OmniusClient(config.omnius)
-        self._conversation_turns = ConversationTurnController()
+        self._conversation_turns = ConversationTurnController(history_limit=2000)
         self._system_service = SystemServiceClient(config.system_service) if config.system_service else None
         try:
             self.identities = IdentityLibrary(config.identity)
@@ -168,9 +178,12 @@ class CompanionRuntime:
         self._active_reasoning_revision: int | None = None
         self._superseded_reasoning_tasks: set[asyncio.Task[None]] = set()
         self._speech_lock = asyncio.Lock()
+        self._proactive_question_lock = asyncio.Lock()
         self._camera_rotations = {camera.id: camera.rotation_degrees if isinstance(camera.rotation_degrees, int) else None for camera in config.cameras}
         self._last_rotation_attempt = {camera.id: 0.0 for camera in config.cameras}
         self._latest_frame: np.ndarray | None = None
+        self._latest_frames: dict[str, tuple[np.ndarray, float]] = {}
+        self._latest_observations: dict[str, Observation] = {}
         self._last_object_candidate_at = 0.0
         self._last_vlm_at = 0.0
         self._object_recall_lock = threading.Lock()
@@ -183,6 +196,10 @@ class CompanionRuntime:
         self._object_candidate_tracks: dict[str, list[dict[str, object]]] = {}
         self._last_ocr_candidate_at: dict[str, float] = {}
         self._last_visual_evidence_at: dict[str, float] = {}
+        self._pending_curiosity: _PendingCuriosityQuestion | None = None
+        self._curiosity_asked: set[tuple[str, str]] = set()
+        self._curiosity_spoken_at: deque[float] = deque()
+        self._last_curiosity_at = 0.0
         self._record_voice_transition("runtime_initialized")
 
     async def update_voice_config(
@@ -237,6 +254,11 @@ class CompanionRuntime:
             "bytes": buffered["bytes"],
         }
         return snapshot
+
+    def conversation_history(self, limit: int = 5000) -> list[dict[str, object]]:
+        if self._memory is None:
+            return []
+        return self._memory.conversation_history(limit)
 
     def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
         if self._memory is None:
@@ -495,6 +517,7 @@ class CompanionRuntime:
             ("advanced-ocr", self._process_ocr_candidates),
             ("object-review-scheduler", self._object_review_scheduler),
             ("identity-dream-scheduler", self._identity_dream_scheduler),
+            ("default-mode-network", self._default_mode_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
         ]
         tasks = camera_tasks + [
@@ -668,6 +691,7 @@ class CompanionRuntime:
                         logger.info("camera %s orientation locked to %s degrees", camera.config.id, angle)
                     frame = self._rotate_frame(frame, angle)
                     self._latest_frame = frame.copy()
+                    self._latest_frames[camera.config.id] = (frame.copy(), now)
                     if analysis_task is not None and analysis_task.done():
                         try:
                             observation = analysis_task.result()
@@ -677,6 +701,7 @@ class CompanionRuntime:
                         else:
                             latest_observation = observation
                             self._latest_observation = observation
+                            self._latest_observations[observation.camera_id] = observation
                             self._queue_vision_memory(observation, frame)
                             asyncio.create_task(self._queue_object_candidate(frame.copy(), observation), name="object-candidate")
                             asyncio.create_task(
@@ -685,7 +710,11 @@ class CompanionRuntime:
                             )
                             self.telemetry.record_observation(observation)
                             candidate = self.telemetry.next_uncertain_observation()
-                            if candidate:
+                            if (
+                                candidate
+                                and self._active_identity_question() is None
+                                and self._active_curiosity_question() is None
+                            ):
                                 asyncio.create_task(self._ask_observation_correction(candidate), name="observation-correction")
                             if self._observations.full():
                                 discarded = self._observations.get_nowait()
@@ -1185,6 +1214,21 @@ class CompanionRuntime:
                     "labels": [item["label"] for item in detections],
                     "scene_labels": list(observation.semantic_labels),
                     "behaviors": [item["behavior"] for item in detections if item["behavior"]],
+                    # Object-mask recall can oscillate across otherwise static
+                    # frames. Objects remain linked as evidence, but only stable
+                    # people/face observations and their behavior can create a
+                    # realtime visual episode boundary. Object profile learning
+                    # has its own durable evidence path.
+                    "boundary_entity_ids": [
+                        item["id"] for item in entities
+                        if item["type"] in {"person", "face_observation"}
+                    ],
+                    "boundary_behaviors": [
+                        item["behavior"]
+                        for item in detections
+                        if item["behavior"]
+                        and item["identity_id"]
+                    ],
                     "entities": entities,
                 },
             )
@@ -1267,8 +1311,28 @@ class CompanionRuntime:
 
     def _queue_memory_event(self, event: PerceptualEvent) -> None:
         if self._memory_events.full():
-            self._memory_events.get_nowait()
-            logger.warning("discarded stale memory event while local writer is busy")
+            if event.event_type in {"vision", "attention"}:
+                logger.debug(
+                    "discarded new low-priority %s memory event while local writer is busy",
+                    event.event_type,
+                )
+                return
+            # Valid speech, corrections, identities, OCR, and learned objects
+            # must not be displaced by the high-rate camera path. Evict one
+            # queued visual/attention item if possible.
+            queued = self._memory_events._queue  # same event loop; no cross-thread access
+            discard_index = next(
+                (
+                    index for index, pending in enumerate(queued)
+                    if pending.event_type in {"vision", "attention"}
+                ),
+                0,
+            )
+            del queued[discard_index]
+            logger.warning(
+                "evicted low-priority memory event to retain %s evidence",
+                event.event_type,
+            )
         self._memory_events.put_nowait(event)
 
     async def _persist_memory_events(self) -> None:
@@ -1409,6 +1473,158 @@ class CompanionRuntime:
                     )
                 else:
                     due_at = schedule_next()
+
+    async def _default_mode_scheduler(self) -> None:
+        """Replay graph memory during quiet periods and surface bounded gaps."""
+        settings = self.config.default_mode
+        if not settings.enabled or self._memory is None:
+            self.telemetry.record_default_mode({"state": "disabled"})
+            await asyncio.Event().wait()
+
+        def next_due() -> float:
+            low = min(settings.interval_min_seconds, settings.interval_max_seconds)
+            high = max(settings.interval_min_seconds, settings.interval_max_seconds)
+            return time.monotonic() + random.uniform(low, high)
+
+        due_at = next_due()
+        self.telemetry.record_default_mode(
+            {
+                "state": "waiting",
+                "next_run_seconds": round(due_at - time.monotonic(), 1),
+            }
+        )
+        while True:
+            await asyncio.sleep(max(1.0, min(10.0, due_at - time.monotonic())))
+            now = time.monotonic()
+            if now < due_at:
+                continue
+            last_activity = max(self._last_valid_speech_at, self._last_spoken_at or 0.0)
+            busy = (
+                self._speaking
+                or not self._speech_segments.empty()
+                or not self._utterances.empty()
+                or not self._memory_events.empty()
+            )
+            if busy or now - last_activity < settings.idle_seconds:
+                due_at = now + min(10.0, settings.idle_seconds)
+                continue
+            self.telemetry.record_default_mode({"state": "replaying"})
+            try:
+                result = await asyncio.to_thread(self._memory.default_mode_pass)
+                result["state"] = "complete"
+                self.telemetry.record_default_mode(result)
+                await self._maybe_ask_default_mode_question(result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("default-mode replay failed")
+                self.telemetry.record_runtime_error("default-mode-network", error)
+                self.telemetry.record_default_mode(
+                    {"state": "failed", "error": str(error)[:240]}
+                )
+            due_at = next_due()
+
+    async def _maybe_ask_default_mode_question(
+        self, result: dict[str, object]
+    ) -> bool:
+        async with self._proactive_question_lock:
+            return await self._maybe_ask_default_mode_question_owned(result)
+
+    async def _maybe_ask_default_mode_question_owned(
+        self, result: dict[str, object]
+    ) -> bool:
+        settings = self.config.default_mode
+        now = time.monotonic()
+        if (
+            not self.config.attention.proactive_speech_enabled
+            or settings.proactive_budget_per_hour <= 0
+            or self._active_curiosity_question() is not None
+            or self._active_identity_question() is not None
+            or self.telemetry.pending_observation() is not None
+            or self._speaking
+            or now - self._last_curiosity_at < settings.proactive_cooldown_seconds
+        ):
+            return False
+        while self._curiosity_spoken_at and now - self._curiosity_spoken_at[0] > 3600:
+            self._curiosity_spoken_at.popleft()
+        if len(self._curiosity_spoken_at) >= settings.proactive_budget_per_hour:
+            return False
+        visible_ids: set[str] = set()
+        visible_preferred_names: list[str] = []
+        for observation in self._latest_observations.values():
+            if (datetime.now(timezone.utc) - observation.timestamp).total_seconds() > 5:
+                continue
+            for detection in observation.detections:
+                for entity_id in (
+                    detection.attributes.get("object_id"),
+                    detection.attributes.get("identity_id"),
+                ):
+                    if entity_id:
+                        visible_ids.add(str(entity_id))
+                preferred_name = detection.attributes.get("identity")
+                if (
+                    detection.attributes.get("identity_persistent") is True
+                    and not detection.attributes.get("identity_needs_name")
+                    and isinstance(preferred_name, str)
+                    and preferred_name.strip()
+                ):
+                    visible_preferred_names.append(preferred_name.strip())
+        # A proactive social question needs a person to address. Objects alone
+        # may become internal reflection candidates, but Egg does not ask an
+        # empty room to explain them.
+        if not visible_preferred_names:
+            return False
+        candidates = result.get("curiosity_candidates")
+        if not isinstance(candidates, list):
+            return False
+        candidate = next(
+            (
+                item for item in candidates
+                if isinstance(item, dict)
+                and str(item.get("subject_id")) in visible_ids
+                and (
+                    str(item.get("subject_id")), str(item.get("predicate"))
+                ) not in self._curiosity_asked
+            ),
+            None,
+        )
+        if candidate is None:
+            return False
+        question = " ".join(str(candidate.get("question") or "").split())
+        if not question:
+            return False
+        question = f"{visible_preferred_names[0]}, {question}"
+        revision = self._conversation_turns.revision
+        spoken = await self._speak(question, expected_revision=revision)
+        if not spoken:
+            return False
+        subject_id = str(candidate["subject_id"])
+        predicate = str(candidate["predicate"])
+        self._pending_curiosity = _PendingCuriosityQuestion(
+            subject_id=subject_id,
+            subject_label=str(candidate.get("subject_label") or subject_id),
+            predicate=predicate,
+            question=question,
+            asked_at=datetime.now(timezone.utc),
+            expires_at=now + settings.question_timeout_seconds,
+        )
+        self._curiosity_asked.add((subject_id, predicate))
+        self._curiosity_spoken_at.append(now)
+        self._last_curiosity_at = now
+        self.telemetry.record_interaction(
+            True, "source-backed reducible graph gap", "", question
+        )
+        self._queue_interaction_memory(
+            "", question, True, "source-backed reducible graph gap"
+        )
+        return True
+
+    def _active_curiosity_question(self) -> _PendingCuriosityQuestion | None:
+        pending = self._pending_curiosity
+        if pending is not None and time.monotonic() >= pending.expires_at:
+            self._pending_curiosity = None
+            return None
+        return pending
 
     async def _queue_ocr_candidates(
         self, frame: np.ndarray, observation: Observation
@@ -1717,8 +1933,16 @@ class CompanionRuntime:
             and not detection.attributes.get("object_id")
             and detection.attributes.get("mask_polygon")
             and self._candidate_area_ratio(detection) <= 0.35
+            and detection.confidence >= learning.auto_label_confidence_threshold
         ]
-        candidate = min(candidates, key=lambda item: item.confidence, default=None)
+        # Reliable, bounded candidates have the highest expected information
+        # gain. Selecting the least-confident detection was feeding Ornith the
+        # noisiest masks and artificially making detector noise look novel.
+        candidate = max(
+            candidates,
+            key=lambda item: item.confidence * (1.0 - self._candidate_area_ratio(item)),
+            default=None,
+        )
         if candidate is None:
             return
         if not self._candidate_is_stable(observation.camera_id, candidate, now):
@@ -2119,6 +2343,38 @@ class CompanionRuntime:
                 else "semantic_barge_unavailable_audio_first"
             )
 
+        pending_curiosity = self._active_curiosity_question()
+        if pending_curiosity is not None:
+            normalized_answer = " ".join(transcript.strip().split())
+            leading = normalized_answer.casefold().split(maxsplit=1)[0].strip(".,!?")
+            is_new_question = normalized_answer.endswith("?") or leading in (
+                DialogueClassifier.QUESTION_WORDS | {"can", "could", "would"}
+            )
+            if not is_new_question:
+                self._pending_curiosity = None
+                unknown = bool(
+                    re.search(
+                        r"\b(i don't know|not sure|no idea|don't remember)\b",
+                        normalized_answer.casefold(),
+                    )
+                )
+                if unknown:
+                    reply = "No problem. I'll leave that open."
+                else:
+                    self._queue_curiosity_answer_memory(
+                        pending_curiosity, normalized_answer
+                    )
+                    reply = f"Got it. I'll remember: {normalized_answer.rstrip('.')}."
+                spoken = await self._speak(reply, expected_revision=turn.revision)
+                reason = "answered active curiosity question"
+                self.telemetry.record_interaction(
+                    spoken, reason, transcript, reply
+                )
+                self._queue_interaction_memory(
+                    transcript, reply, spoken, reason
+                )
+                return
+
         # A response to Egg's own preferred-name question is routed before the
         # general dialogue classifier. This makes a bare answer such as
         # "Troy" both directed and unambiguous, and preserves the exact face
@@ -2142,11 +2398,18 @@ class CompanionRuntime:
             ):
                 return
 
-        try:
-            language = await self._omnius.reason_about_utterance(transcript, live_context)
-        except Exception as error:
-            logger.warning("dialogue routing model unavailable; using sensor evidence: %s", error)
-            language = None
+        language = self._local_language_route(transcript, pending is not None)
+        if self.config.omnius.dialogue_router_enabled:
+            try:
+                model_language = await self._omnius.reason_about_utterance(
+                    transcript, live_context
+                )
+                if model_language is not None:
+                    language = model_language
+            except Exception as error:
+                logger.warning(
+                    "dialogue routing model unavailable; using local routing: %s", error
+                )
         web_query = self._web_search_query(transcript, language)
         if not self._conversation_turns.can_publish(turn.revision):
             return
@@ -2246,6 +2509,43 @@ class CompanionRuntime:
                         )
                 await self._speak(feedback["reply"], expected_revision=turn.revision)
                 return
+        if self._is_visual_question(transcript):
+            visual = self._visual_question_frame()
+            if visual is not None:
+                camera_id, frame = visual
+                started = time.monotonic()
+                try:
+                    image = await asyncio.to_thread(self._encode_visual_question_frame, frame)
+                    reply = await self._omnius.answer_visual_question(
+                        image, transcript, f"camera={camera_id}; {live_context}"
+                    )
+                except Exception as error:
+                    logger.warning("fresh visual question path unavailable: %s", error)
+                    reply = None
+                    self.telemetry.record_tool_call(
+                        "fresh_vision", transcript, False, str(error),
+                        (time.monotonic() - started) * 1000,
+                    )
+                else:
+                    self.telemetry.record_tool_call(
+                        "fresh_vision", transcript, bool(reply), reply or "no answer",
+                        (time.monotonic() - started) * 1000,
+                    )
+                if reply and self._conversation_turns.can_publish(turn.revision):
+                    decision = self._interaction_policy.evaluate(
+                        transcript, reply, directed=True
+                    )
+                    spoken = (
+                        await self._speak(reply, expected_revision=turn.revision)
+                        if decision.allow_speech else False
+                    )
+                    reason = (
+                        "fresh question-conditioned camera evidence"
+                        if spoken else decision.reason
+                    )
+                    self.telemetry.record_interaction(spoken, reason, transcript, reply)
+                    self._queue_interaction_memory(transcript, reply, spoken, reason)
+                    return
         context = await self._cognitive_context(transcript)
         if not self._conversation_turns.can_publish(turn.revision):
             return
@@ -2466,6 +2766,86 @@ class CompanionRuntime:
         words = {word.strip(".,!?;:\"'").casefold() for word in transcript.split()}
         return bool(words & {"this", "that", "object", "holding", "called", "name"})
 
+    @staticmethod
+    def _local_language_route(
+        transcript: str, interaction_pending: bool = False
+    ) -> dict[str, object]:
+        normalized = " ".join(transcript.casefold().split())
+        words = {word.strip(".,!?;:\"'") for word in normalized.split()}
+        directed = bool(
+            interaction_pending
+            or normalized.endswith("?")
+            or words
+            & (
+                DialogueClassifier.QUESTION_WORDS
+                | DialogueClassifier.COMMAND_WORDS
+                | {"egg", "you", "your", "please"}
+            )
+        )
+        explicit_web = bool(
+            re.search(r"\b(search|look up|google|browse|on the web|online)\b", normalized)
+        )
+        return {
+            "directed": directed,
+            "act": "question" if normalized.endswith("?") else "conversation",
+            "confidence": 0.95 if directed else 0.5,
+            "tool": "web_search" if explicit_web else "none",
+            "tool_query": transcript if explicit_web else None,
+        }
+
+    @staticmethod
+    def _is_visual_question(transcript: str) -> bool:
+        normalized = " ".join(transcript.casefold().split())
+        return bool(
+            re.search(
+                r"\b(am i holding|in my hand|what(?:'s| is) this|what do you see|"
+                r"what am i showing|can you see|look at this|read this|what is on)\b",
+                normalized,
+            )
+        )
+
+    def _visual_question_frame(self) -> tuple[str, np.ndarray] | None:
+        now = time.monotonic()
+        candidates: list[tuple[float, str, np.ndarray]] = []
+        for camera_id, (frame, captured_at) in self._latest_frames.items():
+            age = now - captured_at
+            if age > 3.0:
+                continue
+            observation = self._latest_observations.get(camera_id)
+            person_area = 0.0
+            object_count = 0
+            if observation is not None:
+                for detection in observation.detections:
+                    if detection.label == "person":
+                        person_area = max(person_area, detection.bbox.area)
+                    else:
+                        object_count += 1
+            frame_area = max(1.0, float(frame.shape[0] * frame.shape[1]))
+            score = 3.0 * min(1.0, person_area / frame_area) + 0.08 * object_count - 0.1 * age
+            candidates.append((score, camera_id, frame))
+        if not candidates:
+            return None
+        _, camera_id, frame = max(candidates, key=lambda item: item[0])
+        return camera_id, frame.copy()
+
+    @staticmethod
+    def _encode_visual_question_frame(frame: np.ndarray) -> bytes:
+        import cv2
+
+        source = frame
+        height, width = source.shape[:2]
+        if width > 960:
+            scale = 960 / width
+            source = cv2.resize(
+                source, (960, max(1, round(height * scale))), interpolation=cv2.INTER_AREA
+            )
+        ok, encoded = cv2.imencode(
+            ".jpg", source, [cv2.IMWRITE_JPEG_QUALITY, 84]
+        )
+        if not ok:
+            raise RuntimeError("failed to encode current visual question frame")
+        return encoded.tobytes()
+
     async def _handle_target(self, target: AttentionTarget, decision: AttentionDecision, observation: Observation) -> None:
         self.telemetry.record_attention(target.track_id, target.detection.label, decision)
         self._queue_attention_memory(target, decision)
@@ -2501,13 +2881,20 @@ class CompanionRuntime:
         try:
             scene = self._describe_scene(target, observation)
             reply = await self._omnius.companion_reply(scene)
-            await self._speak(reply)
+            spoken = await self._speak(reply)
+            reason = "communicative visual action passed proactive policy"
+            self.telemetry.record_interaction(spoken, reason, "", reply)
+            self._queue_interaction_memory("", reply, spoken, reason)
             self._last_greeting = target.timestamp
         except Exception as error:
             logger.exception("proactive Omnius reply failed")
             self.telemetry.record_runtime_error("proactive-reasoning", error)
 
     async def _maybe_ask_identity_name(self, target: AttentionTarget) -> bool:
+        async with self._proactive_question_lock:
+            return await self._maybe_ask_identity_name_owned(target)
+
+    async def _maybe_ask_identity_name_owned(self, target: AttentionTarget) -> bool:
         settings = self.config.attention
         attributes = target.detection.attributes
         profile_id = attributes.get("identity_id")
@@ -2564,6 +2951,12 @@ class CompanionRuntime:
             "",
             question,
         )
+        self._queue_interaction_memory(
+            "",
+            question,
+            True,
+            "stable unnamed face prompted once for a preferred name",
+        )
         return True
 
     def _queue_attention_memory(self, target: AttentionTarget, decision) -> None:
@@ -2597,6 +2990,24 @@ class CompanionRuntime:
         if self._memory is None:
             return
         now = datetime.now(timezone.utc)
+        visible_entity_ids = {
+            str(entity_id)
+            for detection in (
+                self._latest_observation.detections if self._latest_observation else ()
+            )
+            for entity_id in (
+                detection.attributes.get("identity_id"),
+                detection.attributes.get("object_id"),
+            )
+            if entity_id
+        }
+        retrieval = self._memory.retrieval_snapshot()
+        retrieved_entity_ids = {
+            str(item["owner_id"])
+            for item in retrieval
+            if item.get("owner_type") == "entity" and item.get("owner_id")
+        }
+        influences = sorted(visible_entity_ids | retrieved_entity_ids)
         evidence = EvidenceRef(
             str(uuid4()), "action", now, "interaction-policy", "speech-output",
             quality=1.0 if allowed else 0.8,
@@ -2605,16 +3016,82 @@ class CompanionRuntime:
                 "candidate_response": response,
                 "spoken": allowed,
                 "reason": reason,
+                "graph_influences": influences,
+                "retrieval_influences": retrieval[:12],
             },
         )
         self._queue_memory_event(
             PerceptualEvent(
                 str(uuid4()), "attention", now, "interaction-policy", (evidence,),
-                payload={"labels": ["spoken" if allowed else "suppressed"], "attention_reason": reason},
+                tuple(influences),
+                payload={
+                    "labels": ["spoken" if allowed else "suppressed"],
+                    "attention_reason": reason,
+                    "skip_pairwise_co_observation": True,
+                },
+            )
+        )
+
+    def _queue_curiosity_answer_memory(
+        self, pending: _PendingCuriosityQuestion, answer: str
+    ) -> None:
+        if self._memory is None:
+            return
+        now = datetime.now(timezone.utc)
+        evidence = EvidenceRef(
+            str(uuid4()), "speech", now, "human-answer", "respeaker-asr", quality=1.0,
+            metadata={
+                "transcript": answer,
+                "question": pending.question,
+                "subject_id": pending.subject_id,
+                "predicate": pending.predicate,
+            },
+        )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()), "user_correction", now, "human-answer", (evidence,),
+                (pending.subject_id,),
+                payload={
+                    "entities": [
+                        {
+                            "id": pending.subject_id,
+                            "type": "object",
+                            "label": pending.subject_label,
+                            "confidence": 1.0,
+                            "source": "existing-graph-entity",
+                        }
+                    ],
+                    "claims": [
+                        {
+                            "subject_id": pending.subject_id,
+                            "predicate": pending.predicate,
+                            "value": answer,
+                            "confidence": 1.0,
+                            "source": "human-answer",
+                            "metadata": {"question": pending.question},
+                        }
+                    ],
+                },
             )
         )
 
     async def _ask_observation_correction(self, candidate: dict[str, object]) -> None:
+        async with self._proactive_question_lock:
+            await self._ask_observation_correction_owned(candidate)
+
+    async def _ask_observation_correction_owned(
+        self, candidate: dict[str, object]
+    ) -> None:
+        if (
+            self._active_identity_question() is not None
+            or self._active_curiosity_question() is not None
+            or self._speaking
+            or self._conversation_turns.pending_ingress > 0
+        ):
+            self.telemetry.record_object_learning(
+                "speech_deferral", "another conversational question owns the floor"
+            )
+            return
         if not self._cognitive_attention.allow_uncertainty_question(datetime.now(timezone.utc)):
             self.telemetry.dismiss_pending_observation()
             self.telemetry.record_interaction(
@@ -2624,7 +3101,10 @@ class CompanionRuntime:
         try:
             reply = await self._omnius.observation_question(candidate, self._scene_context())
             if reply != "[[SILENT]]":
-                await self._speak(reply)
+                spoken = await self._speak(reply)
+                reason = "bounded visual-label calibration question"
+                self.telemetry.record_interaction(spoken, reason, "", reply)
+                self._queue_interaction_memory("", reply, spoken, reason)
         except Exception:
             logger.exception("unable to ask for observation correction")
 
@@ -2678,8 +3158,25 @@ class CompanionRuntime:
         query_embedding = (
             await asyncio.to_thread(vision.embed_text, transcript) if vision is not None else None
         )
+        graph_signals = await asyncio.to_thread(
+            self._memory.graph_signals, list(entity_ids)
+        )
+        cognitive_state = {
+            "visible_graph_signals": {
+                entity_id: asdict(signal)
+                for entity_id, signal in graph_signals.items()
+            },
+            "default_mode": self.telemetry.snapshot(self.config).get(
+                "default_mode", {}
+            ),
+        }
         context = await asyncio.to_thread(
-            self._memory.context_for, transcript, live_scene, entity_ids, query_embedding
+            self._memory.context_for,
+            transcript,
+            live_scene,
+            entity_ids,
+            query_embedding,
+            cognitive_state,
         )
         self.telemetry.record_retrieval(self._memory.retrieval_snapshot())
         return context

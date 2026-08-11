@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 
-from egg_companion.config import EggConfig
+from egg_companion.config import DefaultModeConfig, EggConfig
 from egg_companion.memory.entities import EntityResolver
 from egg_companion.memory.context import ContextAssembler
 from egg_companion.memory.consolidation import MemoryConsolidator
 from egg_companion.memory.governance import MemoryGovernance
 from egg_companion.memory.segmentation import EventSegmenter
 from egg_companion.memory.store import MemoryStore
+from egg_companion.cognition.default_mode import DefaultModeNetwork
 from egg_companion.models import EpisodeDraft, EvidenceRef, PerceptualEvent
 
 
@@ -22,6 +23,9 @@ class MemoryPipeline:
         self.consolidator = MemoryConsolidator(store, config.privacy)
         self.governance = MemoryGovernance(store, config.privacy)
         self.segmenter = EventSegmenter(config.memory, config.event_segmentation)
+        self.default_mode = DefaultModeNetwork(
+            store, getattr(config, "default_mode", DefaultModeConfig())
+        )
         self.accepted_events = 0
         self.closed_episodes = 0
 
@@ -78,8 +82,30 @@ class MemoryPipeline:
     def sync_identity_profile(self, profile: dict[str, object]) -> str:
         return self.entities.sync_identity_profile(profile)
 
-    def context_for(self, query: str, live_scene: str, entity_ids=(), query_embedding=None) -> str:
-        return self.context.build(query, live_scene, tuple(entity_ids), query_embedding)
+    def context_for(
+        self,
+        query: str,
+        live_scene: str,
+        entity_ids=(),
+        query_embedding=None,
+        cognitive_state: dict[str, object] | None = None,
+    ) -> str:
+        return self.context.build(
+            query,
+            live_scene,
+            tuple(entity_ids),
+            query_embedding,
+            cognitive_state,
+        )
+
+    def graph_signals(self, entity_ids: list[str]):
+        return self.store.cognitive_signals(entity_ids)
+
+    def default_mode_pass(self) -> dict[str, object]:
+        return self.default_mode.run_once()
+
+    def conversation_history(self, limit: int = 5000) -> list[dict[str, object]]:
+        return self.store.conversation_history(limit)
 
     def retrieval_snapshot(self) -> list[dict[str, object]]:
         return self.context.last_hits()
@@ -180,6 +206,41 @@ class MemoryPipeline:
                     source_id, predicate, target_id, confidence, event.occurred_at,
                     metadata if isinstance(metadata, dict) else {"source": event.source_id},
                     evidence_id,
+                )
+        claims = event.payload.get("claims", ())
+        if isinstance(claims, (list, tuple)):
+            for claim in claims:
+                if not isinstance(claim, dict):
+                    continue
+                subject_id = claim.get("subject_id")
+                predicate = claim.get("predicate")
+                value = claim.get("value")
+                if not all(
+                    isinstance(item, str) and item.strip()
+                    for item in (subject_id, predicate, value)
+                ):
+                    continue
+                if subject_id not in entity_ids:
+                    continue
+                try:
+                    confidence = max(
+                        0.0, min(1.0, float(claim.get("confidence") or 0.0))
+                    )
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                self.store.assert_claim_once(
+                    subject_id,
+                    predicate,
+                    value,
+                    confidence,
+                    event.occurred_at,
+                    source=str(claim.get("source") or event.source_id),
+                    evidence_id=evidence_id,
+                    metadata=(
+                        claim.get("metadata")
+                        if isinstance(claim.get("metadata"), dict)
+                        else {}
+                    ),
                 )
 
     def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:

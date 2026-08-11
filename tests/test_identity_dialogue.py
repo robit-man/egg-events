@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from egg_companion.config import EggConfig
-from egg_companion.models import AttentionTarget, BoundingBox, Detection
+from egg_companion.models import AttentionTarget, BoundingBox, Detection, Observation
 from egg_companion.runtime import CompanionRuntime, _PendingIdentityQuestion
 
 
@@ -165,3 +165,63 @@ def test_explicit_web_search_phrase_has_deterministic_tool_fallback() -> None:
     assert CompanionRuntime._web_search_query(
         "anything", {"tool": "web_search", "tool_query": "current local weather"}
     ) == "current local weather"
+
+
+def test_local_realtime_router_and_deictic_vision_intent_need_no_llm() -> None:
+    route = CompanionRuntime._local_language_route("Where am I holding?")
+    assert route["directed"] is True
+    assert route["tool"] == "none"
+    assert CompanionRuntime._is_visual_question("Where am I holding?")
+    assert CompanionRuntime._is_visual_question("What is this in my hand?")
+    assert not CompanionRuntime._is_visual_question("Tell me the current weather")
+
+
+def test_default_mode_curiosity_requires_and_addresses_named_visible_person() -> None:
+    async def scenario() -> None:
+        config = _config()
+        config.attention.proactive_speech_enabled = True
+        runtime = CompanionRuntime(config)
+        spoken: list[str] = []
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._speak = speak  # type: ignore[method-assign]
+        now = datetime.now(timezone.utc)
+        object_detection = Detection(
+            "keyboard", 0.95, BoundingBox(0, 0, 50, 50), {"object_id": "object-1"}
+        )
+        runtime._latest_observations = {
+            "front": Observation("front", now, (object_detection,))
+        }
+        result = {
+            "curiosity_candidates": [
+                {
+                    "subject_id": "object-1",
+                    "subject_label": "keyboard",
+                    "predicate": "used_for",
+                    "question": "I've seen the keyboard a few times. What do you use it for?",
+                }
+            ]
+        }
+        assert not await runtime._maybe_ask_default_mode_question(result)
+
+        person_detection = Detection(
+            "person", 0.99, BoundingBox(0, 0, 100, 100),
+            {
+                "identity_id": "person-1",
+                "identity": "Cole",
+                "identity_persistent": True,
+                "identity_needs_name": False,
+            },
+        )
+        runtime._latest_observations["front"] = Observation(
+            "front", now, (object_detection, person_detection)
+        )
+        assert await runtime._maybe_ask_default_mode_question(result)
+        assert spoken == [
+            "Cole, I've seen the keyboard a few times. What do you use it for?"
+        ]
+
+    asyncio.run(scenario())

@@ -20,6 +20,7 @@ class ContextAssembler:
     def build(
         self, query: str, live_scene: str, entity_ids: tuple[str, ...] = (),
         query_embedding: np.ndarray | None = None,
+        cognitive_state: dict[str, object] | None = None,
     ) -> str:
         hits = self.retriever.retrieve(query, entity_ids, query_embedding)
         self._last_hits = tuple(hits)
@@ -100,6 +101,9 @@ class ContextAssembler:
         header = (
             "CURRENT SENSORY CONTEXT (live, may be uncertain):\n"
             f"{live_scene}\n\n"
+            "COGNITIVE CONTROL STATE (bounded attention/default-mode metadata; scores guide "
+            "focus but are not facts):\n"
+            f"{json.dumps(cognitive_state or {}, ensure_ascii=True, separators=(',', ':'))}\n\n"
             "RETRIEVED LOCAL MEMORY (use only explicit claims/evidence; relevance is not truth; "
             "omit unsupported details and state uncertainty):\n"
         )

@@ -216,11 +216,13 @@ PAGE = r"""<!doctype html>
     .camera-meta { min-height: 44px; flex-wrap: wrap; color: #d0d5dd; background: #101828; }
 
     .wave { display: block; width: 100%; height: 180px; background: #0b1220; border-radius: 10px; }
-    .conversation { display: grid; gap: 12px; }
+    .conversation { display: grid; gap: 12px; max-height: 620px; overflow: auto; align-content: start; }
     .message { max-width: 88%; padding: 11px 13px; border-radius: 12px; }
     .message.heard { justify-self: start; color: #344054; background: #f2f4f7; border-bottom-left-radius: 4px; }
     .message.agent { justify-self: end; color: #194185; background: var(--accent-soft); border-bottom-right-radius: 4px; }
     .message-role { display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+    .message-meta { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; }
+    .message.suppressed { opacity: .55; border: 1px dashed var(--line-strong); }
 
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
     .field { display: grid; gap: 6px; }
@@ -540,7 +542,7 @@ PAGE = r"""<!doctype html>
           <div class="grid">
             <article class="card span-8"><div class="card-header"><div><h3 class="card-title">Audio input</h3><p id="asr-state" class="card-note">Waiting for ReSpeaker</p></div><div id="voice-floor" class="badge">Listening</div></div><canvas id="wave" class="wave"></canvas><div id="asr-metrics" class="badge-row" style="margin-top:12px"></div></article>
             <article class="card span-4"><div class="card-header"><div><h3 class="card-title">Turn lifecycle</h3><p class="card-note">Current conversation authority</p></div></div><div id="turn-state" class="table-wrap"></div></article>
-            <article class="card span-7"><div class="card-header"><div><h3 class="card-title">Conversation</h3><p class="card-note">Only admitted speech appears here</p></div></div><div id="conversation" class="conversation"><div class="empty">No admitted speech yet.</div></div></article>
+            <article class="card span-7"><div class="card-header"><div><h3 class="card-title">Conversation history</h3><p class="card-note">Complete durable audible ledger; survives navigation and daemon restarts</p></div></div><div id="conversation" class="conversation"><div class="empty">No admitted speech yet.</div></div></article>
             <article class="card span-5"><div class="card-header"><div><h3 class="card-title">Live voice controls</h3><p class="card-note">Applied in-page; an Egg restart is not required</p></div><button id="voice-reload" class="button" type="button">Reload models</button></div><div id="voice-catalog-status" class="badge-row" style="margin-bottom:12px"><span class="badge">Discovering local models</span></div><form id="voice" class="form-grid"><div class="field"><label>ASR model</label><select class="select" name="asr_model"><option>Loading models…</option></select></div><div class="field"><label>ASR language</label><input class="input" name="asr_language" placeholder="en or auto" pattern="auto|[a-z]{2,3}(-[A-Z]{2})?"></div><div class="field"><label>TTS model</label><select class="select" name="voice_model"><option>Loading models…</option></select></div><div class="field"><label>Voice</label><select class="select" name="voice_name"><option>Loading voices…</option></select></div><div class="field"><label>Maximum utterance</label><input class="input" name="segment_seconds" type="number" min="1" max="15" step=".5"></div><div class="field"><label>RMS admission gate</label><input class="input" name="rms_threshold" type="number" min=".001" max="1" step=".001"></div><div class="field"><label>ASR target RMS</label><input class="input" name="asr_target_rms" type="number" min=".001" max="1" step=".001"></div><div class="field"><label>Maximum ASR gain</label><input class="input" name="asr_max_gain" type="number" min="1" max="48" step="1"></div><div class="field"><label>Pre-VAD gain</label><input class="input" name="vad_input_gain" type="number" min="1" max="32" step=".5"></div><div class="button-row"><button class="button primary" type="submit">Apply settings</button><button id="voice-reconnect" class="button" type="button">Reconnect models</button></div><span id="voice-result" class="result"></span></form></article>
           </div>
         </section>
@@ -568,6 +570,7 @@ PAGE = r"""<!doctype html>
             <article class="card span-4"><div class="card-header"><div><h3 class="card-title">Sensing</h3><p class="card-note">Current priority target</p></div></div><div id="cognition-sensing"></div></article>
             <article class="card span-4"><div class="card-header"><div><h3 class="card-title">Decision</h3><p class="card-note">Capture and outward speech</p></div></div><div id="cognition-decision"></div></article>
             <article class="card span-4"><div class="card-header"><div><h3 class="card-title">Episodes</h3><p class="card-note">Active contexts and last boundary</p></div></div><div id="cognition-memory"></div></article>
+            <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Default-mode replay</h3><p class="card-note">Idle graph replay, reflection, and source-backed curiosity candidates</p></div></div><div id="default-mode-state"></div></article>
             <article class="card span-6"><div class="card-header"><div><h3 class="card-title">Attention ledger</h3><p class="card-note">Most recent policy decisions</p></div></div><div id="attention-ledger" class="table-wrap"></div></article>
             <article class="card span-6"><div class="card-header"><div><h3 class="card-title">Interaction ledger</h3><p class="card-note">Spoken and suppressed outcomes</p></div></div><div id="interaction-ledger" class="table-wrap"></div></article>
             <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Retrieval activity</h3><p class="card-note">Evidence brought into active context</p></div></div><div id="retrieval-ledger" class="table-wrap"></div></article>
@@ -819,12 +822,24 @@ PAGE = r"""<!doctype html>
       }
     }
 
-    function renderConversation(telemetry, target) {
+    function renderConversation(telemetry, target, full = false) {
       const node = $(target);
-      const transcript = telemetry.latest_transcript;
-      const reply = telemetry.latest_reply;
-      if (!transcript && !reply) { node.innerHTML = '<div class="empty">No admitted speech yet.</div>'; return; }
-      node.innerHTML = `${transcript ? `<div class="message heard"><span class="message-role">Heard</span>${esc(transcript)}</div>` : ''}${reply ? `<div class="message agent"><span class="message-role">Response</span>${esc(reply)}</div>` : ''}`;
+      const durable = Array.isArray(telemetry.conversation_history) ? telemetry.conversation_history : [];
+      let turns = full ? durable : durable.slice(-4);
+      if (!turns.length) {
+        turns = [
+          telemetry.latest_transcript ? {role:'heard', text:telemetry.latest_transcript, status:'final', at:telemetry.latest_transcript_at} : null,
+          telemetry.latest_reply ? {role:'agent', text:telemetry.latest_reply, status:'spoken'} : null,
+        ].filter(Boolean);
+      }
+      const signature = JSON.stringify(turns.map(turn => [turn.id,turn.role,turn.text,turn.status,turn.at]));
+      if (node.dataset.signature === signature) return;
+      const pinnedToBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 36;
+      const previousScroll = node.scrollTop;
+      node.dataset.signature = signature;
+      if (!turns.length) { node.innerHTML = '<div class="empty">No admitted speech yet.</div>'; return; }
+      node.innerHTML = turns.map(turn => `<div class="message ${turn.role === 'agent' ? 'agent' : 'heard'} ${turn.status === 'suppressed' ? 'suppressed' : ''}"><span class="message-role">${turn.role === 'agent' ? 'Egg' : 'Heard'}</span>${esc(turn.text)}<span class="message-meta">${turn.at ? esc(new Date(turn.at).toLocaleString()) + ' · ' : ''}${esc(stateLabel(turn.status || 'final'))}</span></div>`).join('');
+      node.scrollTop = pinnedToBottom ? node.scrollHeight : previousScroll;
     }
     function renderOverview(state) {
       const telemetry = state.telemetry || {}, cameras = telemetry.cameras || [], asr = telemetry.asr || {}, memory = telemetry.memory?.lifecycle || {}, active = memory.active || [], checks = state.checks || [];
@@ -849,7 +864,7 @@ PAGE = r"""<!doctype html>
       $('#asr-metrics').innerHTML = `<span class="badge good">${esc(asr.accepted || 0)} accepted</span><span class="badge">${esc(asr.rejected || 0)} rejected</span><span class="badge ${asr.errors ? 'bad' : ''}">${esc(asr.errors || 0)} errors</span><span class="badge ${mic.ready ? 'good' : 'warn'}">XVF3000 ${mic.ready ? 'online' : 'pending'}</span><span class="badge">DoA ${mic.doa_angle == null ? '—' : Math.round(Number(mic.doa_angle)) + '°'}</span><span class="badge ${mic.voice_activity ? 'good' : ''}">DSP VAD ${mic.voice_activity ? 'voice' : 'quiet'}</span>${asr.last_rejection ? `<span class="badge warn">${esc(asr.last_rejection)}</span>` : ''}`;
       const rows = [['Floor', stateLabel(voice.floor || '—')], ['Revision', voice.revision ?? '—'], ['Pending ingress', voice.pending_ingress ?? 0], ['Playback', stateLabel(voice.playback_status || 'none')], ['Interruption', voice.active_barge_id ? 'Pending' : 'None'], ['ReSpeaker LEDs', stateLabel(mic.led_state || 'pending')], ['AEC far end', mic.aec_far_end_silence == null ? '—' : mic.aec_far_end_silence ? 'silent' : 'active'], ['AGC gain', mic.agc_gain == null ? '—' : Number(mic.agc_gain).toFixed(2) + '×'], ['Room RT60', mic.rt60_seconds == null ? '—' : Number(mic.rt60_seconds).toFixed(2) + ' s'], ['Last transition', stateLabel(voice.last_transition_reason || '—')]];
       $('#turn-state').innerHTML = table(['State','Value'], rows.map(row => [esc(row[0]), `<span class="mono">${esc(row[1])}</span>`]));
-      renderConversation(telemetry, '#conversation');
+      renderConversation(telemetry, '#conversation', true);
       for (const [key, value] of Object.entries({segment_seconds:voice.asr_segment_seconds, rms_threshold:voice.asr_rms_threshold, asr_target_rms:voice.asr_target_rms, asr_max_gain:voice.asr_max_gain, vad_input_gain:voice.vad_input_gain, asr_language:voice.asr_language})) { const input = $(`#voice [name=${key}]`); if (!voiceFormDirty && document.activeElement !== input) input.value = value ?? ''; }
       renderVoiceChoices({telemetry});
     }
@@ -895,9 +910,11 @@ PAGE = r"""<!doctype html>
     }
     function renderCognition(telemetry) {
       const brain = telemetry.brain || {}, sensing = brain.sensing || {}, cognition = brain.cognition || {}, lifecycle = telemetry.memory?.lifecycle || {}, active = lifecycle.active || [], boundary = lifecycle.last_boundary || {};
+      const defaultMode = telemetry.default_mode || {}, graphFeedback = brain.graph_feedback || {};
       $('#cognition-sensing').innerHTML = `<div class="metric-value">${esc(sensing.target_count || 0)}</div><div class="metric-detail">targets · ${esc(sensing.top_label || 'none')}</div><div class="badge-row" style="margin-top:12px"><span class="badge">priority ${sensing.top_priority == null ? '—' : Math.round(sensing.top_priority * 100) + '%'}</span><span class="badge">novelty ${esc(sensing.novelty || 0)}</span></div>`;
       $('#cognition-decision').innerHTML = `<div class="metric-value">${cognition.allow_outward_speech ? 'External' : 'Internal'}</div><div class="metric-detail">${esc(cognition.reason || 'idle')}</div><div class="badge-row" style="margin-top:12px"><span class="badge">capture ${cognition.capture_priority == null ? '—' : Math.round(cognition.capture_priority * 100) + '%'}</span></div>`;
       $('#cognition-memory').innerHTML = `<div class="metric-value">${active.length}</div><div class="metric-detail">active contexts</div><div class="badge-row" style="margin-top:12px"><span class="badge">${esc(boundary.reason || 'no boundary')}</span></div>`;
+      $('#default-mode-state').innerHTML = `<div class="badge-row"><span class="badge ${defaultMode.state === 'failed' ? 'bad' : defaultMode.state === 'complete' ? 'good' : ''}">${esc(stateLabel(defaultMode.state || 'idle'))}</span><span class="badge">${esc((defaultMode.replayed_entity_ids || []).length)} replayed</span><span class="badge">${esc(defaultMode.reflections_created || 0)} reflections</span><span class="badge">${esc((defaultMode.curiosity_candidates || []).length)} reducible gaps</span><span class="badge">${esc(Object.keys(graphFeedback).length)} live graph feedback signals</span></div>${(defaultMode.curiosity_candidates || []).length ? `<div class="pre" style="margin-top:12px">${esc((defaultMode.curiosity_candidates || []).map(item => `${item.subject_label}: ${item.question} · epistemic ${item.epistemic_value}`).join('\n'))}</div>` : ''}`;
       const attention = (telemetry.attention_decisions || []).slice(-12).reverse(); $('#attention-ledger').innerHTML = table(['Reason','Priority','Time'], attention.map(item => [esc(item.reason || '—'), esc(item.capture_priority ?? '—'), esc(formatTime(item.at))]), 'No attention decisions');
       const interactions = (telemetry.interaction_decisions || []).slice(-12).reverse(); $('#interaction-ledger').innerHTML = table(['Outcome','Reason','Time'], interactions.map(item => [statusBadge(item.allowed ? 'spoken' : 'suppressed'), esc(item.reason || '—'), esc(formatTime(item.at))]), 'No interaction decisions');
       const retrieval = (telemetry.retrieval_hits || []).slice(-16).reverse(); $('#retrieval-ledger').innerHTML = table(['Source','Detail','Score'], retrieval.map(item => [esc(item.source || item.kind || 'evidence'), esc(item.detail || item.reason || item.entity_id || '—'), esc(item.score ?? item.confidence ?? '—')]), 'No retrieval activity');

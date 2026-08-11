@@ -43,12 +43,21 @@ class EventSegmenter:
         # entities remain eligible, while the raw labels stay attached to evidence.
         label_key = "scene_labels" if event.event_type == "vision" else "labels"
         labels = tuple(sorted(str(label) for label in event.payload.get(label_key, ())))
+        boundary_entities = event.payload.get("boundary_entity_ids", event.entity_ids)
+        entity_ids = tuple(sorted(str(value) for value in boundary_entities))
         behavior = (
-            tuple(sorted(str(value) for value in event.payload.get("behaviors", ())))
-            if event.entity_ids
+            tuple(
+                sorted(
+                    str(value)
+                    for value in event.payload.get(
+                        "boundary_behaviors", event.payload.get("behaviors", ())
+                    )
+                )
+            )
+            if entity_ids
             else ()
         )
-        return event.event_type, tuple(sorted(event.entity_ids)), labels, behavior
+        return event.event_type, entity_ids, labels, behavior
 
     def ingest(self, event: PerceptualEvent) -> tuple[bool, tuple[EpisodeDraft, ...]]:
         """Return whether event evidence was accepted plus any closed episode drafts."""
@@ -65,9 +74,15 @@ class EventSegmenter:
         explicit_boundary = event.event_type in {"speech", "user_correction"}
         changed = signature != active.signature
         maxed = duration >= timedelta(seconds=self.memory.episode_max_seconds)
-        entity_changed = signature[1] != active.signature[1] and bool(signature[1] or active.signature[1])
+        entity_changed = signature[1] != active.signature[1] and bool(
+            signature[1] or active.signature[1]
+        )
         confirmed_change = False
-        if changed and not entity_changed:
+        # Stable entity IDs still blink as masks briefly disappear or recall
+        # resolves asynchronously. Require the same changed signature across
+        # three observations for entity changes too; otherwise one missed frame
+        # turns a static room into dozens of false episode boundaries.
+        if changed:
             if signature == active.pending_signature:
                 active.pending_count += 1
             else:
@@ -77,10 +92,10 @@ class EventSegmenter:
         else:
             active.pending_signature = ()
             active.pending_count = 0
-        if explicit_boundary or entity_changed or confirmed_change or maxed:
+        if explicit_boundary or confirmed_change or maxed:
             reason = (
                 "explicit interaction" if explicit_boundary
-                else "entity changed" if entity_changed
+                else "entity changed" if entity_changed and confirmed_change
                 else "confirmed scene change" if confirmed_change
                 else "maximum duration"
             )

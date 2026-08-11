@@ -6,7 +6,12 @@ from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController
 from egg_companion.memory.fusion import EvidenceFusion, FusionResult
 from egg_companion.memory.pipeline import MemoryPipeline
-from egg_companion.models import AttentionDecision, AttentionTarget, Observation
+from egg_companion.models import (
+    AttentionDecision,
+    AttentionTarget,
+    GraphCognitiveSignal,
+    Observation,
+)
 
 
 @dataclass(frozen=True)
@@ -17,6 +22,7 @@ class CognitiveTick:
     targets: list[AttentionTarget]
     decisions: list[tuple[AttentionTarget, AttentionDecision]]
     novelty: float
+    graph_feedback: dict[str, GraphCognitiveSignal]
 
 
 class CognitiveArchitecture:
@@ -41,9 +47,48 @@ class CognitiveArchitecture:
 
     def perceive(self, observation: Observation) -> CognitiveTick:
         targets = self.attention.select(observation)
-        decisions = [(target, self.cognitive_attention.evaluate(target, observation)) for target in targets]
-        novelty = max((target.priority for target in targets), default=0.0)
-        return CognitiveTick(targets=targets, decisions=decisions, novelty=novelty)
+        entity_ids = [
+            str(
+                target.detection.attributes.get("identity_id")
+                or target.detection.attributes.get("object_id")
+            )
+            for target in targets
+            if (
+                target.detection.attributes.get("identity_id")
+                or target.detection.attributes.get("object_id")
+            )
+        ]
+        graph_feedback = (
+            self.memory.graph_signals(entity_ids) if self.memory and entity_ids else {}
+        )
+        decisions = []
+        for target in targets:
+            entity_id = str(
+                target.detection.attributes.get("identity_id")
+                or target.detection.attributes.get("object_id")
+                or ""
+            )
+            decisions.append(
+                (
+                    target,
+                    self.cognitive_attention.evaluate(
+                        target, observation, graph_feedback.get(entity_id)
+                    ),
+                )
+            )
+        novelty = max(
+            (
+                float(decision.components.get("effective_novelty", 0.0))
+                for _, decision in decisions
+            ),
+            default=0.0,
+        )
+        return CognitiveTick(
+            targets=targets,
+            decisions=decisions,
+            novelty=novelty,
+            graph_feedback=graph_feedback,
+        )
 
     @staticmethod
     def associate_object(similarity: float, continuity: float = 0.0) -> FusionResult:

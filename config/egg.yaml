@@ -100,13 +100,15 @@ omnius:
   voice_name: F4
   bearer_token_env: EGG_OMNIUS_TOKEN
   timeout_seconds: 120
+  reasoning_enabled: false
+  dialogue_router_enabled: false
 
 attention:
   max_targets: 1
   track_ttl_seconds: 10
   min_priority: 0.35
   greeting_cooldown_seconds: 45
-  proactive_speech_enabled: false
+  proactive_speech_enabled: true
   # Stable face calibration is bounded and independent of generic chatter.
   identity_question_enabled: true
   identity_question_min_sightings: 1
@@ -236,9 +238,25 @@ cognitive_attention:
   action_change_weight: 0.20
   speech_weight: 0.30
   prediction_error_weight: 0.15
+  epistemic_value_weight: 0.18
+  graph_familiarity_discount: 0.85
+  irreducible_uncertainty_discount: 0.65
   interruption_threshold: 0.75
+  communicative_action_threshold: 0.35
   proactive_rate_limit_seconds: 90
-  uncertainty_question_budget_per_hour: 4
+  uncertainty_question_budget_per_hour: 0
+
+default_mode:
+  enabled: true
+  idle_seconds: 45
+  interval_min_seconds: 60
+  interval_max_seconds: 180
+  replay_limit: 8
+  reflection_min_evidence: 2
+  curiosity_threshold: 0.64
+  proactive_budget_per_hour: 2
+  proactive_cooldown_seconds: 300
+  question_timeout_seconds: 240
 
 privacy:
   persistent_identity_enabled: true

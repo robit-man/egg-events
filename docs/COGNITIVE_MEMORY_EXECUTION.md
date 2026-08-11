@@ -111,7 +111,29 @@ This is the implementation-level checklist for the work orders. Every checked it
 - [x] Expose inspect, correction, export, and deletion controls in the dashboard.
 - [x] Run replay traces, camera stress, audio stress, and recovery tests on hardware.
 
+## WO-011–015: Graph-Coupled Cognition and Realtime Grounding
+
+- [x] Feed graph familiarity, structural relevance, conflicts, and knowledge gaps into attention scoring and bounded LLM context.
+- [x] Project spoken/suppressed action evidence back onto the visible and retrieved entities that influenced it.
+- [x] Discount familiar/static novelty and unstable no-ID uncertainty while retaining communicative actions.
+- [x] Gate Ornith auto-label work by configured confidence and choose the highest expected-value bounded mask.
+- [x] Run bounded idle replay into idempotent, source-linked reflection nodes and inspectable graph jobs.
+- [x] Generate curiosity only for a currently visible subject while a named person is present; enforce timeout, cooldown, hourly budget, and one-question floor ownership.
+- [x] Persist curiosity answers as source-backed claims and leave "I don't know" gaps unresolved.
+- [x] Use Omnius direct realtime mode with hidden reasoning and the serial dialogue router disabled for ordinary turns.
+- [x] Route deictic visual questions through one current best-camera frame to local Ornith before falling back to text context.
+- [x] Render the complete durable heard/agent ledger in the Voice page without resetting scroll on unchanged in-page refreshes.
+- [x] Keep admitted speech/corrections ahead of high-rate visual events when the memory queue is saturated.
+- [x] Remove oscillating object-recall IDs from visual episode boundary signatures while preserving them as graph evidence.
+
 ## Verification Evidence
+
+- [x] `140` tests pass, including graph feedback, novelty habituation, default-mode replay, curiosity closure, deterministic realtime routing, visual-question intent, durable conversation ordering, proactive question ownership, and static object-boundary suppression.
+- [x] The live Omnius realtime request completed successfully with `tools=false`, `realtime=true`, and reasoning disabled.
+- [x] A live question-conditioned Ornith request inspected the current `camera-video1` JPEG and grounded its answer in hands being outside the frame.
+- [x] The live default-mode scheduler replayed 8 entities, created 8 idempotent source-linked reflections, and ranked 3 reducible gaps without runtime errors.
+- [x] `/api/voice/conversation` returned 2,357 chronological durable turns across the prior runtime history, including heard/spoken/suppressed status.
+- [x] After entity-boundary calibration, a 20-second four-camera trace passed with 0 visual episode starts/minute, advancing raw streams and masks on all four cameras, a live waveform, and no hardware/runtime failures.
 
 - [x] `57` CPU-safe tests pass after readiness degradation, evaluation, retention, dialogue, telemetry, buffer, and dashboard API changes.
 - [x] A live alpha-masked camera crop was classified by `robit/ornith-vision:9b` as `television` at `0.95` confidence.

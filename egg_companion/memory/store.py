@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -16,7 +17,7 @@ import numpy as np
 
 from egg_companion.config import MemoryConfig
 from egg_companion.memory.schema import migrate
-from egg_companion.models import EvidenceRef
+from egg_companion.models import EvidenceRef, GraphCognitiveSignal
 
 
 def _identifier() -> str:
@@ -554,6 +555,137 @@ class MemoryStore:
             ).fetchall()
         return [_row(row) for row in rows]
 
+    def cognitive_signals(
+        self, entity_ids: list[str]
+    ) -> dict[str, GraphCognitiveSignal]:
+        """Return small, explainable graph-derived control signals.
+
+        Counts are converted to saturating values so a long-lived hub cannot
+        overwhelm current sensory evidence merely because it has a large past.
+        """
+        signals: dict[str, GraphCognitiveSignal] = {}
+        for entity_id in dict.fromkeys(str(value) for value in entity_ids if value):
+            with self._lock:
+                entity = self._connection.execute(
+                    "SELECT entity_id FROM entities WHERE entity_id=? AND state='active'",
+                    (entity_id,),
+                ).fetchone()
+                if entity is None:
+                    continue
+                evidence_count = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM entity_evidence WHERE entity_id=?",
+                        (entity_id,),
+                    ).fetchone()[0]
+                )
+                edge_count = int(
+                    self._connection.execute(
+                        """SELECT COUNT(*) FROM edges WHERE state='active'
+                        AND (source_id=? OR target_id=?)""",
+                        (entity_id, entity_id),
+                    ).fetchone()[0]
+                )
+                claim_count = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM claims WHERE subject_id=? AND state='active'",
+                        (entity_id,),
+                    ).fetchone()[0]
+                )
+                conflict_count = int(
+                    self._connection.execute(
+                        """SELECT COUNT(*) FROM (
+                        SELECT predicate FROM claims WHERE subject_id=? AND state='active'
+                        GROUP BY predicate HAVING COUNT(DISTINCT object_id_or_text) > 1
+                        )""",
+                        (entity_id,),
+                    ).fetchone()[0]
+                )
+            familiarity = 1.0 - math.exp(-evidence_count / 4.0)
+            structural_relevance = 1.0 - math.exp(-edge_count / 4.0)
+            knowledge_gap = min(
+                1.0,
+                0.55 / (1.0 + claim_count) + (0.45 if conflict_count else 0.0),
+            )
+            signals[entity_id] = GraphCognitiveSignal(
+                entity_id,
+                round(familiarity, 4),
+                round(structural_relevance, 4),
+                round(knowledge_gap, 4),
+                evidence_count,
+                edge_count,
+                claim_count,
+                conflict_count,
+            )
+        return signals
+
+    def cognitive_inventory(self, limit: int = 40) -> list[dict[str, Any]]:
+        """Bounded graph inventory used by quiet-period replay and curiosity."""
+        bounded = max(1, min(int(limit), self.config.graph_max_nodes))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT e.entity_id, e.entity_type, e.display_name, e.updated_at,
+                e.metadata_json,
+                (SELECT COUNT(*) FROM entity_evidence ee
+                 WHERE ee.entity_id=e.entity_id) AS evidence_count,
+                (SELECT COUNT(*) FROM edges ed WHERE ed.state='active'
+                 AND (ed.source_id=e.entity_id OR ed.target_id=e.entity_id)) AS edge_count,
+                (SELECT COUNT(*) FROM claims c WHERE c.state='active'
+                 AND c.subject_id=e.entity_id) AS claim_count
+                FROM entities e WHERE e.state='active' AND e.merged_into IS NULL
+                AND e.entity_type IN ('person','object','content')
+                ORDER BY evidence_count DESC, e.updated_at DESC LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+            records = [_row(row) for row in rows]
+            for record in records:
+                claims = self._connection.execute(
+                    """SELECT predicate, object_id_or_text, confidence, source
+                    FROM claims WHERE subject_id=? AND state='active'
+                    ORDER BY confidence DESC, created_at DESC LIMIT 20""",
+                    (record["entity_id"],),
+                ).fetchall()
+                record["claims"] = [dict(claim) for claim in claims]
+        return records
+
+    def record_default_mode_reflection(
+        self,
+        source_entity_id: str,
+        reflection_kind: str,
+        summary: str,
+        confidence: float,
+        metadata: dict[str, Any],
+        at: datetime,
+    ) -> tuple[str, bool]:
+        """Project one source-supported reflection back into the graph."""
+        digest = hashlib.sha256(
+            f"{source_entity_id}:{reflection_kind}".encode()
+        ).hexdigest()[:24]
+        reflection_id = f"reflection:{digest}"
+        created = self.entity_detail(reflection_id) is None
+        self.upsert_entity(
+            "reflection",
+            summary[:300],
+            {
+                **metadata,
+                "reflection_kind": reflection_kind,
+                "source_entity_id": source_entity_id,
+                "confidence": max(0.0, min(1.0, float(confidence))),
+                "derived_at": at.isoformat(),
+            },
+            reflection_id,
+            now=at,
+        )
+        if created:
+            self.link_entities_once(
+                source_entity_id,
+                "evokes_reflection",
+                reflection_id,
+                confidence,
+                at,
+                {"source": "default-mode-replay"},
+            )
+        return reflection_id, created
+
     def find_entity_by_source(self, source_system: str, source_profile_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
@@ -857,6 +989,71 @@ class MemoryStore:
                 f"SELECT * FROM evidence WHERE {' OR '.join(clauses)} ORDER BY captured_at DESC LIMIT ?", values
             ).fetchall()
         return [_row(row) for row in rows]
+
+    def conversation_history(self, limit: int = 5000) -> list[dict[str, Any]]:
+        """Return the durable audible ledger in chronological order.
+
+        Heard audio and agent action evidence are append-only, so this survives
+        dashboard navigation and daemon restarts. Suppressed candidate responses
+        remain inspectable but are explicitly marked rather than presented as
+        something the person heard.
+        """
+        bounded_limit = max(1, min(int(limit), 20000))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM (
+                    SELECT evidence_id, modality, captured_at, payload_json
+                    FROM evidence
+                    WHERE modality IN ('audio', 'speech', 'action')
+                    AND (
+                        payload_json LIKE '%\"transcript\"%'
+                        OR payload_json LIKE '%\"candidate_response\"%'
+                    )
+                    ORDER BY captured_at DESC
+                    LIMIT ?
+                ) ORDER BY captured_at ASC""",
+                (bounded_limit,),
+            ).fetchall()
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            transcript = payload.get("transcript")
+            response = payload.get("candidate_response")
+            if isinstance(transcript, str) and transcript.strip():
+                normalized = " ".join(transcript.split())[:2000]
+                # Correction/name/curiosity evidence may legitimately point to
+                # the same admitted audio evidence. Keep one audible turn while
+                # the underlying duplicate provenance remains in the graph.
+                if not (
+                    history
+                    and history[-1]["role"] == "heard"
+                    and history[-1]["text"] == normalized
+                ):
+                    history.append(
+                        {
+                            "id": str(row["evidence_id"]),
+                            "role": "heard",
+                            "text": normalized,
+                            "status": "final",
+                            "at": str(row["captured_at"]),
+                        }
+                    )
+            elif isinstance(response, str) and response.strip():
+                spoken = bool(payload.get("spoken"))
+                history.append(
+                    {
+                        "id": str(row["evidence_id"]),
+                        "role": "agent",
+                        "text": " ".join(response.split())[:2000],
+                        "status": "spoken" if spoken else "suppressed",
+                        "at": str(row["captured_at"]),
+                        "reason": str(payload.get("reason") or "")[:300],
+                    }
+                )
+        return history
 
     def associations_for_evidence(self, evidence_id: str) -> dict[str, list[dict[str, Any]]]:
         with self._lock:

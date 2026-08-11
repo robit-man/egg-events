@@ -122,6 +122,7 @@ class RuntimeTelemetry:
         }
         self._scene = SceneInventory()
         self._brain: dict[str, object] = {}
+        self._default_mode: dict[str, object] = {"state": "idle"}
         self._gpu: dict[str, object] = {}
 
     def set_rotation(self, camera_id: str, angle: int) -> None:
@@ -259,6 +260,13 @@ class RuntimeTelemetry:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
+    def record_default_mode(self, state: dict[str, object]) -> None:
+        with self._lock:
+            self._default_mode = {
+                **dict(state),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
     def record_runtime_error(self, component: str, detail: str | BaseException) -> None:
         if isinstance(detail, BaseException):
             message = str(detail).strip()
@@ -376,6 +384,16 @@ class RuntimeTelemetry:
                     "allow_outward_speech": top_decision.allow_outward_speech if top_decision else None,
                     "components": dict(top_decision.components) if top_decision else {},
                     "reason": top_decision.reason if top_decision else "idle",
+                },
+                "graph_feedback": {
+                    entity_id: {
+                        "familiarity": signal.familiarity,
+                        "structural_relevance": signal.structural_relevance,
+                        "knowledge_gap": signal.knowledge_gap,
+                        "evidence_count": signal.evidence_count,
+                        "edge_count": signal.edge_count,
+                    }
+                    for entity_id, signal in tick.graph_feedback.items()
                 },
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -588,6 +606,7 @@ class RuntimeTelemetry:
                 "ocr": {**self._ocr, "recent": list(self._ocr["recent"])},
                 "memory": dict(self._memory),
                 "brain": {**self._brain, "memory": dict(self._memory)},
+                "default_mode": dict(self._default_mode),
                 "gpu": dict(self._gpu),
                 "attention_decisions": list(self._attention_decisions),
                 "interaction_decisions": list(self._interaction_decisions),

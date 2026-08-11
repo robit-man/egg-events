@@ -517,3 +517,65 @@ The cognitive-memory implementation is complete only when Egg can, on real confi
 6. consolidate repeated events without losing evidence, correction history, or delete/export controls;
 7. expose all confidence, provenance, attention, ASR, and retention state in the local dashboard; and
 8. pass unit, trace, audit, and real-hardware smoke checks with reported metrics.
+
+---
+
+## WO-011: Bidirectional Graph-to-Control Feedback
+
+**Outcome:** the graph is part of the perception-action loop, not merely a recall
+database. For every stable visible entity, compute familiarity, structural
+relevance, reducible knowledge gaps, evidence count, and conflicts. Feed those
+signals into attention and the bounded context. Project each spoken or suppressed
+action back onto the visible/retrieved graph entities that influenced it.
+
+**Acceptance:** a familiar, well-supported entity receives less effective novelty
+than the same raw detection with no graph history; the action evidence records its
+graph and retrieval influences; all feedback scores are inspectable in Cognition.
+
+## WO-012: Calibrated Novelty and Perceptual Focus
+
+**Outcome:** replace rarity/noise-seeking with belief update and expected reducible
+information gain. Habituate repeated observations across runtime and graph history,
+discount unstable/no-ID prediction error, retain communicative actions, and send
+Ornith the most reliable bounded object mask rather than the least-confident one.
+
+**Acceptance:** recurrent static entities decay in priority, aleatoric detector
+noise does not dominate, and object auto-label candidates meet the configured
+confidence gate before consuming a VLM call.
+
+## WO-013: Source-Backed Curiosity Contract
+
+**Outcome:** curiosity questions must name one currently visible graph subject,
+one missing predicate, their evidence/familiarity basis, answerability, epistemic
+value, timeout, cooldown, and hourly budget. Answers become evidence-backed claims;
+"I don't know" leaves the gap open. Curiosity can propose speech but never bypass
+the interaction/floor authority.
+
+**Acceptance:** no question is emitted for an absent subject, a previously answered
+predicate, or an exhausted budget; a valid answer closes the candidate on the next
+replay.
+
+## WO-014: Default-Mode Replay and Reflection
+
+**Outcome:** during natural quiet windows, replay a bounded graph inventory,
+materialize source-linked reflection nodes without deleting evidence, detect
+reducible gaps, and expose state/results. Couple replay output back to realtime
+control only through the curiosity contract.
+
+**Acceptance:** replay survives restart as an auditable job; repeated passes are
+idempotent for the same reflection; realtime sensing, ASR, and conversation queues
+always take priority.
+
+## WO-015: Low-Latency Visually Grounded Conversation
+
+**Outcome:** ordinary directed speech uses local deterministic routing plus Omnius
+`realtime=true`, `tools=false`, and hidden reasoning disabled. Deictic questions
+such as "what am I holding?" route one current best-camera frame directly to the
+local Ornith VLM, avoiding a stale label-only context and a second serial text
+generation. The Voice page renders the complete durable heard/agent ledger without
+destroying scroll or route state on refresh.
+
+**Acceptance:** the app makes one question-conditioned vision generation for a
+visual query, responses are grounded in a frame no more than three seconds old,
+conversation history survives navigation and daemon restart, and no hard browser
+refresh is needed.

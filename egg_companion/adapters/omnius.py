@@ -860,6 +860,62 @@ class OmniusClient:
             raise RuntimeError("Omnius VLM returned an invalid completion") from error
         return self.parse_object_classification(content)
 
+    async def answer_visual_question(
+        self, image_jpeg: bytes, utterance: str, scene: str
+    ) -> str | None:
+        """Answer a deictic question from one current camera frame."""
+        image_data = base64.b64encode(image_jpeg).decode("ascii")
+        payload = {
+            "model": self.config.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "You are the visual perception path for an embodied companion. "
+                        "Answer the speaker's question using only visible pixels in this current frame. "
+                        "Be direct and conversational in one short sentence. If an item is partly occluded, "
+                        "say what it most likely is and express uncertainty. If the pixels do not support an "
+                        "answer, say what must be moved into view. Do not identify people or infer sensitive "
+                        "traits. ASR can confuse 'what' with 'where'; when the utterance contains 'am I holding', "
+                        "the intended question is what item is held. Return JSON only: "
+                        '{"answer":string,"grounded":boolean,"confidence":number}.\n'
+                        f"Speaker utterance: {utterance!r}\nCurrent detector context: {scene[:800]}"
+                    ),
+                    "images": [image_data],
+                }
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 96},
+            "keep_alive": "5m",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with self._model_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.vision_base_url).rstrip('/')}/api/chat", json=payload
+                ) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(
+                            f"Ornith visual question HTTP {response.status}: {detail}"
+                        )
+                    result = await response.json()
+        try:
+            content = result["message"]["content"]
+            parsed = json.loads(content)
+            answer = parsed.get("answer")
+            confidence = float(parsed.get("confidence", 0.0))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(answer, str):
+            return None
+        normalized = " ".join(answer.strip().split())
+        if not normalized or len(normalized) > 320 or not 0 <= confidence <= 1:
+            return None
+        return normalized
+
     @staticmethod
     def parse_object_classification(content: object) -> tuple[str, float] | None:
         if not isinstance(content, str):
@@ -930,6 +986,9 @@ class OmniusClient:
             "stream": False,
             "temperature": 0,
             "tools": False,
+            "think": self.config.reasoning_enabled,
+            "realtime": True,
+            "realtime_options": {"max_history_messages": 4, "max_tokens": 128},
         }
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -978,6 +1037,9 @@ class OmniusClient:
             "stream": False,
             "temperature": 0.6,
             "tools": False,
+            "think": self.config.reasoning_enabled,
+            "realtime": True,
+            "realtime_options": {"max_history_messages": 12, "max_tokens": 160},
         }
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:

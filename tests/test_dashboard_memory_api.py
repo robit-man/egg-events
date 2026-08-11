@@ -73,6 +73,7 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
                 "/api/graph",
                 "/api/graph/node",
                 "/api/voice/action",
+                "/api/voice/conversation",
                 "/api/dreams",
                 "/api/dreams/run",
                 "/api/identities/{profile_id}/timeline",
@@ -110,6 +111,8 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "Applied in-page; an Egg restart is not required" in dashboard.PAGE
     assert "voice-service-state" in dashboard.PAGE
     assert "voiceFormDirty" in dashboard.PAGE
+    assert "Complete durable audible ledger" in dashboard.PAGE
+    assert "telemetry.conversation_history" in dashboard.PAGE
     assert "border-radius: 0 !important" in dashboard.PAGE
     assert 'data-person-id=' in dashboard.PAGE
     assert 'id="person-inspector"' in dashboard.PAGE

@@ -2,7 +2,9 @@ from datetime import datetime, timedelta, timezone
 
 from egg_companion.config import CognitiveAttentionConfig
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
-from egg_companion.models import AttentionTarget, BoundingBox, Detection, Observation
+from egg_companion.models import (
+    AttentionTarget, BoundingBox, Detection, GraphCognitiveSignal, Observation,
+)
 
 
 def target(at, behavior="waving"):
@@ -60,3 +62,25 @@ def test_uncertainty_questions_obey_hourly_budget() -> None:
     assert controller.allow_uncertainty_question(now)
     assert not controller.allow_uncertainty_question(now + timedelta(minutes=10))
     assert controller.allow_uncertainty_question(now + timedelta(hours=1, seconds=1))
+
+
+def test_graph_familiarity_downweights_raw_novelty_without_erasing_gap() -> None:
+    now = datetime.now(timezone.utc)
+    attention, observation = target(now, "standing")
+    unfamiliar = CognitiveAttentionController(
+        CognitiveAttentionConfig(), proactive_enabled=False
+    ).evaluate(attention, observation)
+    familiar = CognitiveAttentionController(
+        CognitiveAttentionConfig(), proactive_enabled=False
+    ).evaluate(
+        attention,
+        observation,
+        GraphCognitiveSignal(
+            "person-001", familiarity=0.95, structural_relevance=0.8,
+            knowledge_gap=0.3, evidence_count=20, edge_count=8,
+        ),
+    )
+
+    assert familiar.components["effective_novelty"] < unfamiliar.components["effective_novelty"]
+    assert familiar.capture_priority < unfamiliar.capture_priority
+    assert familiar.components["graph_relevance"] == 0.8

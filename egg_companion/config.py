@@ -136,6 +136,11 @@ class OmniusConfig(BaseModel):
     voice_name: str | None = None
     bearer_token_env: str | None = None
     timeout_seconds: float = Field(default=20, gt=0, le=120)
+    # Spoken turns use Omnius's direct realtime backend and explicitly disable
+    # hidden reasoning. The separate LLM router is optional because it adds a
+    # full serial generation before every reply.
+    reasoning_enabled: bool = False
+    dialogue_router_enabled: bool = False
 
 
 class SystemServiceConfig(BaseModel):
@@ -290,9 +295,30 @@ class CognitiveAttentionConfig(BaseModel):
     action_change_weight: float = Field(default=0.20, ge=0, le=1)
     speech_weight: float = Field(default=0.30, ge=0, le=1)
     prediction_error_weight: float = Field(default=0.15, ge=0, le=1)
+    epistemic_value_weight: float = Field(default=0.18, ge=0, le=1)
+    graph_familiarity_discount: float = Field(default=0.85, ge=0, le=1)
+    irreducible_uncertainty_discount: float = Field(default=0.65, ge=0, le=1)
     interruption_threshold: float = Field(default=0.75, ge=0, le=1)
+    communicative_action_threshold: float = Field(default=0.35, ge=0, le=1)
     proactive_rate_limit_seconds: float = Field(default=90, gt=0, le=3600)
-    uncertainty_question_budget_per_hour: int = Field(default=4, ge=0, le=100)
+    # Generic low-confidence label interrogation is disabled by default; the
+    # source-backed default-mode curiosity contract is the proactive path.
+    uncertainty_question_budget_per_hour: int = Field(default=0, ge=0, le=100)
+
+
+class DefaultModeConfig(BaseModel):
+    """Bounded quiet-period replay, reflection, and curiosity controls."""
+
+    enabled: bool = True
+    idle_seconds: float = Field(default=45, ge=5, le=3600)
+    interval_min_seconds: float = Field(default=60, ge=15, le=86400)
+    interval_max_seconds: float = Field(default=180, ge=15, le=172800)
+    replay_limit: int = Field(default=8, ge=1, le=100)
+    reflection_min_evidence: int = Field(default=2, ge=1, le=1000)
+    curiosity_threshold: float = Field(default=0.64, ge=0, le=1)
+    proactive_budget_per_hour: int = Field(default=2, ge=0, le=20)
+    proactive_cooldown_seconds: float = Field(default=300, ge=0, le=86400)
+    question_timeout_seconds: float = Field(default=240, gt=0, le=3600)
 
 
 class PrivacyConfig(BaseModel):
@@ -326,6 +352,7 @@ class EggConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     event_segmentation: EventSegmentationConfig = Field(default_factory=EventSegmentationConfig)
     cognitive_attention: CognitiveAttentionConfig = Field(default_factory=CognitiveAttentionConfig)
+    default_mode: DefaultModeConfig = Field(default_factory=DefaultModeConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 

@@ -115,6 +115,10 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         await refresh()
         runtime = state["companion"]
         telemetry = runtime.telemetry.snapshot(config) if isinstance(runtime, CompanionRuntime) else {"cameras": []}
+        if isinstance(runtime, CompanionRuntime):
+            telemetry["conversation_history"] = await asyncio.to_thread(
+                runtime.conversation_history, 5000
+            )
         return web.json_response({
             "runtime": state["runtime"],
             "checks": [{"name": check.name, "status": check.status, "detail": check.detail} for check in state["checks"]],
@@ -274,6 +278,14 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             ),
             headers={"Cache-Control": "no-store"},
         )
+
+    async def conversation_history_handler(request: web.Request) -> web.Response:
+        try:
+            limit = max(1, min(20000, int(request.query.get("limit", "5000"))))
+        except ValueError as error:
+            raise web.HTTPBadRequest(text="limit must be an integer") from error
+        payload = await asyncio.to_thread(companion().conversation_history, limit)
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def voice_config_handler(request: web.Request) -> web.Response:
         require_loopback(request)
@@ -479,6 +491,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     )
     app.router.add_get("/api/objects/{profile_id}/mask.png", object_handler)
     app.router.add_get("/api/voice/catalog", voice_catalog_handler)
+    app.router.add_get("/api/voice/conversation", conversation_history_handler)
     app.router.add_put("/api/voice/config", voice_config_handler)
     app.router.add_post("/api/voice/action", voice_action_handler)
     app.router.add_get("/api/dreams", dreams_handler)

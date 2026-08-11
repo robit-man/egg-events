@@ -97,6 +97,25 @@ class MemoryHit:
 
 
 @dataclass(frozen=True)
+class GraphCognitiveSignal:
+    """Bounded graph feedback for one currently perceived entity.
+
+    This is control metadata, not a truth claim: familiarity reflects retained
+    evidence density, while knowledge_gap and conflict_count expose potentially
+    useful uncertainty to attention and curiosity policy.
+    """
+
+    entity_id: str
+    familiarity: float = 0.0
+    structural_relevance: float = 0.0
+    knowledge_gap: float = 1.0
+    evidence_count: int = 0
+    edge_count: int = 0
+    claim_count: int = 0
+    conflict_count: int = 0
+
+
+@dataclass(frozen=True)
 class AttentionDecision:
     capture_priority: float
     allow_outward_speech: bool
