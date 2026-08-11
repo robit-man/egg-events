@@ -36,8 +36,9 @@ vision:
   minimum_detector_classes: 1000
 
 audio:
-  # Pin the physical array; desktop/TTS routing can change PulseAudio's default.
-  input_device: alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.multichannel-input
+  # The runtime resolves this to the physical ReSpeaker array even if desktop
+  # routing later changes PulseAudio's default; sounddevice audits use default.
+  input_device: default
   output_device: default
   doa_mode: respeaker_usb
   respeaker_vendor_id: 10374
