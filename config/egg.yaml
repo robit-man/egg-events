@@ -36,8 +36,8 @@ vision:
   minimum_detector_classes: 1000
 
 audio:
-  # Pulse/PipeWire default source is the ReSpeaker 4 Mic Array multichannel input.
-  input_device: default
+  # Pin the physical array; desktop/TTS routing can change PulseAudio's default.
+  input_device: alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.multichannel-input
   output_device: default
   doa_mode: respeaker_usb
   respeaker_vendor_id: 10374
@@ -68,7 +68,7 @@ transcription:
   # The DSP channel is quiet by design; post-admission audio is normalized to
   # the target above. WebRTC VAD plus ASR grounding rejects steady ambience.
   rms_threshold: 0.003
-  asr_model: base
+  asr_model: dual
   # This installation is used for English conversation and room media. Set to
   # auto live in the dashboard when multilingual recognition is intentional.
   asr_language: en
@@ -90,6 +90,8 @@ transcription:
 
 omnius:
   base_url: http://127.0.0.1:11435
+  # JetPack-matched CUDA Whisper container. Omnius still owns conversation and TTS.
+  asr_base_url: http://127.0.0.1:11436
   model: omnius-qwen35-9b:latest
   vision_model: robit/ornith-vision:9b
   vision_base_url: http://127.0.0.1:11434
@@ -136,21 +138,31 @@ dreams:
   model_path: models/cvlface_adaface_ir18_webface4m
   model_id: minchul/cvlface_adaface_ir18_webface4m
   model_revision: 0dd53f188fa27968b0a1326970ebf4aeb37ce2ca
-  device: cuda
+  # Identity inference stays off the CUDA context shared by Whisper and live
+  # vision. IR18 is slower on CPU, but bounded and cannot wedge the live app.
+  device: cpu
   batch_size: 64
-  use_half_precision: true
+  use_half_precision: false
+  comparison_model_path: ~/.insightface/models/buffalo_s/w600k_mbf.onnx
+  comparison_model_id: insightface/buffalo_s-w600k_mbf
   idle_seconds: 45
   # Natural jitter prevents consolidation from becoming another rigid UI-reset interval.
   interval_min_seconds: 600
   interval_max_seconds: 1800
+  # When a pass finds aliases, follow up promptly until the gallery converges.
+  convergence_interval_seconds: 60
   proposal_similarity: 0.35
   # Template consensus permits dense, multi-angle clusters instead of requiring
   # one fragile exact-nearest-neighbor pair.
-  modern_merge_similarity: 0.46
+  modern_merge_similarity: 0.40
   modern_strong_similarity: 0.54
-  legacy_merge_similarity: 0.40
-  legacy_strong_similarity: 0.60
-  legacy_similarity_floor: 0.30
+  legacy_merge_similarity: 0.24
+  legacy_strong_similarity: 0.55
+  legacy_similarity_floor: 0.12
+  comparison_merge_similarity: 0.30
+  comparison_strong_similarity: 0.50
+  comparison_similarity_floor: 0.15
+  minimum_model_votes: 2
   separated_modern_similarity: 0.38
   separated_legacy_floor: 0.15
   mutual_neighbor_margin: 0.025

@@ -156,3 +156,23 @@ class IdentityLibraryTests(unittest.TestCase):
 
             self.assertEqual(aliases, [])
             self.assertEqual(library.summary()["canonical_people"], 2)
+
+    def test_rejected_face_samples_are_quarantined_without_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            enrolled = self._enroll(
+                library, "front", np.array((1.0, 0.0, 0.0), dtype=np.float32)
+            )
+            sample = library.face_sample_snapshot()[0]
+
+            result = library.apply_face_validation(
+                {str(sample["sample_id"]): False}, "test-validator"
+            )
+
+            self.assertEqual(result, {"accepted": 0, "rejected": 1})
+            self.assertEqual(library.summary()["canonical_people"], 0)
+            self.assertEqual(library.summary()["quarantined_face_samples"], 1)
+            self.assertEqual(library.face_sample_snapshot(), [])
+            self.assertIsNotNone(
+                library.face_sample(str(enrolled["id"]), str(sample["sample_id"]))
+            )

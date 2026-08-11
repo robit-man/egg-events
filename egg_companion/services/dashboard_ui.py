@@ -712,7 +712,7 @@ PAGE = r"""<!doctype html>
     }
     function statusBadge(value) {
       const normalized = String(value || 'unknown').toLowerCase();
-      const tone = ['pass','ready','active','completed','true'].some(word => normalized.includes(word)) ? 'good' : ['warn','pending','degraded'].some(word => normalized.includes(word)) ? 'warn' : ['fail','error','false'].some(word => normalized.includes(word)) ? 'bad' : '';
+      const tone = ['pass','ready','active','completed','true'].some(word => normalized.includes(word)) ? 'good' : ['warn','pending','degraded','interrupted'].some(word => normalized.includes(word)) ? 'warn' : ['fail','error','false'].some(word => normalized.includes(word)) ? 'bad' : '';
       return `<span class="badge ${tone}">${esc(value ?? 'unknown')}</span>`;
     }
     function table(headers, rows, emptyText = 'No records') {
@@ -908,21 +908,21 @@ PAGE = r"""<!doctype html>
       $('#dream-state').textContent = stateLabel(dreams.state || (dreams.enabled ? 'idle' : 'disabled'));
       $('#dream-next').textContent = dreams.next_scheduled_at ? `Next idle window ${new Date(dreams.next_scheduled_at).toLocaleString()}` : 'Schedule pending';
       $('#dream-people').textContent = identity.canonical_people || 0;
-      $('#dream-fragments').textContent = `${identity.coalesced_aliases || 0} aliases · ${identity.provisional_face_profiles || 0} provisional`;
+      $('#dream-fragments').textContent = `${identity.coalesced_aliases || 0} aliases · ${identity.provisional_face_profiles || 0} provisional · ${identity.quarantined_face_samples || 0} invalid crops quarantined`;
       $('#dream-last-profiles').textContent = last.profiles_examined ?? '—';
       $('#dream-last-detail').textContent = last.started_at ? `${last.samples_embedded || 0} evidence crops · ${Number(last.duration_seconds || 0).toFixed(2)} s` : 'No completed dreams';
       $('#dream-merges').textContent = identity.coalesced_aliases || 0;
       $('#dream-conflicts').textContent = `Last pass: ${last.merges || 0} merged · ${last.conflicts_blocked || 0} co-observation blocks`;
       $('#dream-model-ready').className = `badge ${model.ready ? 'good' : 'bad'}`;
       $('#dream-model-ready').textContent = model.ready ? `${esc(model.configured_device || model.device || 'local')} ready` : 'Weights unavailable';
-      $('#dream-model').textContent = `${model.architecture || 'AdaFace IR18'}\n${model.id || 'model unavailable'}\nrevision ${model.revision || '—'}\nconfigured ${model.configured_device || '—'} · runtime ${model.device || 'unloaded'}\n${model.path || '—'}\n\n${model.usage_notice || ''}`;
+      $('#dream-model').textContent = `${model.architecture || 'AdaFace IR18'}\n${model.id || 'model unavailable'}\nrevision ${model.revision || '—'}\nconfigured ${model.configured_device || '—'} · runtime ${model.device || 'unloaded'}\n${model.path || '—'}\n\ncomparison ${model.comparison?.id || 'not configured'} · ${model.comparison?.ready ? (model.comparison?.device || 'ready') : 'unavailable'}\n${model.comparison?.path || '—'}\n\n${model.usage_notice || ''}`;
       $('#dream-policy').innerHTML = (policy.constraints || []).map(item => `<span class="badge">${esc(item)}</span>`).join('') || '<span class="muted">Policy unavailable.</span>';
-      $('#dream-policy-detail').textContent = `Idle ${policy.idle_seconds ?? '—'} s · randomized interval ${policy.interval_min_seconds ?? '—'}–${policy.interval_max_seconds ?? '—'} s · reciprocal top-${policy.reciprocal_neighbor_rank ?? '—'} · AdaFace ${policy.modern_merge_similarity ?? '—'} / SFace ${policy.legacy_merge_similarity ?? '—'} · ${policy.coobservation_min_confirmations ?? '—'} co-observations to veto`;
+      $('#dream-policy-detail').textContent = `Idle ${policy.idle_seconds ?? '—'} s · randomized interval ${policy.interval_min_seconds ?? '—'}–${policy.interval_max_seconds ?? '—'} s · ${policy.minimum_model_votes ?? 2}-model consensus · AdaFace ${policy.modern_merge_similarity ?? '—'} / SFace ${policy.legacy_merge_similarity ?? '—'} / MobileFaceNet ${policy.comparison_merge_similarity ?? '—'} · ${policy.coobservation_min_confirmations ?? '—'} co-observations to veto`;
       const latestCandidates = candidates.filter(item => !last.run_id || item.run_id === last.run_id), auditOnly = latestCandidates.filter(item => item.decision === 'review').length;
       const recent = latestCandidates.filter(item => item.decision !== 'review').slice(0, 60);
       $('#dream-candidates').innerHTML = recent.map(item => {
         const tone = ['merged','consolidated'].includes(item.decision) ? 'good' : item.decision === 'blocked' ? 'bad' : 'warn';
-        return `<article class="dream-candidate"><div class="dream-pair"><div class="dream-face"><img loading="lazy" src="/api/identities/${encodeURIComponent(item.left_id)}/face.jpg" alt="Evidence for ${esc(item.left_id)}"><div><strong>${esc(item.left_id)}</strong><div class="muted">AdaFace ${Number(item.modern_similarity || 0).toFixed(3)}</div></div></div><div class="dream-link">↔</div><div class="dream-face"><img loading="lazy" src="/api/identities/${encodeURIComponent(item.right_id)}/face.jpg" alt="Evidence for ${esc(item.right_id)}"><div><strong>${esc(item.right_id)}</strong><div class="muted">SFace ${Number(item.legacy_similarity || 0).toFixed(3)}</div></div></div></div><div class="badge-row" style="margin-top:10px"><span class="badge ${tone}">${esc(item.decision)}</span><span class="badge">${esc(item.reason || 'evaluated')}</span><span class="badge">margins ${Number(item.left_margin || 0).toFixed(3)} / ${Number(item.right_margin || 0).toFixed(3)}</span>${item.canonical_id ? `<span class="badge good">canonical ${esc(item.canonical_id)}</span>` : ''}</div></article>`;
+        return `<article class="dream-candidate"><div class="dream-pair"><div class="dream-face"><img loading="lazy" src="/api/identities/${encodeURIComponent(item.left_id)}/face.jpg" alt="Evidence for ${esc(item.left_id)}"><div><strong>${esc(item.left_id)}</strong><div class="muted">AdaFace ${Number(item.modern_similarity || 0).toFixed(3)}</div></div></div><div class="dream-link">↔</div><div class="dream-face"><img loading="lazy" src="/api/identities/${encodeURIComponent(item.right_id)}/face.jpg" alt="Evidence for ${esc(item.right_id)}"><div><strong>${esc(item.right_id)}</strong><div class="muted">SFace ${Number(item.legacy_similarity || 0).toFixed(3)} · MobileFaceNet ${item.comparison_similarity == null ? '—' : Number(item.comparison_similarity).toFixed(3)}</div></div></div></div><div class="badge-row" style="margin-top:10px"><span class="badge ${tone}">${esc(item.decision)}</span><span class="badge">${esc(item.reason || 'evaluated')}</span><span class="badge">margins ${Number(item.left_margin || 0).toFixed(3)} / ${Number(item.right_margin || 0).toFixed(3)}</span>${item.canonical_id ? `<span class="badge good">canonical ${esc(item.canonical_id)}</span>` : ''}</div></article>`;
       }).join('') + (auditOnly ? `<div class="empty">${esc(auditOnly)} weak comparisons retained in the audit database; they are not stalled work and require no review.</div>` : '') || '<div class="empty">No identity changes or safety vetoes in the latest dream.</div>';
       $('#dream-history').innerHTML = table(['Started','State','Device','Profiles / samples','Proposals','Merges','Duration'], runs.map(run => [esc(new Date(run.started_at).toLocaleString()), statusBadge(run.state), esc(run.device || '—'), `${esc(run.profiles_examined || 0)} / ${esc(run.samples_embedded || 0)}`, esc(run.proposals || 0), esc(run.merges || 0), `${Number(run.duration_seconds || 0).toFixed(2)} s`]), 'No dream runs recorded');
     }
@@ -1056,7 +1056,7 @@ PAGE = r"""<!doctype html>
     });
     $('#dream-run').addEventListener('click', async () => {
       const button = $('#dream-run'), result = $('#dream-result');
-      button.disabled = true; button.textContent = 'Dreaming…'; result.className = 'result'; result.textContent = 'Re-embedding retained face evidence on the local GPU';
+      button.disabled = true; button.textContent = 'Dreaming…'; result.className = 'result'; result.textContent = 'Re-embedding retained face evidence in isolated local workers';
       try {
         const response = await fetch('/api/dreams/run', {method:'POST', headers:{'Content-Type':'application/json'}});
         if (!response.ok) throw new Error(await response.text());

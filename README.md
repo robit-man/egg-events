@@ -11,6 +11,7 @@ Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker di
 - Persists source-grounded entities, episodes, evidence, claims, revisions, graph edges, and embeddings in local SQLite WAL storage.
 - Uses prediction residuals, habituation, communicative action, and deterministic interruption policy rather than frame-count novelty.
 - Captures the ReSpeaker XVF3000's processed AEC/beamformed ASR channel with adaptive WebRTC-VAD turn boundaries, native DSP VAD/DoA/AEC/AGC/RT60 telemetry, listen/think/speak LED states, and revisioned semantic barge-in with tail-only WAV resume.
+- Runs a JetPack-matched CUDA dual-Whisper service: `tiny.en` admits grounded speech, then `base.en` verifies and supplies the transcript; silence and known Whisper outro hallucinations are rejected before conversation ingress.
 - Reasons through Omnius `/v1/chat`, publishes only responses owned by the latest finalized heard-audio revision, and emits Supertonic `F4` WAV audio.
 - Audits Jetson GPU power state, V4L2 cameras, ReSpeaker input/output/DOA, model checkpoints, CUDA, memory integrity, Ornith availability, and Omnius voice/cognition contracts.
 
@@ -20,7 +21,7 @@ The companion maintains an on-device profile gallery from validated face crops a
 
 ## Install on the Egg
 
-The single launcher performs the Jetson-specific bootstrap, including the CUDA PyTorch build, vision checkpoints, CUDA CTranslate2 ASR runtime, Ornith model, ReSpeaker DSP route, GPU runtime-PM guard, and bounded Ollama service configuration.
+The single launcher performs the Jetson-specific bootstrap, including the CUDA PyTorch build, vision checkpoints, pinned dual-Whisper Jetson container, Ornith model, ReSpeaker DSP route, GPU runtime-PM guard, and bounded Ollama service configuration.
 
 ```bash
 ./egg bootstrap
@@ -28,8 +29,8 @@ The single launcher performs the Jetson-specific bootstrap, including the CUDA P
 
 `config/egg.yaml` discovers every V4L2 camera not already listed, rotates all corrected sources `90°` before inference, uses ReSpeaker USB `2886:0018`, Omnius `1.0.608+` on port `11435`, `omnius-qwen35-9b:latest` for cognition, `robit/ornith-vision:9b` for sparse masked-object teaching, and Supertonic voice `F4`.
 
-Identity dreams use the pinned AdaFace IR18/WebFace4M checkpoint locally and
-offline. Bootstrap it explicitly on a new installation; the randomized idle
+Identity dreams use pinned AdaFace IR18/WebFace4M and InsightFace MobileFaceNet
+checkpoints locally and offline. Bootstrap them explicitly on a new installation; the randomized idle
 scheduler then consolidates profiles and projects their complete evidence history
 without dashboard interaction. The Dreams page is an audit/status view with a
 manual trigger only as an optional override:
@@ -39,8 +40,8 @@ manual trigger only as an optional override:
 ```
 
 The model card requires users to follow the training dataset's license for their
-deployment. Dream merges use quality-weighted AdaFace and SFace templates,
-reciprocal neighborhood/score-separation evidence, compatible names, and repeated
+deployment. Dream merges use quality-weighted AdaFace, SFace, and MobileFaceNet
+templates, two-of-three model consensus, compatible names, and repeated
 or spatially explicit distinct-person constraints. Source profiles and evidence
 remain intact behind reversible aliases. The People page opens each canonical
 person into a dated encounter timeline across every coalesced source profile.
@@ -74,7 +75,7 @@ The bootstrap installs `egg-gpu-pm-guard.service` before display-manager and Oll
 - Omnius chat/ASR/TTS REST API: `egg_companion/adapters/omnius.py`
 - Optional external event bridge: `egg_companion/adapters/system_service.py`
 
-Omnius chat, ASR, voice warm-up, and TTS are native endpoints in `OmniusClient`; TTS WAV is delivered to the local speaker through `aplay`. A separate event bridge remains optional for external system integrations.
+Omnius owns chat, voice warm-up, and TTS; `egg-whisper.service` owns ASR on port `11436`, and `OmniusClient` composes both voice catalogs for the dashboard. TTS WAV is delivered to the local speaker through `aplay`. A separate event bridge remains optional for external system integrations.
 
 The local conversational floor and interruption invariants are documented in
 `docs/VOICE_TURN_RUNTIME.md`. Voice state (`listening`, `audio_detected`,

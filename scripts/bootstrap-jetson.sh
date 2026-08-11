@@ -38,11 +38,12 @@ ensure_local_services() {
 ensure_companion_service() {
   local unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir"
+  ln -sfn "$workspace_dir/deploy/egg-whisper.service" "$unit_dir/egg-whisper.service"
   cat > "$unit_dir/egg-companion.service" <<EOF
 [Unit]
 Description=Egg embodied companion runtime and dashboard
-After=network-online.target omnius-daemon.service pulseaudio.service sound.target
-Wants=network-online.target omnius-daemon.service pulseaudio.service
+After=network-online.target omnius-daemon.service egg-whisper.service pulseaudio.service sound.target
+Wants=network-online.target omnius-daemon.service egg-whisper.service pulseaudio.service
 
 [Service]
 Type=simple
@@ -72,12 +73,16 @@ EOF
   chmod +x "$workspace_dir/scripts/postboot-verify.sh"
   systemctl --user daemon-reload
   systemctl --user enable egg-companion.service
+  systemctl --user enable egg-whisper.service
   systemctl --user enable egg-postboot-verify.service
   sudo loginctl enable-linger "$USER"
 }
 
 ensure_system_packages
 ensure_local_services
+if ! docker image inspect dustynv/whisper:r36.2.0 >/dev/null 2>&1; then
+  docker pull dustynv/whisper:r36.2.0
+fi
 python3 -m venv --system-site-packages "$workspace_dir/.venv"
 venv_python="$workspace_dir/.venv/bin/python"
 venv_pip="$workspace_dir/.venv/bin/pip"
@@ -132,69 +137,6 @@ EOF
   sudo systemctl restart egg-gpu-pm-guard.service
 }
 
-ensure_omnius_cuda_asr() {
-  local asr_venv="$HOME/.omnius/runtimes/asr/transcribe-cli-node/node_modules/transcribe-cli/.venv"
-  local asr_python="$asr_venv/bin/python"
-  local runtime_prefix="$HOME/.local/opt/egg-ctranslate2-cuda"
-  local cuda_root
-  local cuda_library_path
-  local build_dir
-
-  if [[ ! -x "$asr_python" ]]; then
-    echo "Omnius transcribe-cli runtime is missing: $asr_python" >&2
-    return 1
-  fi
-  if ! command -v nvcc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
-    echo "CUDA ASR requires nvcc, cmake, and ninja." >&2
-    return 1
-  fi
-  cuda_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
-  cuda_library_path="$runtime_prefix/lib:$cuda_root/targets/aarch64-linux/lib"
-
-  if LD_LIBRARY_PATH="$cuda_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$asr_python" - <<'PY'
-import ctranslate2
-raise SystemExit(0 if ctranslate2.get_cuda_device_count() > 0 else 1)
-PY
-  then
-    return 0
-  fi
-
-  build_dir="$(mktemp -d /tmp/egg-ctranslate2-cuda.XXXXXX)"
-  git clone --depth 1 --branch v4.8.1 --recurse-submodules https://github.com/OpenNMT/CTranslate2.git "$build_dir/source"
-  "$asr_python" -m pip install --upgrade 'pip<25' wheel 'cmake>=3.22' 'ninja>=1.11' 'pybind11>=2.10'
-  cmake -S "$build_dir/source" -B "$build_dir/source/build-cuda" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$build_dir/prefix" \
-    -DWITH_CUDA=ON \
-    -DWITH_CUDNN=OFF \
-    -DOPENMP_RUNTIME=NONE \
-    -DWITH_MKL=OFF \
-    -DWITH_OPENBLAS=OFF \
-    -DWITH_RUY=OFF \
-    -DCMAKE_CUDA_ARCHITECTURES=87
-  cmake --build "$build_dir/source/build-cuda" --parallel 6
-  cmake --install "$build_dir/source/build-cuda"
-  mkdir -p "$runtime_prefix"
-  cp -a "$build_dir/prefix/." "$runtime_prefix/"
-  CTRANSLATE2_ROOT="$runtime_prefix" LD_LIBRARY_PATH="$cuda_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    "$asr_python" -m pip install --no-build-isolation --no-deps --force-reinstall "$build_dir/source/python"
-  LD_LIBRARY_PATH="$cuda_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$asr_python" - <<'PY'
-import ctranslate2
-if ctranslate2.get_cuda_device_count() < 1:
-    raise SystemExit("CTranslate2 CUDA build completed but cannot access the Jetson GPU.")
-print(f"Using CUDA CTranslate2 {ctranslate2.__version__} with {ctranslate2.get_cuda_device_count()} GPU(s)")
-PY
-  install -d "$HOME/.config/systemd/user/omnius-daemon.service.d"
-  cat > "$HOME/.config/systemd/user/omnius-daemon.service.d/egg-cuda-asr.conf" <<EOF
-[Service]
-Environment="LD_LIBRARY_PATH=$cuda_library_path"
-Environment="OMNIUS_TRANSCRIBE_PYTHON=$asr_python"
-Environment="TRANSCRIBE_PYTHON=$asr_python"
-EOF
-  systemctl --user daemon-reload
-  systemctl --user try-restart omnius-daemon.service || true
-}
-
 ensure_ornith_vision() {
   if ! command -v ollama >/dev/null 2>&1; then
     echo "Ollama is required for Ornith Vision object classification." >&2
@@ -233,7 +175,7 @@ if not torch.cuda.is_available():
 print(f"Using CUDA PyTorch {torch.__version__} on {torch.cuda.get_device_name(0)}")
 PY
 "$venv_pip" install --no-deps -e "$workspace_dir"
-"$venv_pip" install --no-deps open-clip-torch ultralytics sounddevice pyusb webrtcvad-wheels ftfy timm pytest
+"$venv_pip" install --no-deps open-clip-torch ultralytics onnxruntime sounddevice pyusb webrtcvad-wheels ftfy timm pytest
 yunet_model="$workspace_dir/models/face_detection_yunet_2023mar.onnx"
 if [[ ! -s "$yunet_model" ]]; then
   mkdir -p "$(dirname "$yunet_model")"
@@ -260,7 +202,7 @@ if [[ ! -s "$pose_model" ]]; then
   curl -fL --retry 3 --connect-timeout 15 -o "$pose_model" \
     https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt
 fi
-ensure_omnius_cuda_asr
+"$venv_python" "$workspace_dir/scripts/install_dream_identity_model.py"
 ensure_ornith_vision
 EGG_RESPEAKER_PYTHON="$venv_python" "$workspace_dir/scripts/configure-respeaker-aec.sh"
 "$venv_python" -m egg_companion --config "$workspace_dir/config/egg.yaml" audit

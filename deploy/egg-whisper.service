@@ -1,0 +1,16 @@
+[Unit]
+Description=Egg Jetson CUDA dual Whisper ASR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f egg-whisper
+ExecStart=/usr/bin/docker run --rm --name egg-whisper --runtime nvidia --network host --ipc host --pull never -e EGG_WHISPER_PORT=11436 -e EGG_WHISPER_FAST_MODEL=tiny.en -e EGG_WHISPER_ACCURATE_MODEL=base.en -e EGG_WHISPER_MODEL_CACHE=/models -v %h/Documents/egg_events/scripts:/app/egg:ro -v %h/.cache/egg-whisper:/models dustynv/whisper:r36.2.0 python3 /app/egg/jetson_whisper_server.py
+ExecStop=-/usr/bin/docker stop -t 10 egg-whisper
+Restart=always
+RestartSec=3
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target

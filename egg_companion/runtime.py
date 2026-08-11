@@ -567,7 +567,18 @@ class CompanionRuntime:
             return jetson.processes
 
         jetson = jtop()
-        jetson.start()
+        try:
+            jetson.start()
+        except Exception as error:
+            logger.warning(
+                "jtop process telemetry unavailable; tegrastats aggregate telemetry remains active: %s",
+                error,
+            )
+            try:
+                jetson.close()
+            except Exception:
+                pass
+            jetson = None
         process = await asyncio.create_subprocess_exec(
             "tegrastats", "--interval", "2000",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -580,7 +591,11 @@ class CompanionRuntime:
                 text = line.decode("utf-8", errors="replace")
                 ram_match = re.search(r"RAM (\d+)/(\d+)MB", text)
                 gpu_match = re.search(r"GR3D_FREQ (\d+)%", text)
-                processes = await asyncio.to_thread(read_processes, jetson) if jetson.ok() else []
+                processes = (
+                    await asyncio.to_thread(read_processes, jetson)
+                    if jetson is not None and jetson.ok()
+                    else []
+                )
                 self.telemetry.record_gpu_state(
                     ram_used_mb=float(ram_match.group(1)) if ram_match else None,
                     ram_total_mb=float(ram_match.group(2)) if ram_match else None,
@@ -588,7 +603,8 @@ class CompanionRuntime:
                     processes=processes,
                 )
         finally:
-            jetson.close()
+            if jetson is not None:
+                jetson.close()
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=2)
@@ -770,7 +786,8 @@ class CompanionRuntime:
                 await asyncio.sleep(0.5)
                 continue
             self.telemetry.record_waveform(samples)
-            self.telemetry.record_respeaker(self._direction.latest_status())
+            respeaker_status = self._direction.latest_status()
+            self.telemetry.record_respeaker(respeaker_status)
             if (
                 not self.config.audio.barge_in_enabled
                 and (self._speaking or time.monotonic() < self._asr_holdoff_until)
@@ -792,7 +809,16 @@ class CompanionRuntime:
                 next_vad_preview_at = now + 0.1
                 preview_buffer = preview_buffer[-self.config.audio.sample_rate:]
             try:
-                boundaries = await asyncio.to_thread(self._segmenter.feed_events, samples)
+                native_speech_gate = (
+                    bool(respeaker_status.get("speech_detected"))
+                    if self.config.audio.doa_mode == "respeaker_usb"
+                    and respeaker_status.get("ready")
+                    and isinstance(respeaker_status.get("speech_detected"), bool)
+                    else None
+                )
+                boundaries = await asyncio.to_thread(
+                    self._segmenter.feed_events, samples, native_speech_gate
+                )
             except Exception as error:
                 logger.exception("ReSpeaker utterance segmentation failed")
                 self.telemetry.record_runtime_error("audio-segmentation", error)
@@ -1274,6 +1300,23 @@ class CompanionRuntime:
         return self.dreams.snapshot()
 
     async def run_identity_dream(self, requested_by: str = "manual") -> dict[str, object]:
+        face_validation: dict[str, int] | None = None
+        pending_samples = await asyncio.to_thread(
+            self.identities.unvalidated_face_samples
+        )
+        if pending_samples and self._vision is not None:
+            decisions = await asyncio.to_thread(
+                self._vision.validate_face_evidence,
+                [bytes(sample["image_jpeg"]) for sample in pending_samples],
+            )
+            face_validation = await asyncio.to_thread(
+                self.identities.apply_face_validation,
+                {
+                    str(sample["sample_id"]): valid
+                    for sample, valid in zip(pending_samples, decisions)
+                },
+                f"{self.config.vision.clip_model}:{self.config.vision.clip_pretrained}",
+            )
         profiles = [
             str(profile["profile_id"])
             for profile in self.identities.migration_profiles()
@@ -1291,6 +1334,8 @@ class CompanionRuntime:
         result = await asyncio.to_thread(
             self.dreams.run, conflicts, requested_by
         )
+        if face_validation is not None:
+            result["face_validation"] = face_validation
         if self._memory is not None and result.get("aliases"):
             result["memory_projection"] = await asyncio.to_thread(
                 self._memory.store.coalesce_identity_evidence,
@@ -1336,15 +1381,24 @@ class CompanionRuntime:
                     datetime.now(timezone.utc) + timedelta(seconds=due_at - now)
                 )
                 continue
+            converging = False
             try:
-                await self.run_identity_dream("scheduler")
+                result = await self.run_identity_dream("scheduler")
+                converging = int(result.get("merges") or 0) > 0
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 logger.exception("identity dream failed")
                 self.telemetry.record_runtime_error("identity-dream", error)
             finally:
-                due_at = schedule_next()
+                if converging:
+                    delay = self.config.dreams.convergence_interval_seconds
+                    due_at = time.monotonic() + delay
+                    self.dreams.set_next_scheduled_at(
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    )
+                else:
+                    due_at = schedule_next()
 
     async def _queue_ocr_candidates(
         self, frame: np.ndarray, observation: Observation

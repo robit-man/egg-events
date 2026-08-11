@@ -61,6 +61,18 @@ def test_no_utterance_without_sustained_onset() -> None:
     assert utterances == []
 
 
+def test_native_respeaker_gate_blocks_noise_onset_but_not_active_speech() -> None:
+    segmenter, _ = _segmenter(voiced_frames=set(range(30)))
+
+    blocked = segmenter.feed_events(_frames(4), native_speech_gate=False)
+    started = segmenter.feed_events(_frames(3), native_speech_gate=True)
+    continued = segmenter.feed_events(_frames(3), native_speech_gate=False)
+
+    assert blocked == []
+    assert [event.kind for event in started] == ["started"]
+    assert all(event.kind != "ended" for event in continued)
+
+
 def test_utterance_finalizes_at_max_length_cap_without_hangover() -> None:
     # Continuous speech with no silence must still finalize at the
     # segment_seconds cap rather than buffering forever; enough input is fed to

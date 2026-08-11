@@ -188,6 +188,8 @@ class VisionEngine:
             face = person[y : y + face_height, x : x + face_width]
             if min(face.shape[:2]) >= 64:
                 aligned = self._face_recognizer.alignCrop(person, yunet_face)
+                if not self._face_crop_is_valid(aligned):
+                    continue
                 face_embedding = self._face_embedding(aligned)
                 accepted.append(FaceCrop(aligned, confidence, "face", face_embedding))
         if accepted:
@@ -412,29 +414,74 @@ class VisionEngine:
         return angles[int(similarity[:, 0].argmax().item())]
 
     def _face_crop_confidence(self, face: np.ndarray) -> float:
+        valid, confidence = self._face_crop_validity_batch([face])[0]
+        return confidence if valid else 0.0
+
+    def _face_crop_is_valid(self, face: np.ndarray) -> bool:
+        return self._face_crop_validity_batch([face])[0][0]
+
+    def validate_face_evidence(self, jpeg_images: list[bytes]) -> list[bool]:
+        """Reject retained ears, hands, clothing, and objects without deleting evidence."""
+
+        import cv2
+
+        decoded: list[np.ndarray] = []
+        for payload in jpeg_images:
+            image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                decoded.append(np.empty((0, 0, 3), dtype=np.uint8))
+            else:
+                decoded.append(image)
+        output: list[bool] = []
+        for start in range(0, len(decoded), 64):
+            batch = decoded[start : start + 64]
+            valid_indices = [index for index, image in enumerate(batch) if image.size]
+            decisions = [False] * len(batch)
+            if valid_indices:
+                validated = self._face_crop_validity_batch(
+                    [batch[index] for index in valid_indices]
+                )
+                for index, (valid, _) in zip(valid_indices, validated):
+                    decisions[index] = valid
+            output.extend(decisions)
+        return output
+
+    def _face_crop_validity_batch(
+        self, faces: list[np.ndarray]
+    ) -> list[tuple[bool, float]]:
         import cv2
         from PIL import Image
 
         labels = [
             "a clear front-facing human face",
             "a clear human face in side profile",
-            "a close-up human eye",
-            "a human mouth",
-            "eyeglasses",
+            "a clear human face wearing eyeglasses",
+            "an isolated ear, eye, or mouth without a complete face",
             "a hand or other body part",
-            "background or an object",
+            "clothing or fabric without a complete face",
+            "background scenery or a physical object",
         ]
-        image = Image.fromarray(cv2.cvtColor(face, cv2.COLOR_BGR2RGB))
+        if not faces:
+            return []
+        images = [
+            Image.fromarray(cv2.cvtColor(face, cv2.COLOR_BGR2RGB)) for face in faces
+        ]
         prompt_tokens = self._clip_tokenizer(labels).to(self.config.device)
         with self._inference_lock, self._torch.no_grad():
-            image_features = self._clip_model.encode_image(self._clip_preprocess(image).unsqueeze(0).to(self.config.device))
+            image_features = self._clip_model.encode_image(
+                self._torch.stack([self._clip_preprocess(image) for image in images]).to(
+                    self.config.device
+                )
+            )
             text_features = self._clip_model.encode_text(prompt_tokens)
             similarity = (image_features / image_features.norm(dim=-1, keepdim=True)) @ (
                 text_features / text_features.norm(dim=-1, keepdim=True)
             ).T
-        scores = similarity[0].softmax(dim=0)
-        accepted = scores[:2]
-        return float(accepted.max().item()) if int(scores.argmax().item()) in {0, 1} else 0.0
+        scores = similarity.softmax(dim=1).cpu()
+        return [
+            (int(row.argmax().item()) in {0, 1, 2}, float(row[:3].max().item()))
+            for row in scores
+        ]
 
     @staticmethod
     def _pose_keypoints(results: Sequence[object]) -> list[list[list[float]]]:

@@ -36,7 +36,15 @@ if device is None:
 
 parameters = {
     "AGCONOFF": (19, 0, "int", 1),
-    "GAMMAVAD_SR": (19, 39, "float", 3.5),
+    # Let the XVF3000 raise quiet room speech before channel 0 reaches the
+    # application. Desired power 0.02 is roughly -17 dBov; the 100x ceiling is
+    # 40 dB and remains followed by bounded RMS normalization in Egg.
+    "AGCMAXGAIN": (19, 1, "float", 100.0),
+    "AGCDESIREDLEVEL": (19, 2, "float", 0.02),
+    "HPFONOFF": (18, 27, "int", 2),
+    "STATNOISEONOFF_SR": (19, 33, "int", 1),
+    "NONSTATNOISEONOFF_SR": (19, 34, "int", 1),
+    "GAMMAVAD_SR": (19, 39, "float", 2.0),
 }
 for _, (parameter_id, offset, kind, value) in parameters.items():
     payload = struct.pack("iii", offset, int(value), 1) if kind == "int" else struct.pack("ifi", offset, float(value), 0)

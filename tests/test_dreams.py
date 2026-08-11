@@ -31,6 +31,10 @@ class _ModernEmbedder:
         return np.repeat(np.array([[1.0, 0.0]], dtype=np.float32), len(images), axis=0)
 
 
+class _ComparisonEmbedder(_ModernEmbedder):
+    available = True
+
+
 def _enroll(library: IdentityLibrary, camera: str, embedding: np.ndarray, value: int) -> str:
     frame = np.full((96, 96, 3), value, dtype=np.uint8)
     detection = Detection("person", 0.95, BoundingBox(0, 0, 96, 96))
@@ -116,3 +120,52 @@ def test_dream_consolidates_dense_reciprocal_cluster_in_one_automatic_pass(tmp_p
     assert len(ids) == 3
     assert result["merges"] == 2
     assert library.summary()["canonical_people"] == 1
+
+
+def test_dream_accepts_two_of_three_models_without_reciprocal_margin(tmp_path) -> None:
+    library = IdentityLibrary(
+        IdentityConfig(
+            storage_dir=str(tmp_path / "identities"),
+            face_similarity_threshold=0.9999,
+        )
+    )
+    _enroll(library, "front", np.array((1.0, 0.0), dtype=np.float32), 40)
+    _enroll(library, "side", np.array((0.1, 0.995), dtype=np.float32), 80)
+    engine = IdentityDreamEngine(
+        DreamsConfig(
+            model_path=str(tmp_path / "unused"),
+            modern_merge_similarity=0.5,
+            legacy_merge_similarity=0.99,
+            comparison_model_path=str(tmp_path / "comparison.onnx"),
+            comparison_merge_similarity=0.5,
+        ),
+        library,
+    )
+    engine._embedder = _ModernEmbedder()
+    engine._comparison_embedder = _ComparisonEmbedder()
+
+    result = engine.run(set(), "test")
+
+    assert result["merges"] == 1
+    candidate = engine.snapshot()["candidates"][0]
+    assert candidate["comparison_similarity"] == 1.0
+    assert candidate["reason"] == "quality_aggregated_multimodel_consensus"
+
+
+def test_dream_marks_process_orphans_interrupted_on_reopen(tmp_path) -> None:
+    library = IdentityLibrary(IdentityConfig(storage_dir=str(tmp_path / "identities")))
+    engine = _engine(tmp_path, library)
+    engine._database.execute(
+        """INSERT INTO dream_runs
+        (run_id, requested_by, state, model_id, model_revision, started_at)
+        VALUES ('orphan', 'test', 'running', 'test', 'test',
+        '2026-01-01T00:00:00+00:00')"""
+    )
+    engine._database.commit()
+
+    reopened = _engine(tmp_path, library)
+    orphan = next(run for run in reopened.snapshot()["runs"] if run["run_id"] == "orphan")
+
+    assert orphan["state"] == "interrupted"
+    assert orphan["completed_at"] is not None
+    assert "process stopped" in orphan["error"]

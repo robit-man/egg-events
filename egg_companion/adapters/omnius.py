@@ -51,6 +51,9 @@ class OmniusClient:
             raise RuntimeError(f"required token environment variable is unset: {self.config.bearer_token_env}")
         return {"Authorization": f"Bearer {token}"}
 
+    def _asr_base_url(self) -> str:
+        return str(self.config.asr_base_url or self.config.base_url).rstrip("/")
+
     async def health(self) -> None:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
             async with session.get(f"{str(self.config.base_url).rstrip('/')}/health", headers=self._headers()) as response:
@@ -113,14 +116,16 @@ class OmniusClient:
 
         timeout = aiohttp.ClientTimeout(total=90)
         base_url = str(self.config.base_url).rstrip("/")
+        asr_base_url = self._asr_base_url()
 
         async def get_json(
             session: aiohttp.ClientSession,
             path: str,
             *,
+            service_url: str = base_url,
             unavailable: dict[str, object] | None = None,
         ) -> dict[str, object]:
-            async with session.get(f"{base_url}{path}", headers=self._headers()) as response:
+            async with session.get(f"{service_url}{path}", headers=self._headers()) as response:
                 if response.status == 404 and unavailable is not None:
                     return unavailable
                 response.raise_for_status()
@@ -130,15 +135,31 @@ class OmniusClient:
             return payload
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            tts, asr, supertonic = await asyncio.gather(
+            tts, asr, supertonic, dedicated_asr_state = await asyncio.gather(
                 get_json(session, "/v1/voice/models"),
-                get_json(session, "/v1/voice/asr-models"),
+                get_json(
+                    session, "/v1/voice/asr-models", service_url=asr_base_url
+                ),
                 get_json(
                     session,
                     "/v1/voice/supertonic-settings",
                     unavailable={"supported": False, "settings": {}, "options": {"voices": []}},
                 ),
+                get_json(
+                    session,
+                    "/v1/voice/state",
+                    service_url=asr_base_url,
+                    unavailable={},
+                ) if asr_base_url != base_url else asyncio.sleep(0, result={}),
             )
+        if dedicated_asr_state:
+            state = {
+                **state,
+                **{
+                    key: value for key, value in dedicated_asr_state.items()
+                    if key.startswith("asr") or key in {"device", "lastError", "loadedAt"}
+                },
+            }
         models = asr.get("models")
         if isinstance(models, list):
             asr = {
@@ -162,7 +183,7 @@ class OmniusClient:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                f"{str(self.config.base_url).rstrip('/')}/v1/voice/asr-models",
+                f"{self._asr_base_url()}/v1/voice/asr-models",
                 headers=self._headers(),
             ) as response:
                 response.raise_for_status()
@@ -190,7 +211,7 @@ class OmniusClient:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
-                f"{str(self.config.base_url).rstrip('/')}/v1/voice/asr-models/switch",
+                f"{self._asr_base_url()}/v1/voice/asr-models/switch",
                 json={"modelId": model_id},
                 headers=self._headers(),
             ) as response:
@@ -446,7 +467,7 @@ class OmniusClient:
         async with self._asr_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{str(self.config.base_url).rstrip('/')}/v1/voice/transcribe",
+                    f"{self._asr_base_url()}/v1/voice/transcribe",
                     data=wav_audio,
                     headers=headers,
                     params={"language": language},
@@ -484,6 +505,9 @@ class OmniusClient:
     def transcription_rejection_reason(
         payload: dict[str, object], acoustic_evidence: dict[str, object] | None = None
     ) -> str | None:
+        backend_rejection = payload.get("rejection_reason")
+        if isinstance(backend_rejection, str) and backend_rejection.strip():
+            return backend_rejection.strip()
         text = payload.get("text")
         if isinstance(text, str) and OmniusClient._is_known_silence_hallucination(text):
             # Some backends return text with no segment array. This guard must

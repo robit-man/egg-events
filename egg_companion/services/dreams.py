@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
 import sqlite3
 import sys
 import threading
@@ -89,6 +90,49 @@ class AdaFaceEmbedder:
         self.device = device
 
     def embed(self, jpeg_images: list[bytes]) -> np.ndarray:
+        # PyTorch's aarch64 CPU model loader can retain the GIL for long
+        # stretches even when called through asyncio.to_thread. Keep the
+        # dashboard, live ingress, and camera tasks isolated from dream work.
+        if self.config.device == "cpu":
+            return self._embed_in_worker(jpeg_images)
+        return self._embed_local(jpeg_images)
+
+    def _embed_in_worker(self, jpeg_images: list[bytes]) -> np.ndarray:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_adaface_embed_worker,
+            args=(self.config.model_dump(mode="json"), jpeg_images, child),
+            name="egg-adaface-dream",
+            daemon=True,
+        )
+        process.start()
+        child.close()
+        deadline = time.monotonic() + 300
+        try:
+            while not parent.poll(0.25):
+                if not process.is_alive():
+                    process.join(timeout=1)
+                    raise RuntimeError(
+                        f"AdaFace worker exited without a result ({process.exitcode})"
+                    )
+                if time.monotonic() >= deadline:
+                    process.terminate()
+                    process.join(timeout=5)
+                    raise TimeoutError("AdaFace worker exceeded its 300 second bound")
+            status, payload, device = parent.recv()
+            process.join(timeout=5)
+            if status != "ok":
+                raise RuntimeError(str(payload))
+            self.device = str(device)
+            return np.asarray(payload, dtype=np.float32)
+        finally:
+            parent.close()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    def _embed_local(self, jpeg_images: list[bytes]) -> np.ndarray:
         import cv2
 
         self._load()
@@ -116,6 +160,123 @@ class AdaFaceEmbedder:
         return np.concatenate(outputs) if outputs else np.empty((0, 512), dtype=np.float32)
 
 
+def _adaface_embed_worker(
+    config_values: dict[str, object], jpeg_images: list[bytes], connection: object
+) -> None:
+    """Run heavyweight CPU inference outside the latency-sensitive daemon."""
+
+    try:
+        embedder = AdaFaceEmbedder(DreamsConfig.model_validate(config_values))
+        embeddings = embedder._embed_local(jpeg_images)
+        connection.send(("ok", embeddings, embedder.device))
+    except BaseException as error:
+        connection.send(("error", f"{type(error).__name__}: {error}", "failed"))
+    finally:
+        connection.close()
+
+
+class MobileFaceNetEmbedder:
+    """Independent InsightFace comparison model using bounded CPU ONNX inference."""
+
+    def __init__(self, model_path: str | None) -> None:
+        self.model_path = Path(model_path).expanduser().resolve() if model_path else None
+        self._session = None
+        self.device = "unloaded"
+
+    @property
+    def available(self) -> bool:
+        return self.model_path is not None and self.model_path.is_file()
+
+    def _load(self) -> None:
+        if self._session is not None:
+            return
+        if not self.available:
+            raise RuntimeError("the optional InsightFace comparison model is unavailable")
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            str(self.model_path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        self.device = "cpu"
+
+    def embed(self, jpeg_images: list[bytes]) -> np.ndarray:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_mobileface_embed_worker,
+            args=(str(self.model_path or ""), jpeg_images, child),
+            name="egg-mobileface-dream",
+            daemon=True,
+        )
+        process.start()
+        child.close()
+        deadline = time.monotonic() + 120
+        try:
+            while not parent.poll(0.25):
+                if not process.is_alive():
+                    process.join(timeout=1)
+                    raise RuntimeError(
+                        f"MobileFaceNet worker exited without a result ({process.exitcode})"
+                    )
+                if time.monotonic() >= deadline:
+                    process.terminate()
+                    process.join(timeout=5)
+                    raise TimeoutError("MobileFaceNet worker exceeded its 120 second bound")
+            status, payload, device = parent.recv()
+            process.join(timeout=5)
+            if status != "ok":
+                raise RuntimeError(str(payload))
+            self.device = str(device)
+            return np.asarray(payload, dtype=np.float32)
+        finally:
+            parent.close()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    def _embed_local(self, jpeg_images: list[bytes]) -> np.ndarray:
+        import cv2
+
+        self._load()
+        assert self._session is not None
+        inputs: list[np.ndarray] = []
+        for payload in jpeg_images:
+            image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError("retained face evidence is not a decodable JPEG")
+            image = cv2.resize(image, (112, 112), interpolation=cv2.INTER_AREA)
+            image = (image.astype(np.float32) - 127.5) / 127.5
+            inputs.append(np.ascontiguousarray(image.transpose(2, 0, 1)))
+        if not inputs:
+            return np.empty((0, 512), dtype=np.float32)
+        input_name = self._session.get_inputs()[0].name
+        embedding = self._session.run(
+            None, {input_name: np.stack(inputs, dtype=np.float32)}
+        )[0].astype(np.float32)
+        norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+        return embedding / np.maximum(norms, 1e-12)
+
+
+def _mobileface_embed_worker(
+    model_path: str, jpeg_images: list[bytes], connection: object
+) -> None:
+    """Keep ONNX CPU thread pools out of the real-time companion process."""
+
+    try:
+        embedder = MobileFaceNetEmbedder(model_path)
+        embeddings = embedder._embed_local(jpeg_images)
+        connection.send(("ok", embeddings, embedder.device))
+    except BaseException as error:
+        connection.send(("error", f"{type(error).__name__}: {error}", "failed"))
+    finally:
+        connection.close()
+
+
 class IdentityDreamEngine:
     """Quality-aware, constraint-aware identity consolidation during idle periods."""
 
@@ -136,10 +297,12 @@ class IdentityDreamEngine:
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
         self._embedder = AdaFaceEmbedder(config)
+        self._comparison_embedder = MobileFaceNetEmbedder(config.comparison_model_path)
         self._state = "idle" if config.enabled else "disabled"
         self._active_run_id: str | None = None
         self._next_scheduled_at: str | None = None
         self._create_schema()
+        self._recover_interrupted_runs()
 
     def _create_schema(self) -> None:
         self._database.executescript(
@@ -180,7 +343,40 @@ class IdentityDreamEngine:
             CREATE INDEX IF NOT EXISTS dream_candidates_run ON dream_candidates(run_id, decision);
             """
         )
+        columns = {
+            str(row[1]) for row in self._database.execute("PRAGMA table_info(dream_candidates)")
+        }
+        if "comparison_similarity" not in columns:
+            self._database.execute(
+                "ALTER TABLE dream_candidates ADD COLUMN comparison_similarity REAL"
+            )
         self._database.commit()
+
+    def _recover_interrupted_runs(self) -> None:
+        """Close run rows left behind when a process was stopped mid-inference."""
+
+        completed = datetime.now(timezone.utc)
+        rows = self._database.execute(
+            "SELECT run_id, started_at FROM dream_runs WHERE state='running'"
+        ).fetchall()
+        for row in rows:
+            try:
+                started = datetime.fromisoformat(str(row["started_at"]))
+                duration = max(0.0, (completed - started).total_seconds())
+            except ValueError:
+                duration = 0.0
+            self._database.execute(
+                """UPDATE dream_runs SET state='interrupted', completed_at=?,
+                duration_seconds=?, error=? WHERE run_id=?""",
+                (
+                    completed.isoformat(),
+                    round(duration, 3),
+                    "process stopped before the dream pass completed",
+                    str(row["run_id"]),
+                ),
+            )
+        if rows:
+            self._database.commit()
 
     def set_next_scheduled_at(self, value: datetime | None) -> None:
         with self._lock:
@@ -218,17 +414,28 @@ class IdentityDreamEngine:
                         and (self._embedder.model_path / "models" / "__init__.py").is_file()
                     ),
                     "usage_notice": self.usage_notice,
+                    "comparison": {
+                        "id": self.config.comparison_model_id,
+                        "path": str(self._comparison_embedder.model_path or ""),
+                        "ready": self._comparison_embedder.available,
+                        "device": self._comparison_embedder.device,
+                    },
                 },
                 "policy": {
                     "idle_seconds": self.config.idle_seconds,
                     "interval_min_seconds": self.config.interval_min_seconds,
                     "interval_max_seconds": self.config.interval_max_seconds,
+                    "convergence_interval_seconds": self.config.convergence_interval_seconds,
                     "proposal_similarity": self.config.proposal_similarity,
                     "modern_merge_similarity": self.config.modern_merge_similarity,
                     "modern_strong_similarity": self.config.modern_strong_similarity,
                     "legacy_merge_similarity": self.config.legacy_merge_similarity,
                     "legacy_strong_similarity": self.config.legacy_strong_similarity,
                     "legacy_similarity_floor": self.config.legacy_similarity_floor,
+                    "comparison_merge_similarity": self.config.comparison_merge_similarity,
+                    "comparison_strong_similarity": self.config.comparison_strong_similarity,
+                    "comparison_similarity_floor": self.config.comparison_similarity_floor,
+                    "minimum_model_votes": self.config.minimum_model_votes,
                     "separated_modern_similarity": self.config.separated_modern_similarity,
                     "separated_legacy_floor": self.config.separated_legacy_floor,
                     "mutual_neighbor_margin": self.config.mutual_neighbor_margin,
@@ -236,8 +443,8 @@ class IdentityDreamEngine:
                     "coobservation_min_confirmations": self.config.coobservation_min_confirmations,
                     "auto_merge_enabled": self.config.auto_merge_enabled,
                     "constraints": [
-                        "reciprocal top-k template neighborhood",
-                        "AdaFace and SFace consensus",
+                        "two-of-three AdaFace, SFace, and MobileFaceNet consensus",
+                        "dense-cluster edges do not require fragile mutual-nearest ranking",
                         "repeated or spatially distinct co-observation veto",
                         "compatible user-provided names",
                         "reversible aliases; source evidence retained",
@@ -315,20 +522,36 @@ class IdentityDreamEngine:
         profile_by_id = {str(profile["profile_id"]): profile for profile in profiles}
         groups: dict[str, list[str]] = defaultdict(list)
         for profile in profiles:
-            if profile.get("face_embedding") is not None:
+            if (
+                profile.get("face_embedding") is not None
+                and profile.get("kind") != "invalid-face"
+                and int(profile.get("valid_face_samples", 1) or 0) > 0
+            ):
                 groups[canonical(str(profile["profile_id"]))].append(str(profile["profile_id"]))
         samples_by_group: dict[str, list[dict[str, object]]] = defaultdict(list)
+        valid_profile_ids = {member for members in groups.values() for member in members}
         for sample in self.identities.face_sample_snapshot():
+            if str(sample["profile_id"]) not in valid_profile_ids:
+                continue
             group_id = canonical(str(sample["profile_id"]))
             if group_id in groups:
                 samples_by_group[group_id].append(sample)
         ids = sorted(group_id for group_id in groups if samples_by_group[group_id])
         flat_samples = [sample for group_id in ids for sample in samples_by_group[group_id]]
+        self._update_run_progress(run_id, len(ids), len(flat_samples))
         embeddings = self._embedder.embed(
             [bytes(sample["image_jpeg"]) for sample in flat_samples]
         )
+        comparison_embeddings = (
+            self._comparison_embedder.embed(
+                [bytes(sample["image_jpeg"]) for sample in flat_samples]
+            )
+            if self._comparison_embedder.available
+            else None
+        )
         modern_templates: list[np.ndarray] = []
         legacy_templates: list[np.ndarray] = []
+        comparison_templates: list[np.ndarray] = []
         cursor = 0
         for group_id in ids:
             samples = samples_by_group[group_id]
@@ -340,6 +563,12 @@ class IdentityDreamEngine:
             modern_templates.append(self._normalized((embeddings[cursor : cursor + count] * quality[:, None]).sum(axis=0)))
             legacy = np.stack([np.asarray(sample["sface_embedding"], dtype=np.float32) for sample in samples])
             legacy_templates.append(self._normalized((legacy * quality[:, None]).sum(axis=0)))
+            if comparison_embeddings is not None:
+                comparison_templates.append(
+                    self._normalized(
+                        (comparison_embeddings[cursor : cursor + count] * quality[:, None]).sum(axis=0)
+                    )
+                )
             cursor += count
         if len(ids) < 2:
             return {
@@ -351,10 +580,17 @@ class IdentityDreamEngine:
                 "conflicts_blocked": 0,
                 "aliases": [],
             }
-        modern_matrix = np.stack(modern_templates) @ np.stack(modern_templates).T
-        legacy_matrix = np.stack(legacy_templates) @ np.stack(legacy_templates).T
+        modern_matrix = self._cosine_matrix(modern_templates)
+        legacy_matrix = self._cosine_matrix(legacy_templates)
+        comparison_matrix = (
+            self._cosine_matrix(comparison_templates)
+            if comparison_templates
+            else None
+        )
         np.fill_diagonal(modern_matrix, -2.0)
         np.fill_diagonal(legacy_matrix, -2.0)
+        if comparison_matrix is not None:
+            np.fill_diagonal(comparison_matrix, -2.0)
         order = np.argsort(modern_matrix, axis=1)[:, ::-1]
         names: dict[str, set[str]] = {}
         for group_id in ids:
@@ -378,6 +614,11 @@ class IdentityDreamEngine:
                 if modern < self.config.proposal_similarity:
                     continue
                 legacy = float(legacy_matrix[left, right])
+                comparison = (
+                    float(comparison_matrix[left, right])
+                    if comparison_matrix is not None
+                    else None
+                )
                 left_competitors = [
                     float(modern_matrix[left, index])
                     for index in order[left]
@@ -395,18 +636,29 @@ class IdentityDreamEngine:
                 reciprocal = left_rank < reciprocal_rank and right_rank < reciprocal_rank
                 pair = tuple(sorted((ids[left], ids[right])))
                 name_conflict = bool(names[ids[left]] and names[ids[right]] and names[ids[left]] != names[ids[right]])
-                agrees = (
-                    modern >= self.config.modern_merge_similarity
-                    and legacy >= self.config.legacy_merge_similarity
-                ) or (
+                model_votes = int(modern >= self.config.modern_merge_similarity) + int(
+                    legacy >= self.config.legacy_merge_similarity
+                )
+                required_votes = 2
+                if comparison is not None:
+                    model_votes += int(
+                        comparison >= self.config.comparison_merge_similarity
+                    )
+                    required_votes = self.config.minimum_model_votes
+                agrees = model_votes >= required_votes or (
                     modern >= self.config.modern_strong_similarity
-                    and legacy >= self.config.legacy_similarity_floor
+                    and (
+                        legacy >= self.config.legacy_similarity_floor
+                        or comparison is not None
+                        and comparison >= self.config.comparison_similarity_floor
+                    )
                 ) or (
                     legacy >= self.config.legacy_strong_similarity
-                    and modern >= max(
-                        self.config.proposal_similarity,
-                        self.config.modern_merge_similarity - 0.06,
-                    )
+                    and modern >= self.config.proposal_similarity
+                ) or (
+                    comparison is not None
+                    and comparison >= self.config.comparison_strong_similarity
+                    and modern >= self.config.proposal_similarity
                 ) or (
                     modern >= self.config.separated_modern_similarity
                     and legacy >= self.config.separated_legacy_floor
@@ -418,20 +670,19 @@ class IdentityDreamEngine:
                     conflicts_blocked += 1
                 elif name_conflict:
                     decision, reason = "blocked", "incompatible_user_names"
-                elif not reciprocal:
-                    decision, reason = "review", "outside_reciprocal_template_neighborhood"
                 elif not agrees:
                     decision, reason = "review", "embedding_models_do_not_agree"
                 elif not self.config.auto_merge_enabled:
                     decision, reason = "review", "automatic_merge_disabled"
                 else:
-                    decision, reason = "merge", "quality_aggregated_reciprocal_template_consensus"
+                    decision, reason = "merge", "quality_aggregated_multimodel_consensus"
                 candidate = {
                     "run_id": run_id,
                     "left_id": ids[left],
                     "right_id": ids[right],
                     "modern_similarity": round(modern, 6),
                     "legacy_similarity": round(legacy, 6),
+                    "comparison_similarity": round(comparison, 6) if comparison is not None else None,
                     "left_margin": round(left_margin, 6),
                     "right_margin": round(right_margin, 6),
                     "decision": decision,
@@ -452,7 +703,7 @@ class IdentityDreamEngine:
                 alias_id,
                 canonical_id,
                 modern,
-                "dream_adaface_sface_template_consensus",
+                "dream_multimodel_template_consensus",
                 conflicting_pairs,
             )
             if mapping is None:
@@ -494,9 +745,9 @@ class IdentityDreamEngine:
         with self._lock:
             self._database.executemany(
                 """INSERT INTO dream_candidates
-                (run_id, left_id, right_id, modern_similarity, legacy_similarity,
+                (run_id, left_id, right_id, modern_similarity, legacy_similarity, comparison_similarity,
                 left_margin, right_margin, decision, reason, canonical_id, alias_id)
-                VALUES (:run_id, :left_id, :right_id, :modern_similarity, :legacy_similarity,
+                VALUES (:run_id, :left_id, :right_id, :modern_similarity, :legacy_similarity, :comparison_similarity,
                 :left_margin, :right_margin, :decision, :reason, :canonical_id, :alias_id)""",
                 candidates,
             )
@@ -511,6 +762,22 @@ class IdentityDreamEngine:
             "aliases": new_aliases,
             "model_device": self._embedder.device,
         }
+
+    def _update_run_progress(
+        self, run_id: str, profiles_examined: int, samples_embedded: int
+    ) -> None:
+        with self._lock:
+            self._database.execute(
+                """UPDATE dream_runs SET device=?, profiles_examined=?, samples_embedded=?
+                WHERE run_id=?""",
+                (
+                    self.config.device,
+                    profiles_examined,
+                    samples_embedded,
+                    run_id,
+                ),
+            )
+            self._database.commit()
 
     def _finish_run(self, run_id: str, state: str, result: dict[str, object]) -> None:
         details = dict(result)
@@ -562,3 +829,15 @@ class IdentityDreamEngine:
         if norm <= 0:
             raise ValueError("dream identity template must not be empty")
         return np.asarray(vector, dtype=np.float32) / norm
+
+    @staticmethod
+    def _cosine_matrix(templates: list[np.ndarray]) -> np.ndarray:
+        """Compute the small gallery matrix without a global BLAS thread pool.
+
+        OpenBLAS matrix multiplication can deadlock on Jetson after native
+        PyTorch/ONNX worker processes have exited. The gallery is small enough
+        that NumPy's direct contraction is both bounded and faster in practice.
+        """
+
+        values = np.stack(templates).astype(np.float32, copy=False)
+        return np.einsum("ik,jk->ij", values, values, optimize=False)

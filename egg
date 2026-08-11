@@ -34,13 +34,7 @@ fi
 if ! command -v ollama >/dev/null 2>&1 || ! ollama show robit/ornith-vision:9b >/dev/null 2>&1; then
   needs_bootstrap=1
 fi
-asr_python="$HOME/.omnius/runtimes/asr/transcribe-cli-node/node_modules/transcribe-cli/.venv/bin/python"
-asr_library_path="$HOME/.local/opt/egg-ctranslate2-cuda/lib:/usr/local/cuda/targets/aarch64-linux/lib"
-if [[ ! -x "$asr_python" ]] || ! LD_LIBRARY_PATH="$asr_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$asr_python" - <<'PY'
-import ctranslate2
-raise SystemExit(ctranslate2.get_cuda_device_count() < 1)
-PY
-then
+if ! docker image inspect dustynv/whisper:r36.2.0 >/dev/null 2>&1; then
   needs_bootstrap=1
 fi
 if [[ "$needs_bootstrap" == 1 ]]; then

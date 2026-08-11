@@ -193,3 +193,12 @@ def test_rejected_asr_segment_metadata_does_not_retain_hallucinated_text() -> No
 
     assert redacted == [{"id": 0, "start": 0, "end": 12}]
     assert "watching" not in str(redacted).casefold()
+
+
+def test_dedicated_asr_backend_rejection_is_authoritative() -> None:
+    assert OmniusClient.transcription_rejection_reason(
+        {
+            "text": "plausible but uncorroborated words",
+            "rejection_reason": "dual Whisper disagreement on weak base decode",
+        }
+    ) == "dual Whisper disagreement on weak base decode"

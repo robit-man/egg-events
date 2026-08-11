@@ -1,4 +1,5 @@
 import io
+import subprocess
 import wave
 
 import numpy as np
@@ -8,6 +9,7 @@ from egg_companion.adapters.audio import (
     ReSpeakerCapture,
     ReSpeakerWaveformCapture,
     condition_speech_band,
+    resolve_pulse_source,
 )
 from egg_companion.config import AudioConfig, TranscriptionConfig
 
@@ -19,6 +21,29 @@ class FinishedProcess:
     @staticmethod
     def poll() -> int:
         return 0
+
+
+def test_respeaker_mode_ignores_desktop_default_source(monkeypatch) -> None:
+    def run(command, **_kwargs):
+        if command[1:4] == ["list", "sources", "short"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "17 nx_voice_out.monitor module-null-sink.c s16le 2ch 48000Hz RUNNING\n"
+                "2 alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00."
+                "multichannel-input module-alsa-card.c s16le 6ch 16000Hz RUNNING\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "nx_voice_out.monitor\n", "")
+
+    monkeypatch.setattr("egg_companion.adapters.audio.subprocess.run", run)
+
+    assert resolve_pulse_source(
+        AudioConfig(input_device="default", channels=6, doa_mode="respeaker_usb")
+    ) == (
+        "alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.multichannel-input",
+        6,
+    )
 
 
 def test_waveform_short_read_resets_process_and_recovers_next_chunk() -> None:

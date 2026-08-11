@@ -24,6 +24,13 @@ _RESPEAKER_DSP_PARAMETERS: dict[str, tuple[int, int, str]] = {
     "voice_activity": (19, 32, "int"),
     "speech_detected": (19, 22, "int"),
     "agc_gain": (19, 3, "float"),
+    "agc_enabled": (19, 0, "int"),
+    "agc_max_gain": (19, 1, "float"),
+    "agc_desired_level": (19, 2, "float"),
+    "high_pass_filter": (18, 27, "int"),
+    "stationary_noise_suppression_asr": (19, 33, "int"),
+    "nonstationary_noise_suppression_asr": (19, 34, "int"),
+    "asr_vad_threshold": (19, 39, "float"),
     "aec_far_end_silence": (18, 31, "int"),
     "rt60_seconds": (18, 26, "float"),
 }
@@ -88,6 +95,22 @@ class UtteranceBoundary:
 def resolve_pulse_source(audio: AudioConfig) -> tuple[str, int]:
     if audio.input_device != "default":
         return audio.input_device, audio.channels
+    sources = subprocess.run(
+        ["pactl", "list", "sources", "short"], check=False, capture_output=True, text=True
+    )
+    # Desktop/TTS routing is allowed to change PulseAudio's default source.
+    # ReSpeaker capture is not: prefer the physical six-channel array whenever
+    # the configured hardware mode says it is authoritative.
+    if audio.doa_mode == "respeaker_usb":
+        for line in sources.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) >= 2
+                and "SEEED_ReSpeaker_4_Mic_Array" in fields[1]
+                and "multichannel-input" in fields[1]
+            ):
+                match = re.search(r"\b(\d+)ch\b", line)
+                return fields[1], int(match.group(1)) if match else audio.channels
     result = subprocess.run(
         ["pactl", "get-default-source"],
         check=False,
@@ -98,9 +121,6 @@ def resolve_pulse_source(audio: AudioConfig) -> tuple[str, int]:
     if result.returncode or not source:
         detail = result.stderr.strip()
         raise RuntimeError(f"cannot resolve PulseAudio input source: {detail or result.returncode}")
-    sources = subprocess.run(
-        ["pactl", "list", "sources", "short"], check=False, capture_output=True, text=True
-    )
     for line in sources.stdout.splitlines():
         fields = line.split()
         if len(fields) >= 2 and fields[1] == source:
@@ -153,7 +173,11 @@ def read_respeaker_dsp_status(config: AudioConfig, *, diagnostics: bool = True) 
             for name in names
         }
     values["doa_angle"] = values["doa_angle"] % 360
-    for name in ("voice_activity", "speech_detected", "aec_far_end_silence"):
+    for name in (
+        "voice_activity", "speech_detected", "aec_far_end_silence",
+        "agc_enabled", "stationary_noise_suppression_asr",
+        "nonstationary_noise_suppression_asr",
+    ):
         if name in values:
             values[name] = bool(values[name])
     values.update(
@@ -338,7 +362,9 @@ class UtteranceSegmenter:
             if event.kind == "ended" and event.samples is not None
         ]
 
-    def feed_events(self, samples: np.ndarray) -> list[UtteranceBoundary]:
+    def feed_events(
+        self, samples: np.ndarray, native_speech_gate: bool | None = None
+    ) -> list[UtteranceBoundary]:
         """Consume samples and expose ordered onset/end events for barge-in."""
         combined = np.concatenate((self._carry, samples.astype(np.float32, copy=False)))
         frame_count = combined.size // self._frame_samples
@@ -346,11 +372,17 @@ class UtteranceSegmenter:
         events: list[UtteranceBoundary] = []
         for index in range(frame_count):
             frame = combined[index * self._frame_samples: (index + 1) * self._frame_samples]
-            events.extend(self._consume_frame(frame))
+            events.extend(self._consume_frame(frame, native_speech_gate))
         return events
 
-    def _consume_frame(self, frame: np.ndarray) -> list[UtteranceBoundary]:
+    def _consume_frame(
+        self, frame: np.ndarray, native_speech_gate: bool | None = None
+    ) -> list[UtteranceBoundary]:
         voiced = self._is_voiced(frame)
+        # Use the XVF3000's speech detector to admit onset, while allowing an
+        # admitted utterance to continue through normal inter-word gaps.
+        if not self._recording and native_speech_gate is False:
+            voiced = False
         if not self._recording:
             self._pre_roll.append(frame)
             self._voiced_streak = self._voiced_streak + 1 if voiced else 0

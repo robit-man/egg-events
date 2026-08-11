@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import json
 import logging
+import signal
 import sys
 
 from egg_companion.config import load_config
@@ -95,6 +97,10 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    # A live Jetson can spend long stretches inside native CUDA/BLAS calls.
+    # SIGUSR2 provides a non-destructive all-thread traceback for diagnosing a
+    # slow component without stopping voice, cameras, or the dashboard.
+    faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
     args = _parser().parse_args()
     try:
         raise SystemExit(asyncio.run(_run(args)))

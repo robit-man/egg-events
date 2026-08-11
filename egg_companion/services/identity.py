@@ -236,7 +236,8 @@ class IdentityLibrary:
             face_groups = self._face_groups()
             gallery = (
                 self._database.execute(
-                    "SELECT COUNT(*) AS samples, COUNT(DISTINCT profile_id) AS profiles FROM face_samples"
+                    """SELECT COUNT(*) AS samples, COUNT(DISTINCT profile_id) AS profiles
+                    FROM face_samples WHERE validity != 'rejected'"""
                 ).fetchone()
                 if self._database is not None
                 else None
@@ -264,9 +265,14 @@ class IdentityLibrary:
                 "active_observation_tracks": sum(len(tracks) for tracks in self._tracks.values()),
                 "retained_face_samples": int(gallery["samples"]) if gallery else 0,
                 "profiles_with_face_gallery": int(gallery["profiles"]) if gallery else 0,
+                "quarantined_face_samples": int(
+                    self._database.execute(
+                        "SELECT COUNT(*) FROM face_samples WHERE validity='rejected'"
+                    ).fetchone()[0]
+                ) if self._database is not None else 0,
                 "persistent_identity_authority": "face-specific multi-view templates",
                 "appearance_policy": "temporal track only",
-                "coalescing_policy": "reciprocal AdaFace + SFace template clusters with repeated/spatial co-observation veto",
+                "coalescing_policy": "two-of-three face-model template consensus with repeated/spatial co-observation veto",
             }
 
     def coalesce_profiles(
@@ -286,9 +292,12 @@ class IdentityLibrary:
             for left, right in (conflicting_pairs or set()) if left != right
         }
         with self._lock:
+            valid_profile_ids = self._valid_face_profile_ids()
             faces = [
                 profile for profile in self._profiles.values()
-                if profile.face_embedding is not None and profile.profile_id not in self._aliases
+                if profile.face_embedding is not None
+                and profile.profile_id in valid_profile_ids
+                and profile.profile_id not in self._aliases
             ]
             faces.sort(
                 key=lambda profile: (
@@ -377,7 +386,8 @@ class IdentityLibrary:
         with self._lock:
             rows = self._database.execute(
                 """SELECT sample_id, profile_id, captured_at, camera_id, quality,
-                sface_embedding, image_jpeg FROM face_samples ORDER BY captured_at"""
+                sface_embedding, image_jpeg, validity FROM face_samples
+                WHERE validity != 'rejected' ORDER BY captured_at"""
             ).fetchall()
             return [
                 {
@@ -388,9 +398,55 @@ class IdentityLibrary:
                     "quality": float(row["quality"]),
                     "sface_embedding": self._vector(row["sface_embedding"]),
                     "image_jpeg": bytes(row["image_jpeg"]),
+                    "validity": str(row["validity"]),
                 }
                 for row in rows
             ]
+
+    def unvalidated_face_samples(self) -> list[dict[str, object]]:
+        """Return retained legacy samples that still need visual validation."""
+
+        if self._database is None:
+            return []
+        with self._lock:
+            return [
+                {
+                    "sample_id": str(row["sample_id"]),
+                    "profile_id": str(row["profile_id"]),
+                    "image_jpeg": bytes(row["image_jpeg"]),
+                }
+                for row in self._database.execute(
+                    """SELECT sample_id, profile_id, image_jpeg FROM face_samples
+                    WHERE validity='pending' ORDER BY captured_at"""
+                )
+            ]
+
+    def apply_face_validation(
+        self, results: dict[str, bool], model_id: str
+    ) -> dict[str, int]:
+        """Persist reversible sample-level acceptance without deleting evidence."""
+
+        if self._database is None or not results:
+            return {"accepted": 0, "rejected": 0}
+        accepted = sum(bool(value) for value in results.values())
+        rejected = len(results) - accepted
+        validated_at = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._database.executemany(
+                """UPDATE face_samples SET validity=?, validation_model=?, validated_at=?
+                WHERE sample_id=?""",
+                [
+                    (
+                        "accepted" if is_valid else "rejected",
+                        model_id,
+                        validated_at,
+                        sample_id,
+                    )
+                    for sample_id, is_valid in results.items()
+                ],
+            )
+            self._database.commit()
+        return {"accepted": accepted, "rejected": rejected}
 
     def identity_timeline_source(self, profile_id: str) -> dict[str, object] | None:
         """Canonical identity metadata and retained crops across every source alias."""
@@ -400,11 +456,15 @@ class IdentityLibrary:
             canonical = self._profiles.get(canonical_id)
             if canonical is None or canonical.face_embedding is None:
                 return None
+            valid_profile_ids = self._valid_face_profile_ids()
             members = [
                 profile for profile in self._profiles.values()
                 if profile.face_embedding is not None
+                and profile.profile_id in valid_profile_ids
                 and self._canonical_id(profile.profile_id) == canonical_id
             ]
+            if not members:
+                return None
             member_ids = sorted(profile.profile_id for profile in members)
             samples: list[dict[str, object]] = []
             if self._database is not None and member_ids:
@@ -412,6 +472,7 @@ class IdentityLibrary:
                 rows = self._database.execute(
                     f"""SELECT sample_id, profile_id, captured_at, camera_id, quality
                     FROM face_samples WHERE profile_id IN ({placeholders})
+                    AND validity != 'rejected'
                     ORDER BY captured_at DESC""",
                     member_ids,
                 ).fetchall()
@@ -459,11 +520,33 @@ class IdentityLibrary:
 
     def thumbnail(self, profile_id: str) -> bytes | None:
         with self._lock:
+            if self._database is not None:
+                row = self._database.execute(
+                    """SELECT image_jpeg FROM face_samples
+                    WHERE profile_id=? AND validity != 'rejected'
+                    ORDER BY quality DESC, captured_at DESC LIMIT 1""",
+                    (profile_id,),
+                ).fetchone()
+                if row is not None:
+                    return bytes(row["image_jpeg"])
             profile = self._profiles.get(profile_id)
-            return profile.thumbnail if profile else None
+            return (
+                profile.thumbnail
+                if profile is not None and profile_id in self._valid_face_profile_ids()
+                else None
+            )
 
     def migration_profiles(self) -> list[dict[str, object]]:
         with self._lock:
+            valid_sample_counts: dict[str, int] = {}
+            if self._database is not None:
+                valid_sample_counts = {
+                    str(row["profile_id"]): int(row["samples"])
+                    for row in self._database.execute(
+                        """SELECT profile_id, COUNT(*) AS samples FROM face_samples
+                        WHERE validity != 'rejected' GROUP BY profile_id"""
+                    )
+                }
             return [
                 {
                     "profile_id": profile.profile_id,
@@ -478,6 +561,7 @@ class IdentityLibrary:
                     "clip_embedding": profile.clip_embedding.copy(),
                     "face_embedding": profile.face_embedding.copy() if profile.face_embedding is not None else None,
                     "thumbnail": bytes(profile.thumbnail) if profile.thumbnail else None,
+                    "valid_face_samples": valid_sample_counts.get(profile.profile_id, 0),
                 }
                 for profile in self._profiles.values()
             ]
@@ -498,7 +582,12 @@ class IdentityLibrary:
         initial_samples: int = 1,
     ) -> tuple[IdentityProfile | None, bool, float]:
         with self._lock:
-            candidates = [profile for profile in self._profiles.values() if profile.face_embedding is not None]
+            valid_profile_ids = self._valid_face_profile_ids()
+            candidates = [
+                profile for profile in self._profiles.values()
+                if profile.face_embedding is not None
+                and profile.profile_id in valid_profile_ids
+            ]
             best_score = 0.0
             if candidates:
                 # Rank distinct canonical people rather than raw source rows.
@@ -736,11 +825,29 @@ class IdentityLibrary:
 
     def _face_groups(self) -> dict[str, list[IdentityProfile]]:
         groups: dict[str, list[IdentityProfile]] = {}
+        valid_profile_ids = self._valid_face_profile_ids()
         for profile in self._profiles.values():
-            if profile.face_embedding is None:
+            if (
+                profile.face_embedding is None
+                or profile.profile_id not in valid_profile_ids
+            ):
                 continue
             groups.setdefault(self._canonical_id(profile.profile_id), []).append(profile)
         return groups
+
+    def _valid_face_profile_ids(self) -> set[str]:
+        if self._database is None:
+            return {
+                profile.profile_id for profile in self._profiles.values()
+                if profile.face_embedding is not None
+            }
+        return {
+            str(row["profile_id"])
+            for row in self._database.execute(
+                """SELECT DISTINCT profile_id FROM face_samples
+                WHERE validity != 'rejected'"""
+            )
+        }
 
     def _canonical_id(self, profile_id: str) -> str:
         seen: set[str] = set()
@@ -821,11 +928,29 @@ class IdentityLibrary:
                 camera_id TEXT,
                 quality REAL NOT NULL,
                 sface_embedding BLOB NOT NULL,
-                image_jpeg BLOB NOT NULL
+                image_jpeg BLOB NOT NULL,
+                validity TEXT NOT NULL DEFAULT 'accepted',
+                validation_model TEXT,
+                validated_at TEXT
             );
             CREATE INDEX IF NOT EXISTS face_samples_profile ON face_samples(profile_id, captured_at DESC);
             """
         )
+        columns = {
+            str(row[1]) for row in self._database.execute("PRAGMA table_info(face_samples)")
+        }
+        if "validity" not in columns:
+            self._database.execute(
+                "ALTER TABLE face_samples ADD COLUMN validity TEXT NOT NULL DEFAULT 'pending'"
+            )
+        if "validation_model" not in columns:
+            self._database.execute(
+                "ALTER TABLE face_samples ADD COLUMN validation_model TEXT"
+            )
+        if "validated_at" not in columns:
+            self._database.execute(
+                "ALTER TABLE face_samples ADD COLUMN validated_at TEXT"
+            )
         self._database.commit()
 
     def _load(self) -> None:
@@ -948,8 +1073,9 @@ class IdentityLibrary:
                 return
         self._database.execute(
             """INSERT INTO face_samples
-            (sample_id, profile_id, captured_at, camera_id, quality, sface_embedding, image_jpeg)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (sample_id, profile_id, captured_at, camera_id, quality, sface_embedding, image_jpeg,
+            validity, validation_model, validated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 'live-yunet-clip-consensus', ?)""",
             (
                 sample_id,
                 profile_id,
@@ -958,6 +1084,7 @@ class IdentityLibrary:
                 max(0.0, min(1.0, float(quality))),
                 normalized.astype(np.float32).tobytes(),
                 image_jpeg,
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
         overflow = self._database.execute(

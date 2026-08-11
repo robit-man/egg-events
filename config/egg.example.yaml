@@ -39,7 +39,7 @@ audio:
 transcription:
   segment_seconds: 6
   rms_threshold: 0.003
-  asr_model: base
+  asr_model: dual
   asr_language: en
   vad_input_gain: 8
   vad_min_voiced_rms: 0.02
@@ -50,6 +50,8 @@ transcription:
 
 omnius:
   base_url: http://127.0.0.1:11435
+  # Optional dedicated OpenAI/Whisper-compatible ASR service.
+  asr_base_url: http://127.0.0.1:11436
   model: omnius-qwen35-4b:latest
   vision_model: robit/ornith-vision:9b
   vision_base_url: http://127.0.0.1:11434
@@ -92,18 +94,28 @@ dreams:
   model_path: models/cvlface_adaface_ir18_webface4m
   model_id: minchul/cvlface_adaface_ir18_webface4m
   model_revision: 0dd53f188fa27968b0a1326970ebf4aeb37ce2ca
-  device: cuda
+  # CPU avoids competing with live ASR/vision CUDA contexts during idle dreams.
+  device: cpu
   batch_size: 64
-  use_half_precision: true
+  use_half_precision: false
+  # Optional third, independent face model. When present, any two of the three
+  # identity models can establish consensus across difficult viewing angles.
+  comparison_model_path: ~/.insightface/models/buffalo_s/w600k_mbf.onnx
+  comparison_model_id: insightface/buffalo_s-w600k_mbf
   idle_seconds: 45
   interval_min_seconds: 600
   interval_max_seconds: 1800
+  convergence_interval_seconds: 60
   proposal_similarity: 0.35
-  modern_merge_similarity: 0.46
+  modern_merge_similarity: 0.40
   modern_strong_similarity: 0.54
-  legacy_merge_similarity: 0.40
-  legacy_strong_similarity: 0.60
-  legacy_similarity_floor: 0.30
+  legacy_merge_similarity: 0.24
+  legacy_strong_similarity: 0.55
+  legacy_similarity_floor: 0.12
+  comparison_merge_similarity: 0.30
+  comparison_strong_similarity: 0.50
+  comparison_similarity_floor: 0.15
+  minimum_model_votes: 2
   separated_modern_similarity: 0.38
   separated_legacy_floor: 0.15
   mutual_neighbor_margin: 0.025

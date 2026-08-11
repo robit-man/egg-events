@@ -128,6 +128,7 @@ class TranscriptionConfig(BaseModel):
 
 class OmniusConfig(BaseModel):
     base_url: HttpUrl = "http://127.0.0.1:11435"
+    asr_base_url: HttpUrl | None = None
     model: str
     vision_model: str = "robit/ornith-vision:9b"
     vision_base_url: HttpUrl = "http://127.0.0.1:11434"
@@ -187,12 +188,19 @@ class DreamsConfig(BaseModel):
     idle_seconds: float = Field(default=45, ge=5, le=3600)
     interval_min_seconds: float = Field(default=600, ge=30, le=86400)
     interval_max_seconds: float = Field(default=1800, ge=30, le=172800)
+    convergence_interval_seconds: float = Field(default=60, ge=15, le=3600)
     proposal_similarity: float = Field(default=0.35, ge=-1, le=1)
-    modern_merge_similarity: float = Field(default=0.46, ge=-1, le=1)
+    modern_merge_similarity: float = Field(default=0.40, ge=-1, le=1)
     modern_strong_similarity: float = Field(default=0.54, ge=-1, le=1)
-    legacy_merge_similarity: float = Field(default=0.40, ge=-1, le=1)
-    legacy_strong_similarity: float = Field(default=0.60, ge=-1, le=1)
-    legacy_similarity_floor: float = Field(default=0.30, ge=-1, le=1)
+    legacy_merge_similarity: float = Field(default=0.24, ge=-1, le=1)
+    legacy_strong_similarity: float = Field(default=0.55, ge=-1, le=1)
+    legacy_similarity_floor: float = Field(default=0.12, ge=-1, le=1)
+    comparison_model_path: str | None = None
+    comparison_model_id: str = "insightface/buffalo_s-w600k_mbf"
+    comparison_merge_similarity: float = Field(default=0.30, ge=-1, le=1)
+    comparison_strong_similarity: float = Field(default=0.50, ge=-1, le=1)
+    comparison_similarity_floor: float = Field(default=0.15, ge=-1, le=1)
+    minimum_model_votes: int = Field(default=2, ge=2, le=3)
     separated_modern_similarity: float = Field(default=0.38, ge=-1, le=1)
     separated_legacy_floor: float = Field(default=0.15, ge=-1, le=1)
     mutual_neighbor_margin: float = Field(default=0.025, ge=0, le=1)
