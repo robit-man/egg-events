@@ -298,6 +298,9 @@ class OmniusClient:
             "The ledger distinguishes completed and interrupted agent utterances. "
             "Never answer in the human's voice, answer Egg's own prior question, or treat an "
             "interrupted agent utterance as fully heard. "
+            "When the embodied context supplies a user-provided preferred name, use it naturally "
+            "when useful, without repeating it in every reply. When WEB SEARCH TOOL EVIDENCE is "
+            "present, ground current facts in that evidence and do not read URLs aloud. "
             "Decide from the conversational history and context whether this is directed to Egg. "
             "If it is not directed to Egg or does not merit an audible interruption, "
             "reply exactly [[SILENT]].",
@@ -338,7 +341,10 @@ class OmniusClient:
             f"Utterance: {utterance!r}\nContext: {context[:1200]}\n"
             "Return only JSON: {\"directed\":boolean,\"act\":\"question\"|\"correction\"|"
             "\"person_naming\"|\"object_naming\"|\"command\"|\"acknowledgement\"|"
-            "\"conversation\",\"confidence\":number}."
+            "\"conversation\",\"confidence\":number,\"tool\":\"none\"|\"web_search\","
+            "\"tool_query\":string|null}. Select web_search for an explicit request to search or "
+            "for current external information that cannot be grounded in the embodied context. "
+            "Make tool_query a concise standalone search query."
         )
         try:
             parsed = json.loads(raw)
@@ -354,10 +360,22 @@ class OmniusClient:
             or not 0 <= float(parsed["confidence"]) <= 1
         ):
             return None
+        tool = parsed.get("tool", "none")
+        tool_query = parsed.get("tool_query")
+        if tool not in {"none", "web_search"}:
+            return None
+        if tool == "web_search":
+            if not isinstance(tool_query, str) or not tool_query.strip():
+                return None
+            tool_query = " ".join(tool_query.split())[:300]
+        else:
+            tool_query = None
         return {
             "directed": parsed["directed"],
             "act": parsed["act"],
             "confidence": float(parsed["confidence"]),
+            "tool": tool,
+            "tool_query": tool_query,
         }
 
     async def interpret_correction(
@@ -365,8 +383,10 @@ class OmniusClient:
     ) -> dict[str, str] | None:
         return await self.interpret_observation_feedback(utterance, candidate)
 
-    async def interpret_person_naming(self, utterance: str) -> str | None:
-        return await self.interpret_person_introduction(utterance)
+    async def interpret_person_naming(
+        self, utterance: str, *, prompted: bool = False
+    ) -> str | None:
+        return await self.interpret_person_introduction(utterance, prompted=prompted)
 
     async def interpret_object_naming(self, utterance: str) -> str | None:
         return await self.interpret_held_object_label(utterance)
@@ -416,14 +436,62 @@ class OmniusClient:
         normalized = " ".join(label.strip().split())
         return normalized if normalized and len(normalized) <= 64 else None
 
-    async def interpret_person_introduction(self, utterance: str) -> str | None:
+    async def interpret_person_introduction(
+        self, utterance: str, *, prompted: bool = False
+    ) -> str | None:
         raw = await self._structured_chat(
-            "Determine whether the speaker explicitly provides their own preferred name. "
+            "Determine whether the speaker provides their own preferred name. "
             f"Utterance: {utterance!r}\n"
-            "Return only JSON: {\"name\": string|null}. Do not infer names, extract names of third parties, "
-            "or treat descriptions such as 'I am tired' as a name."
+            f"This {'is' if prompted else 'is not'} a direct response to Egg asking what to call them. "
+            "Return only JSON: {\"name\": string|null}. A bare plausible personal name is valid only "
+            "when this is a prompted response. Do not infer names, extract names of third parties, or "
+            "treat descriptions such as 'I am tired' as a name."
         )
         return self.parse_person_name(raw)
+
+    async def web_search(self, query: str, *, num_results: int = 5) -> str:
+        """Invoke Omnius' policy-gated local web-search tool directly.
+
+        The direct tool endpoint keeps voice turns responsive while retaining
+        Omnius' auth, egress, and audit policy. Its output is evidence for a
+        subsequent grounded conversational completion, never executable text.
+        """
+        normalized = " ".join(query.strip().split())
+        if not normalized:
+            raise ValueError("web search query is required")
+        timeout = aiohttp.ClientTimeout(total=min(self.config.timeout_seconds, 20))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{str(self.config.base_url).rstrip('/')}/v1/tools/web_search/call",
+                json={
+                    "args": {
+                        "query": normalized[:300],
+                        "num_results": max(1, min(int(num_results), 8)),
+                        "provider": "duckduckgo",
+                    }
+                },
+                headers=self._headers(),
+            ) as response:
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(
+                        f"Omnius web_search HTTP {response.status}: {detail}"
+                    )
+                result = await response.json()
+        # Omnius' direct tool API wraps the canonical ToolResult with security
+        # metadata. Retain compatibility with an unwrapped ToolResult as well.
+        tool_result = result.get("result", result) if isinstance(result, dict) else result
+        if not isinstance(tool_result, dict) or tool_result.get("success") is not True:
+            detail = (
+                tool_result.get("error", "invalid tool result")
+                if isinstance(tool_result, dict)
+                else "invalid tool result"
+            )
+            raise RuntimeError(f"Omnius web_search failed: {detail}")
+        output = tool_result.get("output")
+        if not isinstance(output, str) or not output.strip():
+            raise RuntimeError("Omnius web_search returned no evidence")
+        return output.strip()[:10000]
 
     @staticmethod
     def parse_person_name(content: object) -> str | None:

@@ -151,6 +151,15 @@ class AttentionConfig(BaseModel):
     min_priority: float = Field(default=0.35, ge=0, le=1)
     greeting_cooldown_seconds: float = Field(default=45, gt=0)
     proactive_speech_enabled: bool = False
+    # Identity calibration is deliberately separate from generic proactive
+    # commentary. A stable face may be asked once for a preferred name even
+    # when unsolicited scene narration is disabled.
+    identity_question_enabled: bool = True
+    # A persistent profile already required IdentityConfig's multi-frame face
+    # enrollment, so its first durable sighting is sufficiently grounded.
+    identity_question_min_sightings: int = Field(default=1, ge=1, le=100)
+    identity_question_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    identity_question_cooldown_seconds: float = Field(default=120, ge=0, le=86400)
 
 
 class IdentityConfig(BaseModel):

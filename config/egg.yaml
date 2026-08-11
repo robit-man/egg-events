@@ -107,6 +107,11 @@ attention:
   min_priority: 0.35
   greeting_cooldown_seconds: 45
   proactive_speech_enabled: false
+  # Stable face calibration is bounded and independent of generic chatter.
+  identity_question_enabled: true
+  identity_question_min_sightings: 1
+  identity_question_timeout_seconds: 300
+  identity_question_cooldown_seconds: 120
 
 identity:
   enabled: true

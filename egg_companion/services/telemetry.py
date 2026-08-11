@@ -111,6 +111,8 @@ class RuntimeTelemetry:
         self._memory = {"accepted_events": 0, "closed_episodes": 0, "last_accepted": False, "last_closed": 0}
         self._attention_decisions: list[dict[str, object]] = []
         self._interaction_decisions: list[dict[str, object]] = []
+        self._tool_calls: list[dict[str, object]] = []
+        self._identity_dialogue: dict[str, object] = {"state": "idle"}
         self._consolidation: dict[str, object] = {}
         self._retrieval_hits: list[dict[str, object]] = []
         self._microphone_direction: float | None = None
@@ -322,6 +324,38 @@ class RuntimeTelemetry:
             )
             self._interaction_decisions = self._interaction_decisions[-20:]
 
+    def record_tool_call(
+        self, name: str, query: str, success: bool, detail: str, duration_ms: float
+    ) -> None:
+        with self._lock:
+            self._tool_calls.append(
+                {
+                    "name": name,
+                    "query": query[:300],
+                    "success": success,
+                    "detail": detail[:500],
+                    "duration_ms": round(duration_ms, 1),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            self._tool_calls = self._tool_calls[-20:]
+
+    def record_identity_dialogue(
+        self,
+        state: str,
+        profile_id: str | None = None,
+        camera_id: str | None = None,
+        name: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._identity_dialogue = {
+                "state": state,
+                "profile_id": profile_id,
+                "camera_id": camera_id,
+                "name": name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
     def record_brain_tick(self, tick) -> None:
         """Sensing/cognition regions of the composed CognitiveArchitecture perceive
         pass (egg_companion/cognition/architecture.py). The memory region is not
@@ -397,6 +431,10 @@ class RuntimeTelemetry:
                 "mask_polygon": detection.attributes.get("mask_polygon"),
                 "behavior": detection.attributes.get("behavior"),
                 "identity": detection.attributes.get("identity"),
+                "identity_id": detection.attributes.get("identity_id"),
+                "identity_kind": detection.attributes.get("identity_kind"),
+                "identity_needs_name": detection.attributes.get("identity_needs_name"),
+                "identity_persistent": detection.attributes.get("identity_persistent"),
                 "identity_confidence": detection.attributes.get("identity_confidence"),
                 "identity_recalled": detection.attributes.get("identity_recalled"),
                 "identity_sightings": detection.attributes.get("identity_sightings"),
@@ -553,6 +591,8 @@ class RuntimeTelemetry:
                 "gpu": dict(self._gpu),
                 "attention_decisions": list(self._attention_decisions),
                 "interaction_decisions": list(self._interaction_decisions),
+                "tool_calls": list(self._tool_calls),
+                "identity_dialogue": dict(self._identity_dialogue),
                 "consolidation": dict(self._consolidation),
                 "retrieval_hits": list(self._retrieval_hits),
                 "seen": seen,

@@ -64,6 +64,20 @@ def test_object_learning_telemetry_exposes_each_pipeline_boundary() -> None:
     assert learning["last_stage"] == "speech_deferral"
 
 
+def test_tool_and_identity_dialogue_are_observable() -> None:
+    config = make_config()
+    telemetry = RuntimeTelemetry(config)
+
+    telemetry.record_tool_call("web_search", "latest news", True, "one result", 12.34)
+    telemetry.record_identity_dialogue("awaiting_name", "person-1", "front")
+    snapshot = telemetry.snapshot(config)
+
+    assert snapshot["tool_calls"][-1]["name"] == "web_search"
+    assert snapshot["tool_calls"][-1]["duration_ms"] == 12.3
+    assert snapshot["identity_dialogue"]["state"] == "awaiting_name"
+    assert snapshot["identity_dialogue"]["profile_id"] == "person-1"
+
+
 def test_inference_updates_never_rewrite_raw_camera_stream() -> None:
     config = EggConfig.model_validate(
         {

@@ -19,6 +19,25 @@ def test_person_name_parser_requires_explicit_bounded_json_name() -> None:
     assert OmniusClient.parse_person_name('My name is Ada') is None
 
 
+def test_dialogue_router_preserves_web_search_tool_contract() -> None:
+    async def scenario() -> None:
+        client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+        async def structured(prompt: str) -> str:
+            return (
+                '{"directed":true,"act":"question","confidence":0.98,'
+                '"tool":"web_search","tool_query":"current Jetson Linux release"}'
+            )
+
+        client._structured_chat = structured  # type: ignore[method-assign]
+        result = await client.reason_about_utterance("What is current?", "scene")
+        assert result is not None
+        assert result["tool"] == "web_search"
+        assert result["tool_query"] == "current Jetson Linux release"
+
+    asyncio.run(scenario())
+
+
 def test_asr_grounding_rejects_no_speech_low_probability_and_repetition() -> None:
     silence = {"segments": [{"no_speech_prob": 0.8, "avg_logprob": -0.2, "compression_ratio": 1.0}]}
     unlikely = {"segments": [{"no_speech_prob": 0.1, "avg_logprob": -1.2, "compression_ratio": 1.0}]}
