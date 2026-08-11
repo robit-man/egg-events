@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { OrbitControls } from '/assets/OrbitControls.js?v=20260810b';
+import { OrbitControls } from '/assets/OrbitControls.js?v=20260811a';
 
 function initCanvasFallback(container) {
   const canvas = document.createElement('canvas');
@@ -12,7 +12,10 @@ function initCanvasFallback(container) {
   let zoom = 1, panX = 0, panY = 0, yaw = 0.22, pitch = -0.12;
   let target = { x:0, y:0, z:0 }, drag = null, moved = false, viewInitialized = false;
   let lastDreamRevision = '';
+  let lastActivationSequence = 0;
   const appendFlashMs = 1600;
+  const activationPulseMs = 1250;
+  const activationHopMs = 150;
   const layoutTweenMs = 1250;
 
   function hash(value) {
@@ -27,6 +30,12 @@ function initCanvasFallback(container) {
     if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
     if (subtype.includes('object')) return colors.object;
     return colors[node.kind] || colors.entity;
+  }
+  function firingColor(source) {
+    if (source === 'voice') return '#ffae00';
+    if (source === 'memory_recall') return '#c084fc';
+    if (source === 'action') return '#34d399';
+    return '#ffffff';
   }
   function matches(node) {
     const text = `${node.label || ''} ${node.source_id || ''} ${node.subtype || ''}`.toLowerCase();
@@ -95,6 +104,61 @@ function initCanvasFallback(container) {
   }
   function linkIdentity(link) { return String(link.id || `${link.source}:${link.relation || ''}:${link.target}`); }
   function appendFlash(item) { return item.appendedAt ? Math.max(0, 1 - (performance.now() - item.appendedAt) / appendFlashMs) : 0; }
+  function activationPulse(item, now = performance.now()) {
+    if (!item.activationAt) return 0;
+    const elapsed = now - item.activationAt;
+    if (elapsed < 0 || elapsed >= activationPulseMs) return 0;
+    const progress = elapsed / activationPulseMs;
+    return Math.sin(progress * Math.PI) * Number(item.activationIntensity || 1);
+  }
+  function fireActivations(payload) {
+    const events = Array.isArray(payload?.events) ? payload.events : [];
+    const byId = new Map(nodes.map(node => [node.id, node]));
+    const adjacency = new Map();
+    for (const link of links) {
+      if (!adjacency.has(link.source)) adjacency.set(link.source, []);
+      if (!adjacency.has(link.target)) adjacency.set(link.target, []);
+      adjacency.get(link.source).push({nodeId:link.target,link});
+      adjacency.get(link.target).push({nodeId:link.source,link});
+    }
+    for (const event of events.sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0))) {
+      const sequence = Number(event.sequence || 0);
+      if (!sequence || sequence <= lastActivationSequence) continue;
+      lastActivationSequence = sequence;
+      const now = performance.now(), intensity = Math.max(.1, Math.min(1, Number(event.intensity || 1)));
+      const origins = (event.origin_node_ids || []).filter(nodeId => byId.has(nodeId));
+      const explicit = (event.node_ids || []).filter(nodeId => byId.has(nodeId));
+      const seeds = origins.length ? origins : explicit;
+      const schedule = new Map(seeds.map(nodeId => [nodeId, 0]));
+      for (const nodeId of explicit) if (!schedule.has(nodeId)) schedule.set(nodeId, activationHopMs);
+      const queue = [...schedule].map(([nodeId, delay]) => ({nodeId,delay,depth:delay ? 1 : 0}));
+      let traversed = 0;
+      while (queue.length && traversed < 120) {
+        const current = queue.shift(); traversed += 1;
+        if (!event.cascade || current.depth >= 3) continue;
+        const neighbors = [...(adjacency.get(current.nodeId) || [])]
+          .sort((left, right) => Number(right.link.confidence || 0) - Number(left.link.confidence || 0)).slice(0, 10);
+        for (const neighbor of neighbors) {
+          const delay = current.delay + activationHopMs;
+          neighbor.link.activationAt = now + current.delay + activationHopMs * .45;
+          neighbor.link.activationIntensity = intensity * Math.pow(.78, current.depth);
+          neighbor.link.activationFrom = current.nodeId;
+          neighbor.link.activationColor = firingColor(event.source);
+          if (!schedule.has(neighbor.nodeId) || delay < schedule.get(neighbor.nodeId)) {
+            schedule.set(neighbor.nodeId, delay);
+            queue.push({nodeId:neighbor.nodeId,delay,depth:current.depth+1});
+          }
+        }
+      }
+      for (const [nodeId, delay] of schedule) {
+        const node = byId.get(nodeId);
+        node.activationAt = now + delay;
+        node.activationIntensity = intensity * Math.pow(.82, Math.round(delay / activationHopMs));
+        node.activationSource = event.source;
+        node.activationColor = firingColor(event.source);
+      }
+    }
+  }
   function graphBounds() {
     if (!nodes.length) return { minX:-25, maxX:25, minY:-20, maxY:20, minZ:-10, maxZ:10 };
     return nodes.reduce((bounds, node) => ({ minX:Math.min(bounds.minX,node.x), maxX:Math.max(bounds.maxX,node.x), minY:Math.min(bounds.minY,node.y), maxY:Math.max(bounds.maxY,node.y), minZ:Math.min(bounds.minZ,node.z||0), maxZ:Math.max(bounds.maxZ,node.z||0) }), { minX:Infinity,maxX:-Infinity,minY:Infinity,maxY:-Infinity,minZ:Infinity,maxZ:-Infinity });
@@ -128,6 +192,15 @@ function initCanvasFallback(container) {
       context.stroke();
       const flash = appendFlash(link);
       if (flash > 0 && visible) { context.strokeStyle = `rgba(255,255,255,${flash})`; context.lineWidth += 1.8 * flash; context.stroke(); }
+      const firing = activationPulse(link, now);
+      if (firing > 0 && visible) {
+        context.globalAlpha = Math.min(1,.22+firing); context.strokeStyle = link.activationColor || '#fff'; context.lineWidth += 2.6 * firing; context.stroke();context.globalAlpha=1;
+        const raw = Math.max(0, Math.min(1, (now-link.activationAt)/activationPulseMs));
+        const t = link.activationFrom === link.target ? 1-raw : raw, inverse = 1-t;
+        const controlX=(source.x+target.x)/2-dy/length*bend, controlY=(source.y+target.y)/2+dx/length*bend;
+        const sparkX=inverse*inverse*source.x+2*inverse*t*controlX+t*t*target.x, sparkY=inverse*inverse*source.y+2*inverse*t*controlY+t*t*target.y;
+        context.fillStyle=link.activationColor||'#fff';context.shadowColor=link.activationColor||'#fff';context.shadowBlur=14*firing;context.beginPath();context.arc(sparkX,sparkY,1.8+2.4*firing,0,Math.PI*2);context.fill();context.shadowBlur=0;
+      }
     }
     for (const node of nodes) {
       const screen = point(node), visible = matches(node), size = radius(node) * screen.scale * (selected === node ? 1.65 : hovered === node ? 1.3 : 1);
@@ -135,6 +208,8 @@ function initCanvasFallback(container) {
       context.beginPath(); context.arc(screen.x, screen.y, size, 0, Math.PI * 2); context.fill();
       const flash = appendFlash(node);
       if (flash > 0 && visible) { context.globalAlpha = flash; context.fillStyle = '#fff'; context.shadowColor = '#fff'; context.shadowBlur = 18 * flash; context.beginPath(); context.arc(screen.x, screen.y, size * (1 + flash * .22), 0, Math.PI * 2); context.fill(); }
+      const firing = activationPulse(node, now);
+      if (firing > 0 && visible) { context.globalAlpha = Math.min(1,.3+firing); context.fillStyle = node.activationColor || '#fff'; context.shadowColor = node.activationColor || '#fff'; context.shadowBlur = 24 * firing; context.beginPath(); context.arc(screen.x, screen.y, size * (1 + firing * .42), 0, Math.PI * 2); context.fill(); }
     }
     context.shadowBlur = 0; context.globalAlpha = 1;
     const focus = hovered || selected;
@@ -160,16 +235,18 @@ function initCanvasFallback(container) {
     return nearest;
   }
   canvas.addEventListener('pointerdown', event => { canvas.setPointerCapture(event.pointerId); drag={x:event.clientX,y:event.clientY,panX,panY,yaw,pitch,pan:event.shiftKey||event.button!==0}; moved=false; });
-  canvas.addEventListener('pointermove', event => { hovered=hitTest(event); canvas.style.cursor=hovered?'pointer':'grab'; if (!drag) return; const dx=event.clientX-drag.x,dy=event.clientY-drag.y; if(Math.hypot(dx,dy)>3)moved=true; if(drag.pan){panX=drag.panX+dx;panY=drag.panY+dy;}else{yaw=drag.yaw+dx*.007;pitch=Math.max(-1.35,Math.min(1.35,drag.pitch+dy*.007));} });
+  canvas.addEventListener('pointermove', event => { hovered=hitTest(event); canvas.style.cursor=hovered?'pointer':'grab'; if (!drag) return; const dx=event.clientX-drag.x,dy=event.clientY-drag.y; if(Math.hypot(dx,dy)>3)moved=true; if(drag.pan){panX=drag.panX+dx;panY=drag.panY+dy;}else{yaw=drag.yaw-dx*.007;pitch=Math.max(-1.35,Math.min(1.35,drag.pitch+dy*.007));} });
   canvas.addEventListener('pointerup', event => { if(!moved)select(hitTest(event));drag=null; });
   canvas.addEventListener('pointercancel', () => { drag=null; });
   canvas.addEventListener('contextmenu', event => event.preventDefault());
   canvas.addEventListener('wheel', event => { event.preventDefault(); const bounds=canvas.getBoundingClientRect(), mx=event.clientX-bounds.left-width/2, my=event.clientY-bounds.top-height/2, factor=Math.exp(-event.deltaY*.001); panX=mx-(mx-panX)*factor;panY=my-(my-panY)*factor;zoom=Math.max(.5,Math.min(80,zoom*factor)); }, {passive:false});
   new ResizeObserver(() => { const wasRenderable=width>50&&height>50;width=Math.max(1,container.clientWidth);height=Math.max(1,container.clientHeight);pixelRatio=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(width*pixelRatio);canvas.height=Math.round(height*pixelRatio);canvas.style.width=`${width}px`;canvas.style.height=`${height}px`; const becameRenderable=!wasRenderable&&width>50&&height>50;if(nodes.length&&(!viewInitialized||becameRenderable))reset(); }).observe(container);
   window.addEventListener('egg:graph-data', event => layout(event.detail));
+  window.addEventListener('egg:graph-activations', event => fireActivations(event.detail));
   window.addEventListener('egg:graph-filter', event => { query=String(event.detail?.query||'').trim().toLowerCase();kind=String(event.detail?.kind||''); });
   window.addEventListener('egg:graph-reset', reset);
   if (window.__eggGraphData) layout(window.__eggGraphData);
+  if (window.__eggGraphActivations) fireActivations(window.__eggGraphActivations);
   window.dispatchEvent(new CustomEvent('egg:graph-renderer', {detail:{mode:'canvas-3d'}}));
   render();
 }
@@ -229,14 +306,19 @@ if (container) {
     const nodeById = new Map();
     const linksByNode = new Map();
     const edgeObjects = [];
+    const edgeById = new Map();
     let graphData = { nodes: [], links: [] };
     let hovered = null;
     let selected = null;
     let labelSprite = null;
     let pointerDown = null;
     let appendPulseObjects = [];
+    const activePulseObjects = new Set();
     let lastDreamRevision = '';
+    let lastActivationSequence = 0;
     const appendFlashMs = 1600;
+    const activationPulseMs = 1250;
+    const activationHopMs = 150;
     const layoutTweenMs = 1250;
     const white = new THREE.Color(0xffffff);
 
@@ -279,6 +361,13 @@ if (container) {
       if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
       if (subtype.includes('object')) return colors.object;
       return colors[node.kind] || colors.entity;
+    }
+
+    function firingColor(source) {
+      if (source === 'voice') return 0xffae00;
+      if (source === 'memory_recall') return 0xc084fc;
+      if (source === 'action') return 0x34d399;
+      return 0xffffff;
     }
 
     function initialPosition(node, index, total) {
@@ -363,9 +452,11 @@ if (container) {
       meshes.length = 0;
       edgeObjects.length = 0;
       appendPulseObjects = [];
+      activePulseObjects.clear();
       meshById.clear();
       nodeById.clear();
       linksByNode.clear();
+      edgeById.clear();
       hovered = null;
       selected = null;
     }
@@ -422,13 +513,15 @@ if (container) {
         const confidence = THREE.MathUtils.clamp(Number(link.confidence ?? 0.5), 0.05, 1);
         const confirmations = Math.max(1, Number(link.confirmations || 1));
         const radius = 0.014 + confidence * 0.045 + Math.min(0.028, Math.log2(confirmations + 1) * 0.007);
-        const geometry = new THREE.TubeGeometry(curveFor(source, target, link), 8, radius, 3, false);
+        const curve = curveFor(source, target, link);
+        const geometry = new THREE.TubeGeometry(curve, 8, radius, 3, false);
         const material = new THREE.MeshBasicMaterial({ color: 0x58709c, transparent: true, opacity: 0.1 + confidence * 0.27, depthWrite: false });
         const edge = new THREE.Mesh(geometry, material);
         const appended = hadGraph && (!previousLinkIds.has(linkIdentity(link)) || (dreamChanged && (dreamTouched.has(link.source) || dreamTouched.has(link.target))));
-        edge.userData = { link, source: link.source, target: link.target, baseColor:material.color.clone(), baseOpacity:material.opacity, appendedAt:appended ? appendedAt : 0 };
+        edge.userData = { link, source: link.source, target: link.target, curve, baseColor:material.color.clone(), baseOpacity:material.opacity, appendedAt:appended ? appendedAt : 0 };
         graphRoot.add(edge);
         edgeObjects.push(edge);
+        edgeById.set(linkIdentity(link), edge);
         if (appended) appendPulseObjects.push(edge);
       }
 
@@ -470,6 +563,53 @@ if (container) {
         fitCamera();
       }
       applyFilter({ query: document.getElementById('graph-search')?.value || '', kind: document.getElementById('graph-kind')?.value || '' });
+    }
+
+    function fireActivations(payload) {
+      const events = Array.isArray(payload?.events) ? payload.events : [];
+      for (const event of events.sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0))) {
+        const sequence = Number(event.sequence || 0);
+        if (!sequence || sequence <= lastActivationSequence) continue;
+        lastActivationSequence = sequence;
+        const now = performance.now(), intensity = THREE.MathUtils.clamp(Number(event.intensity || 1), .1, 1);
+        const origins = (event.origin_node_ids || []).filter(nodeId => meshById.has(nodeId));
+        const explicit = (event.node_ids || []).filter(nodeId => meshById.has(nodeId));
+        const seeds = origins.length ? origins : explicit;
+        const schedule = new Map(seeds.map(nodeId => [nodeId, 0]));
+        for (const nodeId of explicit) if (!schedule.has(nodeId)) schedule.set(nodeId, activationHopMs);
+        const queue = [...schedule].map(([nodeId, delay]) => ({nodeId,delay,depth:delay ? 1 : 0}));
+        let traversed = 0;
+        while (queue.length && traversed < 120) {
+          const current = queue.shift(); traversed += 1;
+          if (!event.cascade || current.depth >= 3) continue;
+          const neighbors = [...(linksByNode.get(current.nodeId) || [])]
+            .sort((left, right) => Number(right.confidence || 0) - Number(left.confidence || 0)).slice(0, 10);
+          for (const link of neighbors) {
+            const neighborId = link.source === current.nodeId ? link.target : link.source;
+            const delay = current.delay + activationHopMs;
+            const edge = edgeById.get(linkIdentity(link));
+            if (edge) {
+              edge.userData.activationAt = now + current.delay + activationHopMs * .45;
+              edge.userData.activationIntensity = intensity * Math.pow(.78, current.depth);
+              edge.userData.activationColor = new THREE.Color(firingColor(event.source));
+              activePulseObjects.add(edge);
+            }
+            if (!schedule.has(neighborId) || delay < schedule.get(neighborId)) {
+              schedule.set(neighborId, delay);
+              queue.push({nodeId:neighborId,delay,depth:current.depth+1});
+            }
+          }
+        }
+        for (const [nodeId, delay] of schedule) {
+          const mesh = meshById.get(nodeId);
+          if (!mesh) continue;
+          mesh.userData.activationAt = now + delay;
+          mesh.userData.activationIntensity = intensity * Math.pow(.82, Math.round(delay / activationHopMs));
+          mesh.userData.activationSource = event.source;
+          mesh.userData.activationColor = new THREE.Color(firingColor(event.source));
+          activePulseObjects.add(mesh);
+        }
+      }
     }
 
     function fitCamera() {
@@ -597,9 +737,11 @@ if (container) {
     fitCamera();
 
     window.addEventListener('egg:graph-data', event => buildGraph(event.detail));
+    window.addEventListener('egg:graph-activations', event => fireActivations(event.detail));
     window.addEventListener('egg:graph-filter', event => applyFilter(event.detail));
     window.addEventListener('egg:graph-reset', fitCamera);
     if (window.__eggGraphData) buildGraph(window.__eggGraphData);
+    if (window.__eggGraphActivations) fireActivations(window.__eggGraphActivations);
 
     const clock = new THREE.Clock();
     function animate() {
@@ -642,6 +784,29 @@ if (container) {
         }
         return true;
       });
+      for (const object of [...activePulseObjects]) {
+        const elapsed = now - object.userData.activationAt;
+        if (elapsed < 0) continue;
+        const progress = elapsed / activationPulseMs;
+        if (progress >= 1) {
+          object.material.color.copy(object.userData.baseColor);
+          if (object.userData.node) {
+            object.material.emissive.copy(object.userData.baseColor);
+            object.material.emissiveIntensity = object.userData.displayEmissiveIntensity;
+            if (object !== selected) object.scale.setScalar(object.userData.baseScale);
+          } else object.material.opacity = object.userData.displayOpacity ?? object.userData.baseOpacity;
+          activePulseObjects.delete(object);
+          continue;
+        }
+        const firing = Math.sin(progress * Math.PI) * Number(object.userData.activationIntensity || 1);
+        const pulseColor = object.userData.activationColor || white;
+        object.material.color.copy(object.userData.baseColor).lerp(pulseColor, firing);
+        if (object.userData.node) {
+          object.material.emissive.copy(object.userData.baseColor).lerp(pulseColor, firing);
+          object.material.emissiveIntensity = object.userData.displayEmissiveIntensity + firing * 3.4;
+          if (object !== selected) object.scale.setScalar(object.userData.baseScale * (1 + firing * .42));
+        } else object.material.opacity = Math.max(object.userData.baseOpacity, .28 + firing * .72);
+      }
       if (selected) selected.scale.setScalar(selected.userData.baseScale * (1.62 + Math.sin(elapsed * 2.2) * 0.08));
       renderer.render(scene, camera);
     }

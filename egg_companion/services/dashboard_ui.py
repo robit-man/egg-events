@@ -608,6 +608,7 @@ PAGE = r"""<!doctype html>
             <aside class="graph-sidebar">
               <article class="card"><div class="card-header"><div><h3 class="card-title">Selection</h3><p class="card-note">Node and immediate relationships</p></div></div><div id="graph-selection"><div class="muted">Select a node in the graph to inspect its nested awareness and provenance.</div></div></article>
               <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
+              <article class="card"><div class="card-header"><div><h3 class="card-title">Live firings</h3><p class="card-note">Causal activity propagates across connected memories without moving your view</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#fff"></i>Vision</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Heard voice</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Memory recall</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Agent action</span></div></article>
               <article class="card"><div class="card-header"><div><h3 class="card-title">Relationship encoding</h3></div></div><p class="card-note">Stronger confidence pulls nodes closer. Thicker curved splines indicate stronger or repeatedly confirmed relationships.</p></article>
             </aside>
           </div>
@@ -653,6 +654,7 @@ PAGE = r"""<!doctype html>
     let personTimelineRevision = 0;
     let graphLoadedAt = 0;
     let graphDataSignature = '';
+    let graphActivationSequence = 0;
     let graphSelectionRevision = 0;
     const cameraViews = new Map();
 
@@ -1025,12 +1027,19 @@ PAGE = r"""<!doctype html>
         if (!response.ok) throw new Error(await response.text());
         const payload = await response.json(), counts = payload.counts || {}, ocr = payload.ocr || {};
         window.__eggGraphData = payload;
-        $('#graph-stats').innerHTML = `<span class="badge">${esc((payload.nodes || []).length)} nodes</span><span class="badge">${esc(counts.links || 0)} relationships</span><span class="badge">${esc(counts.entities || 0)} entities</span>`;
+        const activations = payload.activations || {sequence:0,events:[]};
+        const activationSequence = Number(activations.sequence || 0);
+        window.__eggGraphActivations = activations;
+        $('#graph-stats').innerHTML = `<span class="badge">${esc((payload.nodes || []).length)} nodes</span><span class="badge">${esc(counts.links || 0)} relationships</span><span class="badge">${esc(counts.entities || 0)} entities</span>${activationSequence ? `<span class="badge good">live firing #${esc(activationSequence)}</span>` : ''}`;
         $('#graph-ocr-status').innerHTML = `<span class="badge ${ocr.errors ? 'warn' : 'good'}">OCR ${esc(ocr.hits || 0)} hits</span><span class="badge">${esc(ocr.requests || 0)} scans</span><span class="badge">${esc(ocr.queued || 0)} queued</span>`;
         const signature = JSON.stringify({dream:payload.dream?.revision || null,nodes:(payload.nodes || []).map(node => [node.id,node.updated_at,node.confidence]),links:(payload.links || []).map(link => [link.id,link.confidence,link.confirmations])});
         if (signature !== graphDataSignature) {
           graphDataSignature = signature;
           window.dispatchEvent(new CustomEvent('egg:graph-data', {detail: payload}));
+        }
+        if (activationSequence !== graphActivationSequence) {
+          graphActivationSequence = activationSequence;
+          window.dispatchEvent(new CustomEvent('egg:graph-activations', {detail: activations}));
         }
       } catch (error) {
         graphLoadedAt = 0;
@@ -1160,6 +1169,6 @@ PAGE = r"""<!doctype html>
     connectLiveWaveform();
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
-  <script type="module" src="/assets/knowledge_graph.js?v=20260810c"></script>
+  <script type="module" src="/assets/knowledge_graph.js?v=20260811f"></script>
 </body>
 </html>"""

@@ -78,6 +78,29 @@ def test_tool_and_identity_dialogue_are_observable() -> None:
     assert snapshot["identity_dialogue"]["profile_id"] == "person-1"
 
 
+def test_graph_activations_are_causal_bounded_and_use_real_graph_ids() -> None:
+    config = make_config()
+    telemetry = RuntimeTelemetry(config)
+
+    telemetry.record_graph_activation(
+        "voice",
+        ["episode:turn-1", "evidence:audio-1", "bogus", "entity:"],
+        origin_node_ids=["evidence:audio-1"],
+        intensity=4.0,
+        detail="what am I holding?",
+    )
+    snapshot = telemetry.graph_activation_snapshot()
+
+    assert snapshot["sequence"] == 1
+    assert snapshot["events"][-1]["node_ids"] == [
+        "episode:turn-1",
+        "evidence:audio-1",
+    ]
+    assert snapshot["events"][-1]["origin_node_ids"] == ["evidence:audio-1"]
+    assert snapshot["events"][-1]["intensity"] == 1.0
+    assert telemetry.snapshot(config)["graph_activations"] == snapshot
+
+
 def test_inference_updates_never_rewrite_raw_camera_stream() -> None:
     config = EggConfig.model_validate(
         {

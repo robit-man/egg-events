@@ -112,6 +112,8 @@ class RuntimeTelemetry:
         self._attention_decisions: list[dict[str, object]] = []
         self._interaction_decisions: list[dict[str, object]] = []
         self._tool_calls: list[dict[str, object]] = []
+        self._graph_activation_sequence = 0
+        self._graph_activations: list[dict[str, object]] = []
         self._identity_dialogue: dict[str, object] = {"state": "idle"}
         self._consolidation: dict[str, object] = {}
         self._retrieval_hits: list[dict[str, object]] = []
@@ -347,6 +349,62 @@ class RuntimeTelemetry:
                 }
             )
             self._tool_calls = self._tool_calls[-20:]
+
+    def record_graph_activation(
+        self,
+        source: str,
+        node_ids: list[str] | tuple[str, ...],
+        *,
+        origin_node_ids: list[str] | tuple[str, ...] = (),
+        intensity: float = 1.0,
+        cascade: bool = True,
+        detail: str | None = None,
+    ) -> None:
+        """Publish a bounded causal firing for the live knowledge graph.
+
+        Node IDs use the same ``kind:source_id`` representation returned by the
+        durable graph API, so this stream cannot manufacture graph-only facts.
+        """
+
+        allowed_kinds = {"entity", "evidence", "episode", "claim"}
+
+        def normalized(values: list[str] | tuple[str, ...]) -> list[str]:
+            result: list[str] = []
+            for value in values:
+                node_id = str(value).strip()
+                kind, separator, source_id = node_id.partition(":")
+                if not separator or kind not in allowed_kinds or not source_id:
+                    continue
+                if node_id not in result:
+                    result.append(node_id)
+            return result[:64]
+
+        nodes = normalized(node_ids)
+        origins = normalized(origin_node_ids)
+        if not nodes and not origins:
+            return
+        with self._lock:
+            self._graph_activation_sequence += 1
+            self._graph_activations.append(
+                {
+                    "sequence": self._graph_activation_sequence,
+                    "source": str(source or "cognition")[:48],
+                    "node_ids": nodes,
+                    "origin_node_ids": origins,
+                    "intensity": round(max(0.1, min(1.0, float(intensity))), 3),
+                    "cascade": bool(cascade),
+                    "detail": str(detail)[:160] if detail else None,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            self._graph_activations = self._graph_activations[-64:]
+
+    def graph_activation_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "sequence": self._graph_activation_sequence,
+                "events": [dict(event) for event in self._graph_activations],
+            }
 
     def record_identity_dialogue(
         self,
@@ -611,6 +669,10 @@ class RuntimeTelemetry:
                 "attention_decisions": list(self._attention_decisions),
                 "interaction_decisions": list(self._interaction_decisions),
                 "tool_calls": list(self._tool_calls),
+                "graph_activations": {
+                    "sequence": self._graph_activation_sequence,
+                    "events": [dict(event) for event in self._graph_activations],
+                },
                 "identity_dialogue": dict(self._identity_dialogue),
                 "consolidation": dict(self._consolidation),
                 "retrieval_hits": list(self._retrieval_hits),

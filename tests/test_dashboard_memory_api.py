@@ -102,10 +102,14 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'href="/dreams" data-route="/dreams"' in dashboard.PAGE
     assert 'data-page="/dreams"' in dashboard.PAGE
     assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
-    assert 'src="/assets/knowledge_graph.js?v=20260810c"' in dashboard.PAGE
+    assert 'src="/assets/knowledge_graph.js?v=20260811f"' in dashboard.PAGE
     assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE
     assert "window.open(" not in dashboard.PAGE
     assert "graphDataSignature" in dashboard.PAGE
+    assert "egg:graph-activations" in dashboard.PAGE
+    assert "graphActivationSequence" in dashboard.PAGE
+    assert "Heard voice" in dashboard.PAGE
+    assert "Memory recall" in dashboard.PAGE
     assert "loadGraph(true), 2000" in dashboard.PAGE
     assert "Connected evidence and artifacts" in dashboard.PAGE
     assert "Applied in-page; an Egg restart is not required" in dashboard.PAGE
@@ -118,3 +122,19 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'id="person-inspector"' in dashboard.PAGE
     assert "loadPersonTimeline" in dashboard.PAGE
     assert "encounter periods" in dashboard.PAGE
+
+
+def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> None:
+    graph_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "knowledge_graph.js"
+    ).read_text()
+    controls_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "OrbitControls.js"
+    ).read_text()
+
+    assert "yaw=drag.yaw-dx*.007" in graph_source
+    assert "OrbitControls.js?v=20260811a" in graph_source
+    assert "_rotateLeft( - _twoPI * this._rotateDelta.x" in controls_source
+    assert "egg:graph-activations" in graph_source
+    assert "activationHopMs" in graph_source
+    assert "activePulseObjects" in graph_source

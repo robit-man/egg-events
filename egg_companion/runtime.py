@@ -309,6 +309,7 @@ class CompanionRuntime:
             "merges": int(latest_run.get("merges") or 0) if latest_run else 0,
             "touched_node_ids": sorted(touched),
         }
+        graph["activations"] = self.telemetry.graph_activation_snapshot()
         graph["generated_at"] = datetime.now(timezone.utc).isoformat()
         return graph
 
@@ -1349,6 +1350,35 @@ class CompanionRuntime:
                     self._memory.closed_episodes,
                     self._memory.lifecycle_snapshot(),
                 )
+                if accepted:
+                    modalities = {item.modality for item in event.evidence}
+                    if "audio" in modalities or "speech" in modalities:
+                        source = "voice"
+                    elif "vision" in modalities or event.event_type in {"vision", "ocr"}:
+                        source = "vision"
+                    elif "action" in modalities:
+                        source = "action"
+                    else:
+                        source = event.event_type
+                    origins = tuple(
+                        f"evidence:{item.evidence_id}" for item in event.evidence
+                    )
+                    nodes = (
+                        f"episode:{event.event_id}",
+                        *origins,
+                        *(f"entity:{entity_id}" for entity_id in event.entity_ids),
+                    )
+                    detail = event.payload.get("transcript")
+                    if not isinstance(detail, str):
+                        labels = event.payload.get("labels")
+                        detail = ", ".join(map(str, labels[:6])) if isinstance(labels, list) else None
+                    self.telemetry.record_graph_activation(
+                        source,
+                        nodes,
+                        origin_node_ids=origins,
+                        intensity=1.0 if source in {"voice", "vision"} else 0.82,
+                        detail=detail,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -3178,7 +3208,28 @@ class CompanionRuntime:
             query_embedding,
             cognitive_state,
         )
-        self.telemetry.record_retrieval(self._memory.retrieval_snapshot())
+        retrieval = self._memory.retrieval_snapshot()
+        self.telemetry.record_retrieval(retrieval)
+        recalled_nodes = [
+            f"{item['owner_type']}:{item['owner_id']}"
+            for item in retrieval
+            if item.get("owner_type") in {"entity", "episode", "claim"}
+            and item.get("owner_id")
+        ]
+        recalled_nodes.extend(
+            f"evidence:{evidence_id}"
+            for item in retrieval
+            for evidence_id in item.get("evidence_ids", [])
+            if evidence_id
+        )
+        if recalled_nodes:
+            self.telemetry.record_graph_activation(
+                "memory_recall",
+                recalled_nodes,
+                origin_node_ids=[f"entity:{entity_id}" for entity_id in entity_ids],
+                intensity=0.9,
+                detail=transcript,
+            )
         return context
 
     async def _speak(self, text: str, expected_revision: int | None = None) -> bool:
