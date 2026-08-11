@@ -10,7 +10,8 @@ Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker di
 - Runs CLIP scene classification, anonymous person recall, masked-object recall, and sparse Ornith Vision correction.
 - Persists source-grounded entities, episodes, evidence, claims, revisions, graph edges, and embeddings in local SQLite WAL storage.
 - Uses prediction residuals, habituation, communicative action, and deterministic interruption policy rather than frame-count novelty.
-- Captures live ReSpeaker audio, gates silence with WebRTC VAD and ASR confidence metadata, reasons through Omnius `/v1/chat`, and emits Supertonic `F4` WAV audio.
+- Captures the ReSpeaker XVF3000's processed AEC/beamformed ASR channel with adaptive WebRTC-VAD turn boundaries, native DSP VAD/DoA/AEC/AGC/RT60 telemetry, listen/think/speak LED states, and revisioned semantic barge-in with tail-only WAV resume.
+- Reasons through Omnius `/v1/chat`, publishes only responses owned by the latest finalized heard-audio revision, and emits Supertonic `F4` WAV audio.
 - Audits Jetson GPU power state, V4L2 cameras, ReSpeaker input/output/DOA, model checkpoints, CUDA, memory integrity, Ornith availability, and Omnius voice/cognition contracts.
 
 ## Safety and privacy boundary
@@ -26,6 +27,23 @@ The single launcher performs the Jetson-specific bootstrap, including the CUDA P
 ```
 
 `config/egg.yaml` discovers every V4L2 camera not already listed, rotates all corrected sources `90°` before inference, uses ReSpeaker USB `2886:0018`, Omnius `1.0.608+` on port `11435`, `omnius-qwen35-9b:latest` for cognition, `robit/ornith-vision:9b` for sparse masked-object teaching, and Supertonic voice `F4`.
+
+Identity dreams use the pinned AdaFace IR18/WebFace4M checkpoint locally and
+offline. Bootstrap it explicitly on a new installation; the randomized idle
+scheduler then consolidates profiles and projects their complete evidence history
+without dashboard interaction. The Dreams page is an audit/status view with a
+manual trigger only as an optional override:
+
+```bash
+.venv/bin/python scripts/install_dream_identity_model.py
+```
+
+The model card requires users to follow the training dataset's license for their
+deployment. Dream merges use quality-weighted AdaFace and SFace templates,
+reciprocal neighborhood/score-separation evidence, compatible names, and repeated
+or spatially explicit distinct-person constraints. Source profiles and evidence
+remain intact behind reversible aliases. The People page opens each canonical
+person into a dated encounter timeline across every coalesced source profile.
 
 ## Audit and run
 
@@ -57,5 +75,10 @@ The bootstrap installs `egg-gpu-pm-guard.service` before display-manager and Oll
 - Optional external event bridge: `egg_companion/adapters/system_service.py`
 
 Omnius chat, ASR, voice warm-up, and TTS are native endpoints in `OmniusClient`; TTS WAV is delivered to the local speaker through `aplay`. A separate event bridge remains optional for external system integrations.
+
+The local conversational floor and interruption invariants are documented in
+`docs/VOICE_TURN_RUNTIME.md`. Voice state (`listening`, `audio_detected`,
+`transcribing`, `processing`, `response_playing`, or `barge_pending`) and causal
+playback identities are exposed in the dashboard telemetry snapshot.
 
 The research rationale and implementation ledger are maintained in `docs/COGNITIVE_MEMORY_RESEARCH.md`, `docs/COGNITIVE_MEMORY_WORK_ORDERS.md`, and `docs/COGNITIVE_MEMORY_EXECUTION.md`.

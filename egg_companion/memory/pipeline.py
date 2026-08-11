@@ -91,7 +91,10 @@ class MemoryPipeline:
         confidences = self.entities.ensure_event_entities(event)
         self.store.open_episode(event.occurred_at, episode_id=event.event_id)
         for evidence in event.evidence:
-            self.store.append_evidence(evidence)
+            checksum = evidence.metadata.get("_media_checksum")
+            self.store.append_evidence(
+                evidence, checksum=str(checksum) if isinstance(checksum, str) else None
+            )
             self.store.append_episode_evidence(event.event_id, evidence.evidence_id)
             for entity_id in event.entity_ids:
                 if self.store.entity_detail(entity_id) is None:
@@ -102,13 +105,55 @@ class MemoryPipeline:
                 )
         entity_ids = sorted(set(event.entity_ids))
         evidence_id = event.evidence[0].evidence_id if event.evidence else None
-        for index, source_id in enumerate(entity_ids):
-            for target_id in entity_ids[index + 1 :]:
-                confidence = min(confidences.get(source_id, 0.0), confidences.get(target_id, 0.0))
+        if not event.payload.get("skip_pairwise_co_observation"):
+            for index, source_id in enumerate(entity_ids):
+                for target_id in entity_ids[index + 1 :]:
+                    confidence = min(
+                        confidences.get(source_id, 0.0), confidences.get(target_id, 0.0)
+                    )
+                    self.store.link_entities_once(
+                        source_id, "co_observed_with", target_id, confidence,
+                        event.occurred_at, {"source": event.source_id}, evidence_id,
+                    )
+        relations = event.payload.get("relations", ())
+        if isinstance(relations, (list, tuple)):
+            for relation in relations:
+                if not isinstance(relation, dict):
+                    continue
+                source_id = relation.get("source_id")
+                target_id = relation.get("target_id")
+                predicate = relation.get("relation")
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (source_id, target_id, predicate)
+                ):
+                    continue
+                if source_id not in entity_ids or target_id not in entity_ids:
+                    continue
+                try:
+                    confidence = max(
+                        0.0, min(1.0, float(relation.get("confidence") or 0.0))
+                    )
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                metadata = relation.get("metadata")
                 self.store.link_entities_once(
-                    source_id, "co_observed_with", target_id, confidence, event.occurred_at,
-                    {"source": event.source_id}, evidence_id,
+                    source_id, predicate, target_id, confidence, event.occurred_at,
+                    metadata if isinstance(metadata, dict) else {"source": event.source_id},
+                    evidence_id,
                 )
+
+    def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
+        return self.store.knowledge_graph_snapshot(node_limit)
+
+    def graph_node_detail(self, kind: str, source_id: str) -> dict[str, object] | None:
+        return self.store.graph_node_detail(kind, source_id)
+
+    def persist_media(self, relative_key: str, data: bytes) -> tuple[str, str]:
+        return self.store.persist_media(relative_key, data)
+
+    def evidence_media(self, evidence_id: str) -> tuple[bytes, str] | None:
+        return self.store.evidence_media(evidence_id)
 
     def close(self, at) -> int:
         drafts = self.segmenter.flush(at)

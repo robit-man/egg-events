@@ -69,15 +69,49 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
             paths = {route.resource.canonical for route in captured.app.router.routes()}
             assert created, "runtime must start even when an audit diagnostic fails"
             assert {
+                "/api/config",
+                "/api/graph",
+                "/api/graph/node",
+                "/api/voice/action",
+                "/api/dreams",
+                "/api/dreams/run",
+                "/api/identities/{profile_id}/timeline",
+                "/api/identities/{profile_id}/samples/{sample_id}.jpg",
                 "/api/memory/episodes",
                 "/api/memory/entities/{entity_id}",
+                "/api/memory/evidence/{evidence_id}/media",
                 "/api/memory/claims",
                 "/api/memory/revisions",
                 "/api/memory/export/{entity_id}",
                 "/api/cognition/state",
             } <= paths
+            assert "/assets" in paths
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> None:
+    assert "EGG / COMPANION" not in dashboard.PAGE
+    assert "live sensory field · associative memory · local cognition" not in dashboard.PAGE
+    assert "Optical Array · Raw Streams + Instance Masks" not in dashboard.PAGE
+    assert 'data-page="/graph"' in dashboard.PAGE
+    assert 'href="/dreams" data-route="/dreams"' in dashboard.PAGE
+    assert 'data-page="/dreams"' in dashboard.PAGE
+    assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
+    assert 'src="/assets/knowledge_graph.js?v=20260810c"' in dashboard.PAGE
+    assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE
+    assert "window.open(" not in dashboard.PAGE
+    assert "graphDataSignature" in dashboard.PAGE
+    assert "loadGraph(true), 2000" in dashboard.PAGE
+    assert "Connected evidence and artifacts" in dashboard.PAGE
+    assert "Applied in-page; an Egg restart is not required" in dashboard.PAGE
+    assert "voice-service-state" in dashboard.PAGE
+    assert "voiceFormDirty" in dashboard.PAGE
+    assert "border-radius: 0 !important" in dashboard.PAGE
+    assert 'data-person-id=' in dashboard.PAGE
+    assert 'id="person-inspector"' in dashboard.PAGE
+    assert "loadPersonTimeline" in dashboard.PAGE
+    assert "encounter periods" in dashboard.PAGE

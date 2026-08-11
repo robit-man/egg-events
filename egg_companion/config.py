@@ -89,11 +89,16 @@ class AudioConfig(BaseModel):
     respeaker_vendor_id: int = Field(default=0x2886, ge=0, le=65535)
     respeaker_product_id: int = Field(default=0x0018, ge=0, le=65535)
     doa_serial_device: str | None = None
+    respeaker_led_enabled: bool = True
+    respeaker_led_brightness: int = Field(default=8, ge=0, le=31)
     sample_rate: int = Field(default=16000, gt=0)
     channels: int = Field(default=1, ge=1, le=8)
     asr_channel: int = Field(default=0, ge=0, le=7)
     asr_target_rms: float = Field(default=0.08, gt=0, le=1)
     asr_max_gain: float = Field(default=24.0, ge=1, le=48)
+    barge_in_enabled: bool = True
+    playback_resume_rewind_ms: int = Field(default=80, ge=0, le=500)
+    playback_timeout_seconds: float = Field(default=30, gt=0, le=300)
     waveform_fps: int = Field(default=30, ge=10, le=60)
     waveform_samples: int = Field(default=256, ge=64, le=1024)
 
@@ -102,9 +107,10 @@ class TranscriptionConfig(BaseModel):
     # segment_seconds is the hard cap on a single utterance's length, not a fixed
     # capture window: utterances are bounded by VAD onset/hangover (see
     # vad_min_contiguous_ms / vad_hangover_ms) so speech is never chopped mid-word.
-    segment_seconds: float = Field(default=3.0, gt=0, le=15)
+    segment_seconds: float = Field(default=12.0, gt=0, le=15)
     rms_threshold: float = Field(default=0.012, gt=0, le=1)
     asr_model: str = "medium"
+    asr_language: str = Field(default="en", pattern=r"^(auto|[a-z]{2,3}(?:-[A-Z]{2})?)$")
     vad_aggressiveness: int = Field(default=2, ge=0, le=3)
     vad_input_gain: float = Field(default=10.0, ge=1, le=32)
     vad_min_speech_ms: int = Field(default=240, ge=30, le=3000)
@@ -113,6 +119,11 @@ class TranscriptionConfig(BaseModel):
     vad_min_voiced_rms: float = Field(default=0.008, gt=0, le=1)
     vad_pre_roll_ms: float = Field(default=300, ge=0, le=2000)
     vad_hangover_ms: float = Field(default=600, ge=100, le=5000)
+    # When set above vad_hangover_ms, trailing silence grows toward this bound
+    # as voiced duration and natural pause continuations accumulate.
+    vad_hangover_max_ms: float | None = Field(default=None, ge=100, le=5000)
+    vad_hangover_growth_ms: float = Field(default=1600, gt=0, le=20000)
+    vad_continuation_growth: float = Field(default=1.0, ge=0, le=8)
 
 
 class OmniusConfig(BaseModel):
@@ -144,9 +155,50 @@ class AttentionConfig(BaseModel):
 class IdentityConfig(BaseModel):
     enabled: bool = True
     storage_dir: str = "data/identity-library"
+    # Whole-body CLIP features describe appearance/semantics; they are not
+    # permitted to create durable people.  They remain available elsewhere for
+    # scene and object understanding.
     similarity_threshold: float = Field(default=0.88, ge=0, le=1)
     face_similarity_threshold: float = Field(default=0.45, ge=0, le=1)
+    face_match_margin: float = Field(default=0.04, ge=0, le=1)
+    minimum_face_quality: float = Field(default=0.75, ge=0, le=1)
+    enrollment_min_face_observations: int = Field(default=3, ge=2, le=20)
+    enrollment_face_consistency: float = Field(default=0.65, ge=0, le=1)
+    retroactive_coalescing_enabled: bool = True
+    retroactive_merge_similarity: float = Field(default=0.80, ge=0, le=1)
+    track_ttl_seconds: float = Field(default=8.0, gt=0, le=120)
+    track_iou_threshold: float = Field(default=0.18, ge=0, le=1)
+    track_center_distance: float = Field(default=0.65, gt=0, le=3)
     sample_interval_seconds: float = Field(default=15, gt=0)
+    gallery_max_samples: int = Field(default=8, ge=2, le=32)
+    gallery_diversity_similarity: float = Field(default=0.985, ge=0, le=1)
+
+
+class DreamsConfig(BaseModel):
+    """Idle-time, bounded offline learning and identity consolidation."""
+
+    enabled: bool = True
+    model_path: str = "models/cvlface_adaface_ir18_webface4m"
+    model_id: str = "minchul/cvlface_adaface_ir18_webface4m"
+    model_revision: str = "0dd53f188fa27968b0a1326970ebf4aeb37ce2ca"
+    device: str = "cuda"
+    batch_size: int = Field(default=64, ge=1, le=256)
+    use_half_precision: bool = True
+    idle_seconds: float = Field(default=45, ge=5, le=3600)
+    interval_min_seconds: float = Field(default=600, ge=30, le=86400)
+    interval_max_seconds: float = Field(default=1800, ge=30, le=172800)
+    proposal_similarity: float = Field(default=0.35, ge=-1, le=1)
+    modern_merge_similarity: float = Field(default=0.46, ge=-1, le=1)
+    modern_strong_similarity: float = Field(default=0.54, ge=-1, le=1)
+    legacy_merge_similarity: float = Field(default=0.40, ge=-1, le=1)
+    legacy_strong_similarity: float = Field(default=0.60, ge=-1, le=1)
+    legacy_similarity_floor: float = Field(default=0.30, ge=-1, le=1)
+    separated_modern_similarity: float = Field(default=0.38, ge=-1, le=1)
+    separated_legacy_floor: float = Field(default=0.15, ge=-1, le=1)
+    mutual_neighbor_margin: float = Field(default=0.025, ge=0, le=1)
+    reciprocal_neighbor_rank: int = Field(default=8, ge=1, le=20)
+    coobservation_min_confirmations: int = Field(default=3, ge=1, le=100)
+    auto_merge_enabled: bool = True
 
 
 class ObjectLearningConfig(BaseModel):
@@ -168,6 +220,24 @@ class ObjectLearningConfig(BaseModel):
     review_stale_after_seconds: float = Field(default=21600, gt=0, le=604800)
     confidence_audit_enabled: bool = True
     confidence_audit_batch_size: int = Field(default=5, ge=1, le=50)
+
+
+class OcrConfig(BaseModel):
+    enabled: bool = True
+    full_frame_interval_seconds: float = Field(default=20, ge=2, le=3600)
+    text_object_interval_seconds: float = Field(default=8, ge=1, le=3600)
+    queue_size: int = Field(default=8, ge=1, le=64)
+    max_image_size: int = Field(default=1280, ge=320, le=2560)
+    min_text_characters: int = Field(default=2, ge=1, le=100)
+    max_fragments: int = Field(default=8, ge=1, le=32)
+    text_bearing_labels: list[str] = Field(
+        default_factory=lambda: [
+            "book", "card", "document", "label", "laptop", "license plate",
+            "magazine", "menu", "monitor", "newspaper", "package", "packaging",
+            "paper", "phone", "poster", "receipt", "screen", "sign", "tablet",
+            "television", "text", "tv", "whiteboard",
+        ]
+    )
 
 
 class MemoryConfig(BaseModel):
@@ -233,7 +303,9 @@ class EggConfig(BaseModel):
     system_service: SystemServiceConfig | None = None
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
+    dreams: DreamsConfig = Field(default_factory=DreamsConfig)
     object_learning: ObjectLearningConfig = Field(default_factory=ObjectLearningConfig)
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     event_segmentation: EventSegmentationConfig = Field(default_factory=EventSegmentationConfig)
     cognitive_attention: CognitiveAttentionConfig = Field(default_factory=CognitiveAttentionConfig)

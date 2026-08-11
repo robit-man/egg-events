@@ -66,6 +66,16 @@ class RuntimeTelemetry:
             "last_metadata": {},
         }
         self._latest_reply: str | None = None
+        self._voice_runtime: dict[str, object] = {
+            "floor": "listening",
+            "revision": 0,
+            "active_playback_id": None,
+            "playback_status": None,
+            "active_barge_id": None,
+            "history_turns": 0,
+            "last_transition_reason": "runtime_initialized",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         self._runtime_errors: list[dict[str, str]] = []
         self._object_learning = {
             "stable_candidates": 0,
@@ -87,12 +97,27 @@ class RuntimeTelemetry:
             "last_detail": None,
             "updated_at": None,
         }
+        self._ocr: dict[str, object] = {
+            "queued": 0,
+            "requests": 0,
+            "hits": 0,
+            "empty": 0,
+            "errors": 0,
+            "last_stage": "idle",
+            "last_detail": None,
+            "updated_at": None,
+            "recent": [],
+        }
         self._memory = {"accepted_events": 0, "closed_episodes": 0, "last_accepted": False, "last_closed": 0}
         self._attention_decisions: list[dict[str, object]] = []
         self._interaction_decisions: list[dict[str, object]] = []
         self._consolidation: dict[str, object] = {}
         self._retrieval_hits: list[dict[str, object]] = []
         self._microphone_direction: float | None = None
+        self._respeaker: dict[str, object] = {
+            "device": "XVF3000 ReSpeaker USB 4-Mic Array v2.0",
+            "ready": False,
+        }
         self._scene = SceneInventory()
         self._brain: dict[str, object] = {}
         self._gpu: dict[str, object] = {}
@@ -110,6 +135,10 @@ class RuntimeTelemetry:
             self._vad_speech = speech
             self._vad_speech_ratio = round(speech_ratio, 3)
             self._vad_speech_ms = speech_ms
+
+    def record_respeaker(self, status: dict[str, object]) -> None:
+        with self._lock:
+            self._respeaker = dict(status)
 
     def record_waveform(self, samples: np.ndarray) -> None:
         if samples.size:
@@ -188,9 +217,45 @@ class RuntimeTelemetry:
         with self._lock:
             self._object_learning["review_queue_depth"] = int(depth)
 
+    def record_ocr(
+        self,
+        stage: str,
+        detail: object | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        counter_by_stage = {
+            "queued": "queued",
+            "request": "requests",
+            "hit": "hits",
+            "empty": "empty",
+            "error": "errors",
+        }
+        with self._lock:
+            counter = counter_by_stage.get(stage)
+            if counter:
+                self._ocr[counter] = int(self._ocr[counter]) + 1
+            now = datetime.now(timezone.utc).isoformat()
+            self._ocr["last_stage"] = stage
+            self._ocr["last_detail"] = None if detail is None else str(detail)[:300]
+            self._ocr["updated_at"] = now
+            if stage == "hit":
+                recent = list(self._ocr["recent"])
+                recent.append({"at": now, "text": str(detail or "")[:500], **dict(metadata or {})})
+                self._ocr["recent"] = recent[-12:]
+
     def record_reply(self, reply: str) -> None:
         with self._lock:
             self._latest_reply = reply
+
+    def record_voice_transition(
+        self, snapshot: dict[str, object], reason: str
+    ) -> None:
+        with self._lock:
+            self._voice_runtime = {
+                **dict(snapshot),
+                "last_transition_reason": reason[:160],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
     def record_runtime_error(self, component: str, detail: str | BaseException) -> None:
         if isinstance(detail, BaseException):
@@ -468,6 +533,7 @@ class RuntimeTelemetry:
                 "waveform_updated_at": self._waveform_updated_at,
                 "audio_rms": self._audio_rms,
                 "microphone_direction": self._microphone_direction,
+                "respeaker": dict(self._respeaker),
                 "vad": {
                     "speech": self._vad_speech,
                     "speech_ratio": self._vad_speech_ratio,
@@ -481,6 +547,7 @@ class RuntimeTelemetry:
                 "latest_reply": self._latest_reply,
                 "runtime_errors": list(self._runtime_errors),
                 "object_learning": dict(self._object_learning),
+                "ocr": {**self._ocr, "recent": list(self._ocr["recent"])},
                 "memory": dict(self._memory),
                 "brain": {**self._brain, "memory": dict(self._memory)},
                 "gpu": dict(self._gpu),
@@ -497,9 +564,23 @@ class RuntimeTelemetry:
                 "voice": {
                     "asr_segment_seconds": config.transcription.segment_seconds,
                     "asr_rms_threshold": config.transcription.rms_threshold,
+                    "asr_target_rms": config.audio.asr_target_rms,
+                    "asr_max_gain": config.audio.asr_max_gain,
                     "asr_model": config.transcription.asr_model,
+                    "asr_language": config.transcription.asr_language,
+                    "vad_aggressiveness": config.transcription.vad_aggressiveness,
+                    "vad_input_gain": config.transcription.vad_input_gain,
+                    "vad_min_voiced_rms": config.transcription.vad_min_voiced_rms,
+                    "vad_min_contiguous_ms": config.transcription.vad_min_contiguous_ms,
                     "tts_model": config.omnius.voice_model,
                     "tts_voice": config.omnius.voice_name,
                     "asr_input": f"ReSpeaker DSP ASR channel {config.audio.asr_channel}",
+                    "barge_in_enabled": config.audio.barge_in_enabled,
+                    "vad_hangover_ms": config.transcription.vad_hangover_ms,
+                    "vad_hangover_max_ms": (
+                        config.transcription.vad_hangover_max_ms
+                        or config.transcription.vad_hangover_ms
+                    ),
+                    **dict(self._voice_runtime),
                 },
             }

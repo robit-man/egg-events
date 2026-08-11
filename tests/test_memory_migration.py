@@ -30,7 +30,13 @@ def test_legacy_profile_migration_is_idempotent_and_preserves_provenance(tmp_pat
     vision = MigrationVision()
     identities = IdentityLibrary(IdentityConfig(storage_dir=str(tmp_path / "identities")))
     frame = np.full((48, 48, 3), 100, dtype=np.uint8)
-    identities.observe("camera-0", frame, (Detection("person", 0.96, BoundingBox(0, 0, 48, 48)),), vision)
+    for _ in range(3):
+        identities.observe(
+            "camera-0",
+            frame,
+            (Detection("person", 0.96, BoundingBox(0, 0, 48, 48)),),
+            vision,
+        )
     identities.name_most_recent("Ada")
 
     objects = ObjectLibrary(ObjectLearningConfig(storage_dir=str(tmp_path / "objects")))

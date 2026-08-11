@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
+import re
 import threading
 import time
-from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from collections import deque
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +27,7 @@ from egg_companion.adapters.speaker import Speaker
 from egg_companion.adapters.system_service import SystemServiceClient
 from egg_companion.adapters.vision import SegmentedObject, VisionEngine
 from egg_companion.cognition.architecture import CognitiveArchitecture
+from egg_companion.cognition.conversation import AudioTurn, ConversationTurnController
 from egg_companion.cognition.dialogue import DialogueClassifier, DialogueEvidence
 from egg_companion.config import EggConfig
 from egg_companion.core.attention import AttentionManager
@@ -34,10 +38,34 @@ from egg_companion.memory.migrate_legacy import LegacyMemoryMigrator
 from egg_companion.memory.store import MemoryStore
 from egg_companion.models import AttentionDecision, AttentionTarget, Detection, EvidenceRef, Observation, PerceptualEvent
 from egg_companion.services.telemetry import RuntimeTelemetry
+from egg_companion.services.dreams import IdentityDreamEngine
 from egg_companion.services.identity import IdentityLibrary
 from egg_companion.services.object_library import ObjectLibrary
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _SpeechSegment:
+    utterance_id: str
+    audio: bytes
+    started_at: float
+    ended_at: float
+    barge_id: str | None
+    boundary: dict[str, object]
+    acoustic: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _OcrCandidate:
+    camera_id: str
+    image_png: bytes
+    observed_at: datetime
+    scope: str
+    parent_id: str
+    parent_type: str
+    parent_label: str
+    confidence: float
 
 
 class CompanionRuntime:
@@ -64,6 +92,7 @@ class CompanionRuntime:
         self._waveform_capture = ReSpeakerWaveformCapture(config.audio)
         self._speaker = Speaker(config.audio)
         self._omnius = OmniusClient(config.omnius)
+        self._conversation_turns = ConversationTurnController()
         self._system_service = SystemServiceClient(config.system_service) if config.system_service else None
         try:
             self.identities = IdentityLibrary(config.identity)
@@ -80,28 +109,57 @@ class CompanionRuntime:
                 config.object_learning.model_copy(update={"enabled": False})
             )
         self._observations: asyncio.Queue[Observation] = asyncio.Queue(config.runtime.event_queue_size)
-        self._speech_segments: asyncio.Queue[bytes] = asyncio.Queue(config.runtime.speech_queue_size)
-        self._utterances: asyncio.Queue[str] = asyncio.Queue(config.runtime.reasoning_queue_size)
+        self._speech_segments: asyncio.Queue[_SpeechSegment] = asyncio.Queue(
+            config.runtime.speech_queue_size
+        )
+        self._utterances: asyncio.Queue[AudioTurn] = asyncio.Queue(
+            config.runtime.reasoning_queue_size
+        )
         self._memory_events: asyncio.Queue[PerceptualEvent] = asyncio.Queue(config.runtime.event_queue_size)
         self._perceptual_buffer = PerceptualBuffer(config.memory)
         self._object_candidates: asyncio.Queue[
             tuple[str, Detection, SegmentedObject, str, int]
         ] = asyncio.Queue(maxsize=4)
+        self._ocr_candidates: asyncio.Queue[_OcrCandidate] = asyncio.Queue(
+            maxsize=config.ocr.queue_size
+        )
         self._memory = None
         if config.memory.enabled:
             try:
                 memory_store = MemoryStore(config.memory)
                 LegacyMemoryMigrator(memory_store, self.identities, self.objects).run()
+                face_profile_ids = [
+                    str(profile["profile_id"])
+                    for profile in self.identities.migration_profiles()
+                    if profile.get("face_embedding") is not None
+                ]
+                conflicts = memory_store.identity_strong_coobservation_conflicts(
+                    face_profile_ids,
+                    config.dreams.coobservation_min_confirmations,
+                )
+                identity_aliases = self.identities.coalesce_profiles(conflicts)
+                coalescing = memory_store.coalesce_identity_evidence(identity_aliases)
+                if coalescing["aliases"]:
+                    logger.info(
+                        "coalesced %s identity fragments into canonical people (%s evidence links)",
+                        coalescing["aliases"], coalescing["evidence_links_copied"],
+                    )
                 self._memory = MemoryPipeline(config, memory_store)
             except Exception as error:
                 logger.exception("cognitive memory unavailable; live sensing remains active")
                 self.telemetry.record_runtime_error("cognitive-memory", error)
+        self.dreams = IdentityDreamEngine(config.dreams, self.identities)
         self._brain = CognitiveArchitecture(self._attention, self._cognitive_attention, self._memory)
         self._last_greeting: datetime | None = None
         self._latest_observation: Observation | None = None
         self._speaking = False
         self._asr_holdoff_until = 0.0
         self._last_spoken_at: float | None = None
+        self._open_utterances: deque[tuple[str, float, str | None]] = deque()
+        self._active_reasoning_task: asyncio.Task[None] | None = None
+        self._active_reasoning_revision: int | None = None
+        self._superseded_reasoning_tasks: set[asyncio.Task[None]] = set()
+        self._speech_lock = asyncio.Lock()
         self._camera_rotations = {camera.id: camera.rotation_degrees if isinstance(camera.rotation_degrees, int) else None for camera in config.cameras}
         self._last_rotation_attempt = {camera.id: 0.0 for camera in config.cameras}
         self._latest_frame: np.ndarray | None = None
@@ -113,6 +171,9 @@ class CompanionRuntime:
         self._identity_name_questions: set[str] = set()
         self._last_valid_speech_at = 0.0
         self._object_candidate_tracks: dict[str, list[dict[str, object]]] = {}
+        self._last_ocr_candidate_at: dict[str, float] = {}
+        self._last_visual_evidence_at: dict[str, float] = {}
+        self._record_voice_transition("runtime_initialized")
 
     async def update_voice_config(
         self,
@@ -121,11 +182,23 @@ class CompanionRuntime:
         voice_model: str | None,
         voice_name: str | None,
         asr_model: str | None,
+        asr_target_rms: float | None = None,
+        asr_max_gain: float | None = None,
+        vad_input_gain: float | None = None,
+        asr_language: str | None = None,
     ) -> None:
         if segment_seconds is not None:
             self.config.transcription.segment_seconds = segment_seconds
         if rms_threshold is not None:
             self.config.transcription.rms_threshold = rms_threshold
+        if asr_target_rms is not None:
+            self.config.audio.asr_target_rms = asr_target_rms
+        if asr_max_gain is not None:
+            self.config.audio.asr_max_gain = asr_max_gain
+        if vad_input_gain is not None:
+            self.config.transcription.vad_input_gain = vad_input_gain
+        if asr_language is not None:
+            self.config.transcription.asr_language = asr_language
         self._capture = ReSpeakerCapture(
             self.config.audio,
             self.config.transcription,
@@ -134,8 +207,8 @@ class CompanionRuntime:
         if voice_model and voice_model != self.config.omnius.voice_model:
             await self._omnius.ensure_voice_ready(voice_model)
             self.config.omnius.voice_model = voice_model
-        if voice_name is not None:
-            normalized_voice_name = voice_name or None
+        normalized_voice_name = voice_name or None
+        if voice_name is not None and normalized_voice_name != self.config.omnius.voice_name:
             await self._omnius.configure_supertonic_voice(normalized_voice_name)
             self.config.omnius.voice_name = normalized_voice_name
         if asr_model and asr_model != self.config.transcription.asr_model:
@@ -152,6 +225,174 @@ class CompanionRuntime:
             "bytes": buffered["bytes"],
         }
         return snapshot
+
+    def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
+        if self._memory is None:
+            graph: dict[str, object] = {
+                "nodes": [],
+                "links": [],
+                "counts": {"entities": 0, "evidence": 0, "claims": 0, "episodes": 0, "links": 0},
+                "node_limit": node_limit,
+            }
+        else:
+            graph = self._memory.knowledge_graph_snapshot(node_limit)
+        graph["ocr"] = self.telemetry.snapshot(self.config).get("ocr", {})
+        dream_snapshot = self.dreams.snapshot()
+        latest_run = next(
+            (
+                run for run in dream_snapshot.get("runs", [])
+                if run.get("state") == "completed"
+            ),
+            None,
+        )
+        touched: set[str] = set()
+        if latest_run is not None:
+            alias_map = {
+                str(item["alias_id"]): str(item["canonical_id"])
+                for item in self.identities.alias_mappings()
+            }
+
+            def canonical(profile_id: str) -> str:
+                seen: set[str] = set()
+                while profile_id in alias_map and profile_id not in seen:
+                    seen.add(profile_id)
+                    profile_id = alias_map[profile_id]
+                return profile_id
+
+            for candidate in dream_snapshot.get("candidates", []):
+                if candidate.get("run_id") != latest_run.get("run_id"):
+                    continue
+                for key in ("left_id", "right_id", "canonical_id", "alias_id"):
+                    if candidate.get(key):
+                        touched.add(f"entity:{canonical(str(candidate[key]))}")
+        graph["dream"] = {
+            "revision": (
+                f"{latest_run.get('run_id')}:{latest_run.get('completed_at')}"
+                if latest_run else None
+            ),
+            "run_id": latest_run.get("run_id") if latest_run else None,
+            "completed_at": latest_run.get("completed_at") if latest_run else None,
+            "merges": int(latest_run.get("merges") or 0) if latest_run else 0,
+            "touched_node_ids": sorted(touched),
+        }
+        graph["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return graph
+
+    def graph_node_detail(self, kind: str, source_id: str) -> dict[str, object] | None:
+        return self._memory.graph_node_detail(kind, source_id) if self._memory else None
+
+    def evidence_media(self, evidence_id: str) -> tuple[bytes, str] | None:
+        return self._memory.evidence_media(evidence_id) if self._memory else None
+
+    def identity_timeline(self, profile_id: str) -> dict[str, object] | None:
+        source = self.identities.identity_timeline_source(profile_id)
+        if source is None:
+            return None
+        canonical_id = str(source["id"])
+        detail = self._memory.inspect_entity(canonical_id) if self._memory else None
+        events: list[dict[str, object]] = []
+        for sample in source["retained_face_samples"]:
+            events.append(
+                {
+                    "event_id": f"face-sample:{sample['sample_id']}",
+                    "captured_at": sample["captured_at"],
+                    "modality": "face",
+                    "source": sample.get("camera_id") or "identity gallery",
+                    "quality": sample.get("quality", 0.0),
+                    "artifact_url": sample["artifact_url"],
+                    "artifact_kind": "image",
+                    "summary": f"Retained face angle from {sample.get('source_profile_id')}",
+                }
+            )
+        for evidence in (detail or {}).get("evidence", []):
+            payload = evidence.get("payload") if isinstance(evidence.get("payload"), dict) else {}
+            modality = str(evidence.get("modality") or "evidence")
+            text = payload.get("transcript") or payload.get("text") or payload.get("summary")
+            detections = payload.get("detections") if isinstance(payload.get("detections"), list) else []
+            context_labels = sorted(
+                {
+                    str(item.get("label"))
+                    for item in detections
+                    if isinstance(item, dict)
+                    and item.get("label")
+                    and str(item.get("label")) != "person"
+                }
+            )
+            artifact_url = (
+                f"/api/memory/evidence/{evidence['evidence_id']}/media"
+                if evidence.get("media_key")
+                else None
+            )
+            artifact_kind = (
+                "audio" if modality in {"speech", "audio"} else "image"
+                if modality in {"vision", "image", "ocr"} else None
+            )
+            summary = str(text)[:500] if text else (
+                f"Seen with {', '.join(context_labels[:8])}" if context_labels else "Observed"
+            )
+            events.append(
+                {
+                    "event_id": str(evidence.get("evidence_id")),
+                    "captured_at": evidence.get("captured_at"),
+                    "modality": modality,
+                    "source": evidence.get("source_id") or evidence.get("source_type"),
+                    "quality": round(float(evidence.get("quality") or 0.0), 4),
+                    "artifact_url": artifact_url,
+                    "artifact_kind": artifact_kind,
+                    "summary": summary,
+                    "context_labels": context_labels,
+                }
+            )
+        valid_events: list[tuple[datetime, dict[str, object]]] = []
+        for event in events:
+            try:
+                captured_at = datetime.fromisoformat(str(event["captured_at"]))
+            except (TypeError, ValueError):
+                continue
+            valid_events.append((captured_at, event))
+        valid_events.sort(key=lambda item: item[0], reverse=True)
+        encounters: list[dict[str, object]] = []
+        for captured_at, event in valid_events:
+            if (
+                not encounters
+                or (
+                    datetime.fromisoformat(str(encounters[-1]["started_at"])) - captured_at
+                ).total_seconds() > 15 * 60
+                or datetime.fromisoformat(str(encounters[-1]["started_at"])).date() != captured_at.date()
+            ):
+                encounters.append(
+                    {
+                        "encounter_id": f"encounter:{canonical_id}:{captured_at.isoformat()}",
+                        "started_at": captured_at.isoformat(),
+                        "ended_at": captured_at.isoformat(),
+                        "events": [],
+                        "event_count": 0,
+                        "modalities": [],
+                        "sources": [],
+                    }
+                )
+            encounter = encounters[-1]
+            # Events arrive newest first. Keep the conventional interval meaning:
+            # started_at is the oldest point and ended_at is the newest point.
+            encounter["started_at"] = captured_at.isoformat()
+            encounter["event_count"] = int(encounter["event_count"]) + 1
+            modalities = set(encounter["modalities"])
+            modalities.add(str(event["modality"]))
+            encounter["modalities"] = sorted(modalities)
+            sources = set(encounter["sources"])
+            if event.get("source"):
+                sources.add(str(event["source"]))
+            encounter["sources"] = sorted(sources)
+            if len(encounter["events"]) < 24:
+                encounter["events"].append(event)
+        source["encounters"] = encounters[:120]
+        source["encounter_count"] = len(encounters)
+        source["evidence_event_count"] = len(valid_events)
+        source["retained_artifact_count"] = sum(
+            bool(event.get("artifact_url")) for _, event in valid_events
+        )
+        source.pop("retained_face_samples", None)
+        return source
 
     def inspect_memory_entity(self, entity_id: str) -> dict[str, object] | None:
         return self._memory.inspect_entity(entity_id) if self._memory else None
@@ -239,7 +480,9 @@ class CompanionRuntime:
             ("speech-recognition", self._process_speech),
             ("conversation-reasoning", self._reason_about_transcript),
             ("ornith-object-labeler", self._auto_label_objects),
+            ("advanced-ocr", self._process_ocr_candidates),
             ("object-review-scheduler", self._object_review_scheduler),
+            ("identity-dream-scheduler", self._identity_dream_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
         ]
         tasks = camera_tasks + [
@@ -405,8 +648,12 @@ class CompanionRuntime:
                         else:
                             latest_observation = observation
                             self._latest_observation = observation
-                            self._queue_vision_memory(observation)
+                            self._queue_vision_memory(observation, frame)
                             asyncio.create_task(self._queue_object_candidate(frame.copy(), observation), name="object-candidate")
+                            asyncio.create_task(
+                                self._queue_ocr_candidates(frame.copy(), observation),
+                                name=f"ocr-candidate:{observation.camera_id}",
+                            )
                             self.telemetry.record_observation(observation)
                             candidate = self.telemetry.next_uncertain_observation()
                             if candidate:
@@ -483,6 +730,7 @@ class CompanionRuntime:
                     "identity_kind": matches[index]["kind"],
                     "identity_outcome": matches[index]["resolver_outcome"],
                     "identity_confidence_components": matches[index]["confidence_components"],
+                    "identity_persistent": matches[index].get("persistent", True),
                 },
             )
             if index in matches
@@ -519,7 +767,11 @@ class CompanionRuntime:
                 await asyncio.sleep(0.5)
                 continue
             self.telemetry.record_waveform(samples)
-            if self._speaking or time.monotonic() < self._asr_holdoff_until:
+            self.telemetry.record_respeaker(self._direction.latest_status())
+            if (
+                not self.config.audio.barge_in_enabled
+                and (self._speaking or time.monotonic() < self._asr_holdoff_until)
+            ):
                 self._segmenter.reset()
                 preview_buffer = np.empty(0, dtype=np.float32)
                 continue
@@ -537,19 +789,45 @@ class CompanionRuntime:
                 next_vad_preview_at = now + 0.1
                 preview_buffer = preview_buffer[-self.config.audio.sample_rate:]
             try:
-                completed_utterances = await asyncio.to_thread(self._segmenter.feed, samples)
+                boundaries = await asyncio.to_thread(self._segmenter.feed_events, samples)
             except Exception as error:
                 logger.exception("ReSpeaker utterance segmentation failed")
                 self.telemetry.record_runtime_error("audio-segmentation", error)
                 continue
-            for segment in completed_utterances:
-                if segment.size == 0:
+            for boundary in boundaries:
+                if boundary.kind == "started":
+                    await self._on_utterance_started(boundary.at_monotonic)
+                    continue
+                segment = boundary.samples
+                self._conversation_turns.speech_ended()
+                self._record_voice_transition(f"utterance_{boundary.reason or 'ended'}")
+                utterance = (
+                    self._open_utterances.popleft()
+                    if self._open_utterances
+                    else (str(uuid4()), boundary.at_monotonic, None)
+                )
+                utterance_id, started_at, barge_id = utterance
+                if segment is None or segment.size == 0:
+                    if barge_id:
+                        asyncio.create_task(
+                            self._resume_barge(barge_id, "empty_acoustic_segment"),
+                            name=f"barge-resume:{barge_id}",
+                        )
+                    self._conversation_turns.reject_audio_input()
+                    self._record_voice_transition("empty_acoustic_segment")
                     continue
                 try:
                     audio, rms = await asyncio.to_thread(self._capture.process_samples, segment)
                 except Exception as error:
                     logger.exception("ReSpeaker ASR segment processing failed")
                     self.telemetry.record_runtime_error("audio-segmentation", error)
+                    self._conversation_turns.reject_audio_input()
+                    if barge_id:
+                        asyncio.create_task(
+                            self._resume_barge(barge_id, "segment_processing_failed"),
+                            name=f"barge-resume:{barge_id}",
+                        )
+                    self._record_voice_transition("segment_processing_failed")
                     continue
                 self.telemetry.record_audio(
                     rms,
@@ -564,58 +842,220 @@ class CompanionRuntime:
                         self._capture.last_speech_ms,
                         self._capture.last_speech_ratio,
                     )
+                    if barge_id:
+                        asyncio.create_task(
+                            self._resume_barge(barge_id, "acoustic_candidate_rejected"),
+                            name=f"barge-resume:{barge_id}",
+                        )
+                    self._conversation_turns.reject_audio_input()
+                    self._record_voice_transition("acoustic_candidate_rejected")
                     continue
                 self._last_valid_speech_at = time.monotonic()
                 if self._speech_segments.full():
-                    self._speech_segments.get_nowait()
-                    logger.warning("discarded stale speech segment while Omnius is busy")
-                self._speech_segments.put_nowait(audio)
+                    reason = "speech ingress overload; rejected newest complete utterance"
+                    logger.warning(reason)
+                    self.telemetry.record_runtime_error("speech-ingress-overload", reason)
+                    if barge_id:
+                        playback = self._conversation_turns.resolve_barge(
+                            barge_id, "audio_first"
+                        )
+                        if playback:
+                            self._speaker.discard(playback.playback_id)
+                    self._conversation_turns.reject_audio_input()
+                    self._record_voice_transition("speech_ingress_rejected")
+                    continue
+                self._speech_segments.put_nowait(
+                    _SpeechSegment(
+                        utterance_id=utterance_id,
+                        audio=audio,
+                        started_at=started_at,
+                        ended_at=boundary.at_monotonic,
+                        barge_id=barge_id,
+                        boundary={
+                            "reason": boundary.reason,
+                            "voiced_ms": boundary.voiced_ms,
+                            "silence_target_ms": boundary.silence_target_ms,
+                            "continuation_count": boundary.continuation_count,
+                        },
+                        acoustic={
+                            "source_rms": rms,
+                            "minimum_rms": self.config.transcription.rms_threshold,
+                            "speech_detected": self._capture.last_speech_detected,
+                            "speech_ms": self._capture.last_speech_ms,
+                            "speech_ratio": self._capture.last_speech_ratio,
+                            "voiced_rms": self._capture.last_voiced_rms,
+                            "conditioned_rms": self._capture.last_conditioned_rms,
+                            "asr_gain": self._capture.last_applied_gain,
+                            "conditioning": "speech-band-160hz+voiced-rms-agc",
+                        },
+                    )
+                )
+
+    async def _on_utterance_started(self, started_at: float) -> None:
+        await asyncio.to_thread(self._direction.try_set_led_state, "listen")
+        barge = self._conversation_turns.speech_started(started_at)
+        barge_id = barge.barge_id if barge else None
+        self._open_utterances.append((str(uuid4()), started_at, barge_id))
+        if barge is not None:
+            interruption = await self._speaker.interrupt(barge.playback_id)
+            if interruption is not None:
+                self._conversation_turns.bind_barge_cursor(
+                    barge.barge_id, interruption.resume_seconds
+                )
+            self._speaking = self._speaker.is_playing
+            self._record_voice_transition("playback_provisionally_interrupted")
+            return
+        self._record_voice_transition("heard_audio_started")
+
+    async def _resume_barge(self, barge_id: str, reason: str) -> bool:
+        async with self._speech_lock:
+            playback = self._conversation_turns.resolve_barge(barge_id, "resume")
+            if playback is None:
+                return False
+            self._record_voice_transition(f"barge_resume:{reason}")
+            current = self._conversation_turns.active_playback
+            if (
+                current is None
+                or current.playback_id != playback.playback_id
+                or current.status != "playing"
+            ):
+                return False
+            self._speaking = True
+            try:
+                result = await self._speaker.resume(playback.playback_id)
+            except asyncio.CancelledError:
+                current = self._conversation_turns.active_playback
+                if (
+                    current
+                    and current.playback_id == playback.playback_id
+                    and current.status == "playing"
+                ):
+                    self._conversation_turns.terminate_playback(
+                        playback.playback_id, "superseded"
+                    )
+                self._record_voice_transition("barge_resume_superseded")
+                raise
+            except Exception as error:
+                logger.exception("speaker tail resume failed")
+                self.telemetry.record_runtime_error("speaker", error)
+                self._conversation_turns.terminate_playback(playback.playback_id, "failed")
+                self._record_voice_transition("barge_resume_failed")
+                return False
+            finally:
+                self._speaking = self._speaker.is_playing
+            # No paused transport means the process finished concurrently with
+            # VAD onset; its logical utterance is already at the end.
+            if result is None or result.outcome == "completed":
+                terminal = self._conversation_turns.complete_playback(playback.playback_id)
+                if terminal:
+                    self.telemetry.record_reply(terminal.text)
+                    self._last_spoken_at = time.monotonic()
+                self._record_voice_transition("barge_tail_completed")
+                return True
+            self._record_voice_transition("barge_tail_interrupted")
+            return False
 
     async def _process_speech(self) -> None:
         while True:
-            audio = await self._speech_segments.get()
+            segment = await self._speech_segments.get()
+            await asyncio.to_thread(self._direction.try_set_led_state, "think")
             try:
-                transcript = await self._omnius.transcribe(audio)
+                acoustic_evidence = {
+                    **segment.acoustic,
+                    "boundary_reason": segment.boundary.get("reason"),
+                    "boundary_continuation_count": segment.boundary.get(
+                        "continuation_count"
+                    ),
+                }
+                transcript = await self._omnius.transcribe(
+                    segment.audio,
+                    acoustic_evidence=acoustic_evidence,
+                    language=self.config.transcription.asr_language,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 logger.exception("Omnius transcription failed")
                 self.telemetry.record_asr_error(error)
+                self._conversation_turns.reject_audio_input()
+                if segment.barge_id:
+                    await self._resume_barge(segment.barge_id, "asr_failed")
+                self._record_voice_transition("asr_failed")
                 continue
             if not transcript:
                 metadata = dict(self._omnius.last_transcription_metadata)
+                metadata["boundary"] = segment.boundary
                 self.telemetry.record_asr_rejection(
                     str(metadata.get("rejection_reason") or "empty or ungrounded transcript"), metadata
                 )
+                self._conversation_turns.reject_audio_input()
+                if segment.barge_id:
+                    await self._resume_barge(segment.barge_id, "asr_empty")
+                self._record_voice_transition("asr_empty")
                 continue
-            self.telemetry.record_transcript(transcript, self._omnius.last_transcription_metadata)
+            transcript_metadata = {
+                **dict(self._omnius.last_transcription_metadata),
+                "utterance_id": segment.utterance_id,
+                "barge_id": segment.barge_id,
+                "boundary": segment.boundary,
+            }
+            self.telemetry.record_transcript(transcript, transcript_metadata)
             self._perceptual_buffer.append_audio(
                 BufferedMediaRef(
                     "respeaker-asr",
                     datetime.now(timezone.utc),
                     f"volatile://respeaker/{time.monotonic_ns()}.wav",
-                    len(audio),
+                    len(segment.audio),
                     {
                         "vad": True,
-                        "rms": self._capture.last_voiced_rms,
-                        "speech_ratio": self._capture.last_speech_ratio,
+                        "rms": segment.acoustic.get("voiced_rms"),
+                        "speech_ratio": segment.acoustic.get("speech_ratio"),
+                        "utterance_id": segment.utterance_id,
+                        "boundary": segment.boundary,
                         "retained": False,
                     },
                 )
             )
-            self._queue_speech_memory(transcript)
+            self._queue_speech_memory(transcript, segment)
+            turn = self._conversation_turns.finalize_audio_turn(
+                transcript,
+                utterance_id=segment.utterance_id,
+                started_at=segment.started_at,
+                ended_at=segment.ended_at,
+                barge_id=segment.barge_id,
+            )
+            self._record_voice_transition("heard_turn_finalized")
+            self._cancel_stale_reasoning(turn.revision)
             if self._utterances.full():
-                self._utterances.get_nowait()
-                logger.warning("discarded stale utterance while Omnius reasoning is busy")
-            self._utterances.put_nowait(transcript)
+                reason = "conversation reasoning overload; rejected newest finalized turn"
+                logger.warning(reason)
+                self.telemetry.record_runtime_error("reasoning-ingress-overload", reason)
+                if segment.barge_id:
+                    playback = self._conversation_turns.resolve_barge(
+                        segment.barge_id, "audio_first"
+                    )
+                    if playback:
+                        self._speaker.discard(playback.playback_id)
+                self._conversation_turns.reject_reasoning()
+                self._record_voice_transition("reasoning_ingress_rejected")
+                continue
+            self._utterances.put_nowait(turn)
 
-    def _queue_vision_memory(self, observation: Observation) -> None:
+    def _queue_vision_memory(
+        self, observation: Observation, frame: np.ndarray | None = None
+    ) -> None:
         if self._memory is None:
             return
         detections = [
             {
                 "label": detection.label,
                 "confidence": round(detection.confidence, 3),
+                "bbox": {
+                    "x1": round(float(detection.bbox.x1), 2),
+                    "y1": round(float(detection.bbox.y1), 2),
+                    "x2": round(float(detection.bbox.x2), 2),
+                    "y2": round(float(detection.bbox.y2), 2),
+                },
                 "identity_id": detection.attributes.get("identity_id"),
                 "object_id": detection.attributes.get("object_id"),
                 "behavior": detection.attributes.get("behavior"),
@@ -625,15 +1065,21 @@ class CompanionRuntime:
         entities = []
         for detection in observation.detections:
             identity_id = detection.attributes.get("identity_id")
-            if identity_id:
-                kind = str(detection.attributes.get("identity_kind") or "appearance")
+            identity_kind = str(detection.attributes.get("identity_kind") or "appearance")
+            identity_persistent = bool(detection.attributes.get(
+                "identity_persistent", identity_kind == "face"
+            ))
+            if identity_id and (identity_persistent or "face" in identity_kind):
                 entities.append(
                     {
                         "id": str(identity_id),
-                        "type": "person" if kind == "face" else "appearance_track",
-                        "label": detection.attributes.get("identity"),
+                        "type": "person" if identity_persistent else "face_observation",
+                        "label": (
+                            detection.attributes.get("identity")
+                            if identity_persistent else "Unconfirmed face observation"
+                        ),
                         "confidence": detection.attributes.get("identity_confidence"),
-                        "kind": kind,
+                        "kind": identity_kind,
                         "resolver_outcome": detection.attributes.get("identity_outcome"),
                         "face_similarity": (
                             detection.attributes.get("identity_confidence_components") or {}
@@ -641,7 +1087,9 @@ class CompanionRuntime:
                         "clip_similarity": (
                             detection.attributes.get("identity_confidence_components") or {}
                         ).get("clip_similarity"),
-                        "source": "identity-library",
+                        "source": (
+                            "identity-library" if identity_persistent else "temporal-face-track"
+                        ),
                         "camera_id": observation.camera_id,
                     }
                 )
@@ -659,22 +1107,41 @@ class CompanionRuntime:
                     }
                 )
         event_id = str(uuid4())
+        media_key = None
+        media_checksum = None
+        last_media_at = self._last_visual_evidence_at.get(observation.camera_id, 0.0)
+        if (
+            frame is not None
+            and entities
+            and self.config.memory.retain_raw_media
+            and time.monotonic() - last_media_at >= 5.0
+        ):
+            try:
+                encoded = self._encode_frame(frame)
+                relative_key = (
+                    f"vision/{observation.timestamp:%Y/%m/%d}/"
+                    f"{observation.camera_id}-{event_id}.jpg"
+                )
+                media_key, media_checksum = self._memory.persist_media(relative_key, encoded)
+                self._last_visual_evidence_at[observation.camera_id] = time.monotonic()
+            except Exception as error:
+                logger.warning("visual evidence artifact could not be retained: %s", error)
         evidence = EvidenceRef(
             evidence_id=str(uuid4()), modality="vision", captured_at=observation.timestamp,
             source_type="camera", source_id=observation.camera_id,
+            media_key=media_key,
             quality=sum(item["confidence"] for item in detections) / max(1, len(detections)),
-            metadata={"detections": detections, "semantic_labels": list(observation.semantic_labels)},
+            metadata={
+                "detections": detections,
+                "semantic_labels": list(observation.semantic_labels),
+                **({"_media_checksum": media_checksum} if media_checksum else {}),
+            },
         )
         self._queue_memory_event(
             PerceptualEvent(
                 event_id=event_id, event_type="vision", occurred_at=observation.timestamp, source_id=observation.camera_id,
                 evidence=(evidence,),
-                entity_ids=tuple(
-                    str(entity_id)
-                    for item in detections
-                    for entity_id in (item["identity_id"], item["object_id"])
-                    if entity_id
-                ),
+                entity_ids=tuple(str(item["id"]) for item in entities),
                 payload={
                     "labels": [item["label"] for item in detections],
                     "scene_labels": list(observation.semantic_labels),
@@ -684,27 +1151,79 @@ class CompanionRuntime:
             )
         )
 
-    def _queue_speech_memory(self, transcript: str) -> None:
+    def _queue_speech_memory(self, transcript: str, segment: _SpeechSegment) -> None:
         if self._memory is None:
             return
         now = datetime.now(timezone.utc)
+        visible_faces: list[dict[str, object]] = []
+        latest = self._latest_observation
+        if latest is not None and (now - latest.timestamp).total_seconds() <= 5.0:
+            for detection in latest.detections:
+                identity_kind = str(detection.attributes.get("identity_kind") or "")
+                identity_persistent = bool(detection.attributes.get(
+                    "identity_persistent", identity_kind == "face"
+                ))
+                if (
+                    (identity_persistent or "face" in identity_kind)
+                    and detection.attributes.get("identity_id")
+                ):
+                    visible_faces.append(
+                        {
+                            "id": str(detection.attributes["identity_id"]),
+                            "type": "person" if identity_persistent else "face_observation",
+                            "label": (
+                                detection.attributes.get("identity")
+                                if identity_persistent else "Unconfirmed face observation"
+                            ),
+                            "confidence": detection.attributes.get("identity_confidence"),
+                            "source": (
+                                "face-visible-during-speech"
+                                if identity_persistent else "face-observation-during-speech"
+                            ),
+                            "camera_id": latest.camera_id,
+                        }
+                    )
+        media_key = None
+        media_checksum = None
+        if self.config.memory.retain_raw_media:
+            try:
+                relative_key = f"audio/{now:%Y/%m/%d}/{segment.utterance_id}.wav"
+                media_key, media_checksum = self._memory.persist_media(
+                    relative_key, segment.audio
+                )
+            except Exception as error:
+                logger.warning("audio evidence artifact could not be retained: %s", error)
         evidence = EvidenceRef(
-            evidence_id=str(uuid4()), modality="speech", captured_at=now, source_type="respeaker", source_id="respeaker-asr",
+            evidence_id=str(uuid4()), modality="audio", captured_at=now, source_type="respeaker", source_id="respeaker-asr",
+            media_key=media_key,
             quality=self._capture.last_speech_ratio,
             metadata={
                 "transcript": transcript,
+                "utterance_id": segment.utterance_id,
+                "duration_seconds": max(0.0, segment.ended_at - segment.started_at),
                 "rms": self.telemetry.snapshot(self.config)["audio_rms"],
                 "vad_accepted": True,
                 "vad_speech_ratio": self._capture.last_speech_ratio,
                 "speech_ms": self._capture.last_speech_ms,
                 "doa": self._direction.latest_angle(),
+                "respeaker_dsp": self._direction.latest_status(),
                 "asr_model": self.config.transcription.asr_model,
                 "asr_service": str(self.config.omnius.base_url),
                 "asr_metadata": dict(self._omnius.last_transcription_metadata),
+                "visible_face_ids": [item["id"] for item in visible_faces],
+                **({"_media_checksum": media_checksum} if media_checksum else {}),
             },
         )
         self._queue_memory_event(
-            PerceptualEvent(str(uuid4()), "speech", now, "respeaker-asr", (evidence,), payload={"transcript": transcript})
+            PerceptualEvent(
+                str(uuid4()),
+                "speech",
+                now,
+                "respeaker-asr",
+                (evidence,),
+                tuple(str(item["id"]) for item in visible_faces),
+                payload={"transcript": transcript, "entities": visible_faces},
+            )
         )
 
     def _queue_memory_event(self, event: PerceptualEvent) -> None:
@@ -747,6 +1266,374 @@ class CompanionRuntime:
             except Exception as error:
                 logger.exception("memory consolidation failed")
                 self.telemetry.record_runtime_error("memory-consolidation", error)
+
+    def dreams_snapshot(self) -> dict[str, object]:
+        return self.dreams.snapshot()
+
+    async def run_identity_dream(self, requested_by: str = "manual") -> dict[str, object]:
+        profiles = [
+            str(profile["profile_id"])
+            for profile in self.identities.migration_profiles()
+            if profile.get("face_embedding") is not None
+        ]
+        conflicts = (
+            await asyncio.to_thread(
+                self._memory.store.identity_strong_coobservation_conflicts,
+                profiles,
+                self.config.dreams.coobservation_min_confirmations,
+            )
+            if self._memory is not None
+            else set()
+        )
+        result = await asyncio.to_thread(
+            self.dreams.run, conflicts, requested_by
+        )
+        if self._memory is not None and result.get("aliases"):
+            result["memory_projection"] = await asyncio.to_thread(
+                self._memory.store.coalesce_identity_evidence,
+                list(result["aliases"]),
+            )
+        return result
+
+    async def _identity_dream_scheduler(self) -> None:
+        if not self.config.dreams.enabled:
+            await asyncio.Event().wait()
+
+        def schedule_next() -> float:
+            low = min(
+                self.config.dreams.interval_min_seconds,
+                self.config.dreams.interval_max_seconds,
+            )
+            high = max(
+                self.config.dreams.interval_min_seconds,
+                self.config.dreams.interval_max_seconds,
+            )
+            delay = random.uniform(low, high)
+            self.dreams.set_next_scheduled_at(
+                datetime.now(timezone.utc) + timedelta(seconds=delay)
+            )
+            return time.monotonic() + delay
+
+        due_at = schedule_next()
+        while True:
+            await asyncio.sleep(max(1.0, min(15.0, due_at - time.monotonic())))
+            now = time.monotonic()
+            if now < due_at:
+                continue
+            last_activity = max(self._last_valid_speech_at, self._last_spoken_at or 0.0)
+            busy = (
+                self._speaking
+                or not self._speech_segments.empty()
+                or not self._utterances.empty()
+                or not self._memory_events.empty()
+            )
+            if busy or now - last_activity < self.config.dreams.idle_seconds:
+                due_at = now + min(15.0, self.config.dreams.idle_seconds)
+                self.dreams.set_next_scheduled_at(
+                    datetime.now(timezone.utc) + timedelta(seconds=due_at - now)
+                )
+                continue
+            try:
+                await self.run_identity_dream("scheduler")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("identity dream failed")
+                self.telemetry.record_runtime_error("identity-dream", error)
+            finally:
+                due_at = schedule_next()
+
+    async def _queue_ocr_candidates(
+        self, frame: np.ndarray, observation: Observation
+    ) -> None:
+        if not self.config.ocr.enabled or self._ocr_candidates.full():
+            return
+        now = time.monotonic()
+        candidates: list[tuple[str, str, str, str, float, object | None]] = []
+        frame_key = f"frame:{observation.camera_id}"
+        if now - self._last_ocr_candidate_at.get(frame_key, 0.0) >= (
+            self.config.ocr.full_frame_interval_seconds
+        ):
+            self._last_ocr_candidate_at[frame_key] = now
+            candidates.append(
+                (
+                    "frame",
+                    f"scene:{observation.camera_id}",
+                    "object_category",
+                    f"{observation.camera_id} scene",
+                    0.55,
+                    None,
+                )
+            )
+        for detection in observation.detections:
+            labels = {
+                str(detection.label),
+                str(detection.attributes.get("base_label") or ""),
+            }
+            if not any(self._label_implies_text(label) for label in labels):
+                continue
+            object_id = detection.attributes.get("object_id")
+            parent_id = (
+                str(object_id)
+                if object_id
+                else f"visual:{observation.camera_id}:{self._identifier_fragment(detection.label)}"
+            )
+            key = f"object:{parent_id}"
+            if now - self._last_ocr_candidate_at.get(key, 0.0) < (
+                self.config.ocr.text_object_interval_seconds
+            ):
+                continue
+            self._last_ocr_candidate_at[key] = now
+            candidates.append(
+                (
+                    "object",
+                    parent_id,
+                    "object" if object_id else "object_category",
+                    detection.label,
+                    detection.confidence,
+                    detection.bbox,
+                )
+            )
+        for scope, parent_id, parent_type, parent_label, confidence, bbox in candidates[:4]:
+            if self._ocr_candidates.full():
+                break
+            try:
+                image_png = await asyncio.to_thread(
+                    self._encode_ocr_image,
+                    frame,
+                    bbox,
+                    self.config.ocr.max_image_size,
+                )
+            except Exception as error:
+                self.telemetry.record_ocr("error", error)
+                self.telemetry.record_runtime_error("ocr-prepare", error)
+                continue
+            try:
+                self._ocr_candidates.put_nowait(
+                    _OcrCandidate(
+                        observation.camera_id,
+                        image_png,
+                        observation.timestamp,
+                        scope,
+                        parent_id,
+                        parent_type,
+                        parent_label,
+                        float(confidence),
+                    )
+                )
+            except asyncio.QueueFull:
+                # Multiple camera preparation tasks can fill the bounded queue
+                # between the capacity check and this non-blocking write.
+                break
+            self.telemetry.record_ocr("queued", f"{observation.camera_id}:{scope}:{parent_label}")
+
+    def _label_implies_text(self, label: str) -> bool:
+        normalized = " ".join(label.casefold().replace("_", " ").replace("-", " ").split())
+        return any(
+            hint.casefold() in normalized or normalized in hint.casefold()
+            for hint in self.config.ocr.text_bearing_labels
+            if hint.strip() and normalized
+        )
+
+    @staticmethod
+    def _identifier_fragment(value: str) -> str:
+        normalized = "-".join(
+            part for part in re.split(r"[^a-z0-9]+", value.casefold()) if part
+        )
+        return normalized[:48] or "unknown"
+
+    @staticmethod
+    def _encode_ocr_image(frame: np.ndarray, bbox: object | None, max_size: int) -> bytes:
+        import cv2
+
+        image = frame
+        if bbox is not None:
+            height, width = frame.shape[:2]
+            box_width = max(1.0, float(bbox.x2) - float(bbox.x1))
+            box_height = max(1.0, float(bbox.y2) - float(bbox.y1))
+            margin_x = box_width * 0.06
+            margin_y = box_height * 0.06
+            x1 = max(0, int(float(bbox.x1) - margin_x))
+            y1 = max(0, int(float(bbox.y1) - margin_y))
+            x2 = min(width, int(float(bbox.x2) + margin_x))
+            y2 = min(height, int(float(bbox.y2) + margin_y))
+            if x2 > x1 and y2 > y1:
+                image = frame[y1:y2, x1:x2]
+        height, width = image.shape[:2]
+        scale = min(1.0, float(max_size) / max(height, width))
+        if scale < 1.0:
+            image = cv2.resize(
+                image,
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        encoded, payload = cv2.imencode(".png", image)
+        if not encoded:
+            raise RuntimeError("failed to encode OCR image")
+        return payload.tobytes()
+
+    async def _run_advanced_ocr(self, image_png: bytes) -> dict[str, object] | None:
+        scratch_path = (
+            Path(self.config.object_learning.storage_dir)
+            / ".ocr-scratch"
+            / f"{uuid4().hex}.png"
+        )
+        await asyncio.to_thread(scratch_path.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(scratch_path.write_bytes, image_png)
+        try:
+            return await self._omnius.ocr_advanced(str(scratch_path))
+        finally:
+            await asyncio.to_thread(scratch_path.unlink, missing_ok=True)
+
+    async def _process_ocr_candidates(self) -> None:
+        while True:
+            candidate = await self._ocr_candidates.get()
+            self.telemetry.record_ocr(
+                "request", f"{candidate.camera_id}:{candidate.scope}:{candidate.parent_label}"
+            )
+            try:
+                result = await self._run_advanced_ocr(candidate.image_png)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("advanced OCR candidate failed", exc_info=error)
+                self.telemetry.record_ocr("error", error)
+                self.telemetry.record_runtime_error("ocr-advanced", error)
+                continue
+            if result is None:
+                self.telemetry.record_ocr("empty", candidate.parent_label)
+                continue
+            text = " ".join(str(result.get("text") or "").split())
+            if sum(character.isalnum() for character in text) < self.config.ocr.min_text_characters:
+                self.telemetry.record_ocr("empty", candidate.parent_label)
+                continue
+            self.telemetry.record_ocr(
+                "hit",
+                text,
+                {
+                    "camera_id": candidate.camera_id,
+                    "scope": candidate.scope,
+                    "parent_id": candidate.parent_id,
+                    "parent_label": candidate.parent_label,
+                    "vision_used": bool(result.get("vision_used")),
+                },
+            )
+            self._queue_ocr_memory(candidate, text, bool(result.get("vision_used")))
+
+    def _queue_ocr_memory(
+        self, candidate: _OcrCandidate, text: str, vision_used: bool
+    ) -> None:
+        if self._memory is None:
+            return
+        normalized = " ".join(text.split())[:1000]
+        content_id = f"content:{hashlib.sha256(normalized.casefold().encode()).hexdigest()[:24]}"
+        fragments = self._ocr_fragments(normalized, self.config.ocr.max_fragments)
+        descriptors: list[dict[str, object]] = [
+            {
+                "id": candidate.parent_id,
+                "type": candidate.parent_type,
+                "label": candidate.parent_label,
+                "confidence": candidate.confidence,
+                "source": "advanced-ocr",
+                "camera_id": candidate.camera_id,
+                "ocr_scope": candidate.scope,
+            },
+            {
+                "id": content_id,
+                "type": "content",
+                "label": normalized[:120],
+                "confidence": candidate.confidence,
+                "source": "advanced-ocr",
+                "content_level": "block",
+                "camera_id": candidate.camera_id,
+                "vision_used": vision_used,
+            },
+        ]
+        relations: list[dict[str, object]] = [
+            {
+                "source_id": candidate.parent_id,
+                "relation": "contains_text",
+                "target_id": content_id,
+                "confidence": candidate.confidence,
+                "metadata": {"scope": candidate.scope, "camera_id": candidate.camera_id},
+            }
+        ]
+        fragment_ids: list[str] = []
+        if len(fragments) > 1:
+            for index, fragment in enumerate(fragments):
+                fragment_id = (
+                    "content:fragment:"
+                    + hashlib.sha256(
+                        f"{content_id}:{index}:{fragment.casefold()}".encode()
+                    ).hexdigest()[:24]
+                )
+                fragment_ids.append(fragment_id)
+                descriptors.append(
+                    {
+                        "id": fragment_id,
+                        "type": "content",
+                        "label": fragment[:120],
+                        "confidence": candidate.confidence,
+                        "source": "advanced-ocr",
+                        "content_level": "fragment",
+                        "fragment_index": index,
+                        "camera_id": candidate.camera_id,
+                    }
+                )
+                relations.append(
+                    {
+                        "source_id": content_id,
+                        "relation": "contains_fragment",
+                        "target_id": fragment_id,
+                        "confidence": candidate.confidence,
+                        "metadata": {"fragment_index": index},
+                    }
+                )
+        entity_ids = (candidate.parent_id, content_id, *fragment_ids)
+        evidence = EvidenceRef(
+            str(uuid4()),
+            "ocr",
+            candidate.observed_at,
+            "camera-advanced-ocr",
+            candidate.camera_id,
+            quality=candidate.confidence,
+            metadata={
+                "text": normalized,
+                "scope": candidate.scope,
+                "parent_id": candidate.parent_id,
+                "parent_label": candidate.parent_label,
+                "vision_used": vision_used,
+                "fragments": fragments,
+            },
+        )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "ocr",
+                candidate.observed_at,
+                candidate.camera_id,
+                (evidence,),
+                tuple(entity_ids),
+                payload={
+                    "labels": ["ocr", candidate.parent_label],
+                    "entities": descriptors,
+                    "relations": relations,
+                    "skip_pairwise_co_observation": True,
+                },
+            )
+        )
+
+    @staticmethod
+    def _ocr_fragments(text: str, limit: int) -> list[str]:
+        fragments: list[str] = []
+        for fragment in re.split(r"[\r\n]+|(?<=[.!?])\s+", text):
+            normalized = " ".join(fragment.split()).strip(" -–—|•")
+            if not normalized or normalized.casefold() in {item.casefold() for item in fragments}:
+                continue
+            fragments.append(normalized[:300])
+            if len(fragments) >= limit:
+                break
+        return fragments or [text[:300]]
 
     async def _queue_object_candidate(self, frame: np.ndarray, observation: Observation) -> None:
         learning = self.config.object_learning
@@ -798,17 +1685,13 @@ class CompanionRuntime:
         """Run the Ornith VLM classification and Omnius's OCR-advanced endpoint
         concurrently on the same crop. OCR is always attempted alongside the VLM as
         corroborating evidence; it never blocks or fails the VLM classification."""
-        scratch_path = Path(self.config.object_learning.storage_dir) / ".ocr-scratch" / f"{uuid4().hex}.png"
-        scratch_path.parent.mkdir(parents=True, exist_ok=True)
-        scratch_path.write_bytes(image_png)
-        try:
-            vlm_result, ocr_result = await asyncio.gather(
-                self._omnius.classify_masked_object(image_png, detector_label, detector_confidence),
-                self._omnius.ocr_advanced(str(scratch_path)),
-                return_exceptions=True,
-            )
-        finally:
-            scratch_path.unlink(missing_ok=True)
+        vlm_result, ocr_result = await asyncio.gather(
+            self._omnius.classify_masked_object(
+                image_png, detector_label, detector_confidence
+            ),
+            self._run_advanced_ocr(image_png),
+            return_exceptions=True,
+        )
         if isinstance(vlm_result, BaseException):
             raise vlm_result
         self.telemetry.record_object_learning("ocr_request")
@@ -1077,105 +1960,236 @@ class CompanionRuntime:
 
     async def _reason_about_transcript(self) -> None:
         while True:
-            transcript = await self._utterances.get()
+            turn = await self._utterances.get()
+            task = asyncio.create_task(
+                self._handle_audio_turn(turn), name=f"heard-turn:{turn.revision}"
+            )
+            self._active_reasoning_task = task
+            self._active_reasoning_revision = turn.revision
             try:
-                pending = self.telemetry.pending_observation()
-                live_context = self._scene_context()
-                try:
-                    language = await self._omnius.reason_about_utterance(transcript, live_context)
-                except Exception as error:
-                    logger.warning("dialogue routing model unavailable; using sensor evidence: %s", error)
-                    language = None
-                dialogue = self._dialogue.classify(
-                    DialogueEvidence(
-                        transcript,
-                        doa_aligned=(
-                            self._latest_observation is not None
-                            and self._latest_observation.microphone_direction is not None
-                        ),
-                        seconds_since_tts=(
-                            time.monotonic() - self._last_spoken_at
-                            if self._last_spoken_at is not None
-                            else None
-                        ),
-                        interaction_pending=pending is not None,
-                        language_directed=(
-                            bool(language["directed"]) if language is not None else None
-                        ),
-                    )
-                )
-                if not dialogue.directed:
-                    self.telemetry.record_interaction(
-                        False, dialogue.reason, transcript, "[[SILENT]]"
-                    )
-                    continue
-                unnamed_identity = self._visible_unnamed_identity()
-                if unnamed_identity and dialogue.act == "person_naming":
-                    person_name = await self._omnius.interpret_person_naming(transcript)
-                    if person_name:
-                        profile = await asyncio.to_thread(self.identities.name_most_recent, person_name)
-                        if profile:
-                            await self._sync_identity_profile(profile.profile_id)
-                            self._queue_identity_name_memory(profile.profile_id, person_name, transcript)
-                if dialogue.act == "object_naming":
-                    try:
-                        object_label = await asyncio.wait_for(
-                            self._omnius.interpret_object_naming(transcript), timeout=30
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning("held-object label interpretation timed out")
-                        object_label = None
-                    if object_label:
-                        learned = await self._learn_held_object(object_label)
-                        if learned:
-                            logger.info("user-labelled segmented object as %s", learned)
-                if pending:
-                    feedback = await self._omnius.interpret_correction(transcript, pending)
-                    if feedback and feedback["decision"] in {"confirm", "correct"}:
-                        self.telemetry.resolve_observation_correction(feedback["decision"], feedback["label"] or None)
-                        if feedback["decision"] == "correct" and feedback["label"] and pending.get("object_id"):
-                            profile = await asyncio.to_thread(
-                                self.objects.relabel, str(pending["object_id"]), feedback["label"], 1.0,
-                                "user", "human-feedback",
-                                {
-                                    "utterance": transcript,
-                                    "previous_label": pending.get("label"),
-                                    "corrected_at": datetime.now(timezone.utc).isoformat(),
-                                },
-                            )
-                            if profile:
-                                await self._sync_object_profile(profile.profile_id)
-                                self._queue_user_correction_memory(
-                                    profile.profile_id, str(pending.get("label")), profile.label, transcript
-                                )
-                        await self._speak(feedback["reply"])
-                        continue
-                reply = await self._omnius.conversation_reply(
-                    transcript, await self._cognitive_context(transcript)
-                )
-                decision = self._interaction_policy.evaluate(
-                    transcript, reply, directed=dialogue.directed
-                )
-                self.telemetry.record_interaction(decision.allow_speech, decision.reason, transcript, reply)
-                self._queue_interaction_memory(transcript, reply, decision.allow_speech, decision.reason)
-                if decision.allow_speech:
-                    await self._speak(reply)
+                await task
             except asyncio.CancelledError:
-                raise
+                if task not in self._superseded_reasoning_tasks:
+                    raise
+                self._superseded_reasoning_tasks.discard(task)
+                logger.debug("superseded reasoning for heard-audio revision %s", turn.revision)
             except Exception as error:
                 logger.exception("Omnius reasoning failed; capture remains active")
                 self.telemetry.record_runtime_error("reasoning", error)
+            finally:
+                self._superseded_reasoning_tasks.discard(task)
+                if self._active_reasoning_task is task:
+                    self._active_reasoning_task = None
+                    self._active_reasoning_revision = None
+                self._conversation_turns.finish_processing(turn.revision)
+                self._record_voice_transition("heard_turn_processing_finished")
 
-    async def _learn_held_object(self, label: str) -> str | None:
+    def _cancel_stale_reasoning(self, current_revision: int) -> bool:
+        active = self._active_reasoning_task
+        if (
+            active is None
+            or active.done()
+            or self._active_reasoning_revision is None
+            or self._active_reasoning_revision >= current_revision
+        ):
+            return False
+        self._superseded_reasoning_tasks.add(active)
+        active.cancel()
+        return True
+
+    async def _handle_audio_turn(self, turn: AudioTurn) -> None:
+        transcript = turn.text
+        pending = self.telemetry.pending_observation()
+        live_context = self._scene_context()
+        interruption = None
+        if turn.barge_id:
+            playback = self._conversation_turns.active_playback
+            if playback is not None and playback.status == "barge_pending":
+                try:
+                    interruption = await self._omnius.classify_interruption(
+                        transcript,
+                        playback.text,
+                        self._conversation_turns.prompt_history(),
+                        live_context,
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "interruption classifier unavailable; yielding to heard audio: %s", error
+                    )
+            if not self._conversation_turns.barge_decision_current(
+                turn.barge_id, turn.revision
+            ):
+                return
+            if (
+                interruption is not None
+                and (not interruption.genuine or not interruption.should_cancel_playback)
+            ):
+                self.telemetry.record_interaction(
+                    False,
+                    f"playback resumed after semantic barge triage: {interruption.reason}",
+                    transcript,
+                    "[[RESUME]]",
+                )
+                await self._resume_barge(turn.barge_id, interruption.reason)
+                return
+            outcome = "interrupted" if interruption is not None else "audio_first"
+            terminal = self._conversation_turns.resolve_barge(turn.barge_id, outcome)
+            if terminal:
+                self._speaker.discard(terminal.playback_id)
+            self._record_voice_transition(
+                "semantic_barge_accepted"
+                if interruption is not None
+                else "semantic_barge_unavailable_audio_first"
+            )
+
+        try:
+            language = await self._omnius.reason_about_utterance(transcript, live_context)
+        except Exception as error:
+            logger.warning("dialogue routing model unavailable; using sensor evidence: %s", error)
+            language = None
+        if not self._conversation_turns.can_publish(turn.revision):
+            return
+        dialogue = self._dialogue.classify(
+            DialogueEvidence(
+                transcript,
+                doa_aligned=(
+                    self._latest_observation is not None
+                    and self._latest_observation.microphone_direction is not None
+                ),
+                seconds_since_tts=(
+                    time.monotonic() - self._last_spoken_at
+                    if self._last_spoken_at is not None
+                    else None
+                ),
+                interaction_pending=pending is not None,
+                language_directed=(
+                    bool(language["directed"]) if language is not None else None
+                ),
+                playback_overlap=turn.barge_id is not None,
+                interruption_genuine=(
+                    interruption.genuine if interruption is not None else None
+                ),
+            )
+        )
+        if not dialogue.directed:
+            self.telemetry.record_interaction(False, dialogue.reason, transcript, "[[SILENT]]")
+            return
+        unnamed_identity = self._visible_unnamed_identity()
+        if unnamed_identity and dialogue.act == "person_naming":
+            person_name = await self._omnius.interpret_person_naming(transcript)
+            if not self._conversation_turns.can_publish(turn.revision):
+                return
+            if person_name:
+                profile = await asyncio.to_thread(self.identities.name_most_recent, person_name)
+                if not self._conversation_turns.can_publish(turn.revision):
+                    return
+                if profile:
+                    await self._sync_identity_profile(profile.profile_id)
+                    self._queue_identity_name_memory(profile.profile_id, person_name, transcript)
+        if dialogue.act == "object_naming":
+            try:
+                object_label = await asyncio.wait_for(
+                    self._omnius.interpret_object_naming(transcript), timeout=30
+                )
+            except asyncio.TimeoutError:
+                logger.warning("held-object label interpretation timed out")
+                object_label = None
+            if not self._conversation_turns.can_publish(turn.revision):
+                return
+            if object_label:
+                learned = await self._learn_held_object(
+                    object_label, expected_revision=turn.revision
+                )
+                if learned:
+                    logger.info("user-labelled segmented object as %s", learned)
+        if pending:
+            feedback = await self._omnius.interpret_correction(transcript, pending)
+            if not self._conversation_turns.can_publish(turn.revision):
+                return
+            if feedback and feedback["decision"] in {"confirm", "correct"}:
+                self.telemetry.resolve_observation_correction(
+                    feedback["decision"], feedback["label"] or None
+                )
+                if (
+                    feedback["decision"] == "correct"
+                    and feedback["label"]
+                    and pending.get("object_id")
+                ):
+                    profile = await asyncio.to_thread(
+                        self.objects.relabel,
+                        str(pending["object_id"]),
+                        feedback["label"],
+                        1.0,
+                        "user",
+                        "human-feedback",
+                        {
+                            "utterance": transcript,
+                            "previous_label": pending.get("label"),
+                            "corrected_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    if not self._conversation_turns.can_publish(turn.revision):
+                        return
+                    if profile:
+                        await self._sync_object_profile(profile.profile_id)
+                        self._queue_user_correction_memory(
+                            profile.profile_id,
+                            str(pending.get("label")),
+                            profile.label,
+                            transcript,
+                        )
+                await self._speak(feedback["reply"], expected_revision=turn.revision)
+                return
+        context = await self._cognitive_context(transcript)
+        if not self._conversation_turns.can_publish(turn.revision):
+            return
+        reply = await self._omnius.conversation_reply(
+            transcript,
+            context,
+            self._conversation_turns.prompt_history(),
+        )
+        if not self._conversation_turns.can_publish(turn.revision):
+            return
+        decision = self._interaction_policy.evaluate(
+            transcript, reply, directed=dialogue.directed
+        )
+        if decision.allow_speech:
+            spoken = await self._speak(reply, expected_revision=turn.revision)
+            reason = (
+                decision.reason
+                if spoken
+                else "response superseded before audible publication"
+            )
+            self.telemetry.record_interaction(spoken, reason, transcript, reply)
+            self._queue_interaction_memory(transcript, reply, spoken, reason)
+            return
+        self.telemetry.record_interaction(False, decision.reason, transcript, reply)
+        self._queue_interaction_memory(
+            transcript, reply, False, decision.reason
+        )
+
+    async def _learn_held_object(
+        self, label: str, expected_revision: int | None = None
+    ) -> str | None:
         vision = self._vision
         if not self.config.object_learning.enabled or self._latest_frame is None or vision is None:
             return None
         frame = self._latest_frame.copy()
         segmented = await asyncio.to_thread(vision.segment_held_object, frame)
+        if (
+            expected_revision is not None
+            and not self._conversation_turns.can_publish(expected_revision)
+        ):
+            return None
         if segmented is None:
             logger.info("no valid handheld object segment available for label %r", label)
             return None
         profile = await asyncio.to_thread(self.objects.learn, label, segmented, vision)
+        if (
+            expected_revision is not None
+            and not self._conversation_turns.can_publish(expected_revision)
+        ):
+            return None
         if profile:
             await self._sync_object_profile(profile.profile_id)
         return profile.label if profile else None
@@ -1410,28 +2424,86 @@ class CompanionRuntime:
         self.telemetry.record_retrieval(self._memory.retrieval_snapshot())
         return context
 
-    async def _speak(self, text: str) -> bool:
-        if not text.strip():
+    async def _speak(self, text: str, expected_revision: int | None = None) -> bool:
+        normalized = " ".join(text.strip().split())
+        if not normalized:
             return False
+        revision = (
+            self._conversation_turns.revision
+            if expected_revision is None
+            else expected_revision
+        )
+        await asyncio.to_thread(self._direction.try_set_led_state, "think")
         try:
-            wav_audio = await self._omnius.synthesize(text)
+            wav_audio = await self._omnius.synthesize(normalized)
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             logger.exception("Omnius synthesis failed")
             self.telemetry.record_runtime_error("tts", error)
             return False
-        self._speaking = True
-        try:
-            await self._speaker.play_wav(wav_audio)
-        except Exception as error:
-            logger.exception("speaker playback failed")
-            self.telemetry.record_runtime_error("speaker", error)
+        if not self._conversation_turns.is_current(revision):
+            logger.debug("discarded stale synthesized response for heard-audio revision %s", revision)
             return False
-        finally:
-            self._speaking = False
-            self._asr_holdoff_until = time.monotonic() + 1.5
-        self.telemetry.record_reply(text)
-        self._last_spoken_at = time.monotonic()
-        return True
+        async with self._speech_lock:
+            if not self._conversation_turns.is_current(revision):
+                return False
+            playback = self._conversation_turns.begin_playback(
+                normalized, expected_revision=revision
+            )
+            if playback is None:
+                return False
+            self._speaking = True
+            await asyncio.to_thread(self._direction.try_set_led_state, "speak")
+            self._record_voice_transition("playback_started")
+            try:
+                result = await self._speaker.play_wav(
+                    wav_audio, playback_id=playback.playback_id
+                )
+            except asyncio.CancelledError:
+                current = self._conversation_turns.active_playback
+                if (
+                    current is not None
+                    and current.playback_id == playback.playback_id
+                    and current.status == "playing"
+                ):
+                    self._conversation_turns.terminate_playback(
+                        playback.playback_id, "superseded"
+                    )
+                self._record_voice_transition("playback_superseded")
+                raise
+            except Exception as error:
+                logger.exception("speaker playback failed")
+                self.telemetry.record_runtime_error("speaker", error)
+                self._conversation_turns.terminate_playback(playback.playback_id, "failed")
+                self._record_voice_transition("playback_failed")
+                return False
+            finally:
+                self._speaking = self._speaker.is_playing
+                await asyncio.to_thread(self._direction.try_set_led_state, "trace")
+                if not self.config.audio.barge_in_enabled:
+                    self._asr_holdoff_until = time.monotonic() + 1.5
+            if result.outcome == "interrupted":
+                barge = self._conversation_turns.active_barge
+                if barge and barge.playback_id == playback.playback_id:
+                    self._conversation_turns.bind_barge_cursor(
+                        barge.barge_id, result.resume_seconds
+                    )
+                self._last_spoken_at = time.monotonic()
+                self._record_voice_transition("playback_waiting_on_barge")
+                return True
+            terminal = self._conversation_turns.complete_playback(playback.playback_id)
+            if terminal is None:
+                return False
+            self.telemetry.record_reply(terminal.text)
+            self._last_spoken_at = time.monotonic()
+            self._record_voice_transition("playback_completed")
+            return True
+
+    def _record_voice_transition(self, reason: str) -> None:
+        self.telemetry.record_voice_transition(
+            self._conversation_turns.snapshot(), reason
+        )
 
     def _encode_frame(self, frame: np.ndarray) -> bytes:
         import cv2

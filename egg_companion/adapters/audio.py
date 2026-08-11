@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import io
+import json
+import math
 import re
 import subprocess
 import struct
@@ -9,12 +10,79 @@ import threading
 import time
 import wave
 from collections import deque
+from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
 from egg_companion.config import AudioConfig, TranscriptionConfig
 
 _respeaker_usb_lock = threading.RLock()
+
+_RESPEAKER_DSP_PARAMETERS: dict[str, tuple[int, int, str]] = {
+    "doa_angle": (21, 0, "int"),
+    "voice_activity": (19, 32, "int"),
+    "speech_detected": (19, 22, "int"),
+    "agc_gain": (19, 3, "float"),
+    "aec_far_end_silence": (18, 31, "int"),
+    "rt60_seconds": (18, 26, "float"),
+}
+_RESPEAKER_LED_COMMANDS = {"trace": 0, "listen": 2, "speak": 3, "think": 4, "spin": 5}
+
+_SPEECH_BAND_LOW_HZ = 160.0
+_SPEECH_BAND_LOW_TRANSITION_HZ = 40.0
+_SPEECH_BAND_HIGH_HZ = 7600.0
+_SPEECH_BAND_HIGH_TRANSITION_HZ = 400.0
+
+
+def condition_speech_band(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Remove DC, chassis/fan rumble, and near-Nyquist energy before VAD/ASR.
+
+    The ReSpeaker DSP stream on this unit has a strong stationary component near
+    117 Hz. WebRTC VAD classifies that component as voice, so applying gain to
+    the unfiltered window turns room tone into plausible Whisper text. A smooth
+    FFT-domain speech-band filter avoids an optional DSP dependency and works on
+    both 30 ms VAD frames and complete utterances.
+    """
+    source = np.asarray(samples, dtype=np.float32)
+    if source.ndim != 1 or not source.size:
+        return source.copy()
+    centered = source - float(np.mean(source))
+    spectrum = np.fft.rfft(centered)
+    frequencies = np.fft.rfftfreq(centered.size, d=1.0 / sample_rate)
+    weights = np.ones_like(frequencies)
+
+    low_stop = max(0.0, _SPEECH_BAND_LOW_HZ - _SPEECH_BAND_LOW_TRANSITION_HZ)
+    weights[frequencies < low_stop] = 0.0
+    low_transition = (frequencies >= low_stop) & (frequencies < _SPEECH_BAND_LOW_HZ)
+    if np.any(low_transition):
+        phase = (frequencies[low_transition] - low_stop) / max(
+            _SPEECH_BAND_LOW_HZ - low_stop, 1.0
+        )
+        weights[low_transition] = 0.5 - 0.5 * np.cos(np.pi * phase)
+
+    nyquist = sample_rate / 2
+    high_stop = min(nyquist, _SPEECH_BAND_HIGH_HZ)
+    high_start = max(_SPEECH_BAND_LOW_HZ, high_stop - _SPEECH_BAND_HIGH_TRANSITION_HZ)
+    high_transition = (frequencies > high_start) & (frequencies <= high_stop)
+    if np.any(high_transition):
+        phase = (frequencies[high_transition] - high_start) / max(
+            high_stop - high_start, 1.0
+        )
+        weights[high_transition] = 0.5 + 0.5 * np.cos(np.pi * phase)
+    weights[frequencies > high_stop] = 0.0
+    return np.fft.irfft(spectrum * weights, n=centered.size).astype(np.float32)
+
+
+@dataclass(frozen=True)
+class UtteranceBoundary:
+    kind: Literal["started", "ended"]
+    at_monotonic: float
+    samples: np.ndarray | None = None
+    reason: str | None = None
+    voiced_ms: int = 0
+    silence_target_ms: int = 0
+    continuation_count: int = 0
 
 
 def resolve_pulse_source(audio: AudioConfig) -> tuple[str, int]:
@@ -42,34 +110,94 @@ def resolve_pulse_source(audio: AudioConfig) -> tuple[str, int]:
     return source, audio.channels
 
 
-def read_respeaker_direction(config: AudioConfig) -> float:
+def _respeaker_device(config: AudioConfig):
     try:
         import usb.core
-        import usb.util
     except ImportError as error:
-        raise RuntimeError("PyUSB is required for ReSpeaker USB direction-of-arrival") from error
+        raise RuntimeError("PyUSB is required for ReSpeaker XVF3000 controls") from error
+    device = usb.core.find(
+        idVendor=config.respeaker_vendor_id,
+        idProduct=config.respeaker_product_id,
+    )
+    if device is None:
+        raise RuntimeError(
+            f"ReSpeaker USB device {config.respeaker_vendor_id:04x}:"
+            f"{config.respeaker_product_id:04x} not found"
+        )
+    return device
+
+
+def _read_respeaker_parameter(device, parameter: tuple[int, int, str]) -> float:
+    import usb.util
+
+    parameter_id, offset, value_type = parameter
+    command = 0x80 | offset | (0x40 if value_type == "int" else 0)
+    response = device.ctrl_transfer(
+        usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
+        0, command, parameter_id, 8, 100000,
+    )
+    mantissa, exponent = struct.unpack("ii", bytes(response))
+    return float(mantissa if value_type == "int" else mantissa * (2.0 ** exponent))
+
+
+def read_respeaker_dsp_status(config: AudioConfig, *, diagnostics: bool = True) -> dict[str, object]:
+    """Read the XVF3000's native VAD, DoA, AEC, AGC, and room estimate."""
+
+    device = _respeaker_device(config)
+    names = list(_RESPEAKER_DSP_PARAMETERS) if diagnostics else [
+        "doa_angle", "voice_activity", "speech_detected"
+    ]
     with _respeaker_usb_lock:
-        device = usb.core.find(
-            idVendor=config.respeaker_vendor_id,
-            idProduct=config.respeaker_product_id,
-        )
-        if device is None:
-            raise RuntimeError(
-                f"ReSpeaker USB device {config.respeaker_vendor_id:04x}:"
-                f"{config.respeaker_product_id:04x} not found"
-            )
-        response = device.ctrl_transfer(
-            usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
-            0,
-            0xC0,
-            21,
-            8,
-            100000,
-        )
-    angle, _ = struct.unpack("ii", bytes(response))
+        values = {
+            name: _read_respeaker_parameter(device, _RESPEAKER_DSP_PARAMETERS[name])
+            for name in names
+        }
+    values["doa_angle"] = values["doa_angle"] % 360
+    for name in ("voice_activity", "speech_detected", "aec_far_end_silence"):
+        if name in values:
+            values[name] = bool(values[name])
+    values.update(
+        {
+            "device": "XVF3000 ReSpeaker USB 4-Mic Array v2.0",
+            "sample_rate": config.sample_rate,
+            "capture_channels": config.channels,
+            "asr_channel": config.asr_channel,
+            "asr_stream": "processed AEC/beamformed/denoised channel 0",
+            "updated_at": time.time(),
+        }
+    )
+    return values
+
+
+def read_respeaker_direction(config: AudioConfig) -> float:
+    angle = float(read_respeaker_dsp_status(config, diagnostics=False)["doa_angle"])
     if not 0 <= angle < 360:
         raise RuntimeError(f"ReSpeaker returned invalid direction: {angle}")
-    return float(angle)
+    return angle
+
+
+def write_respeaker_led(config: AudioConfig, state: str) -> None:
+    if not config.respeaker_led_enabled:
+        return
+    import usb.util
+
+    device = _respeaker_device(config)
+    normalized = state.strip().lower()
+    if normalized == "off":
+        command, data = 1, [0, 0, 0, 0]
+    elif normalized in _RESPEAKER_LED_COMMANDS:
+        command, data = _RESPEAKER_LED_COMMANDS[normalized], [0]
+    else:
+        raise ValueError(f"unsupported ReSpeaker LED state: {state}")
+    with _respeaker_usb_lock:
+        device.ctrl_transfer(
+            usb.util.CTRL_OUT | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
+            0, 0x20, 0x1C, [config.respeaker_led_brightness], 8000,
+        )
+        device.ctrl_transfer(
+            usb.util.CTRL_OUT | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
+            0, command, 0x1C, data, 8000,
+        )
 
 
 class ReSpeakerDirection:
@@ -81,12 +209,19 @@ class ReSpeakerDirection:
         self._thread: threading.Thread | None = None
         self._failure: BaseException | None = None
         self._stop_event = threading.Event()
+        self._status: dict[str, object] = {
+            "device": "XVF3000 ReSpeaker USB 4-Mic Array v2.0",
+            "ready": False,
+            "led_state": "off",
+        }
 
     def start(self) -> None:
         if self.config.doa_mode == "disabled":
             return
         if self.config.doa_mode not in {"respeaker_usb", "serial"}:
             raise ValueError(f"unsupported ReSpeaker DOA mode: {self.config.doa_mode}")
+        if self.config.doa_mode == "respeaker_usb" and self.config.respeaker_led_enabled:
+            self.set_led_state("trace")
         self._thread = threading.Thread(target=self._read, name="respeaker-doa", daemon=True)
         self._thread.start()
 
@@ -94,11 +229,30 @@ class ReSpeakerDirection:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
+        if self.config.doa_mode == "respeaker_usb" and self.config.respeaker_led_enabled:
+            try:
+                self.set_led_state("off")
+            except Exception:
+                pass
 
     def latest_angle(self) -> float | None:
         if self._failure:
             raise RuntimeError("ReSpeaker DOA reader failed") from self._failure
         return self._angles[-1] if self._angles else None
+
+    def latest_status(self) -> dict[str, object]:
+        return dict(self._status)
+
+    def set_led_state(self, state: str) -> None:
+        write_respeaker_led(self.config, state)
+        self._status = {**self._status, "led_state": state, "led_brightness": self.config.respeaker_led_brightness}
+
+    def try_set_led_state(self, state: str) -> bool:
+        try:
+            self.set_led_state(state)
+            return True
+        except Exception:
+            return False
 
     def _read(self) -> None:
         try:
@@ -110,8 +264,15 @@ class ReSpeakerDirection:
             self._failure = error
 
     def _read_respeaker_usb(self) -> None:
+        last_diagnostics = 0.0
         while not self._stop_event.is_set():
-            self._angles.append(read_respeaker_direction(self.config))
+            diagnostics = time.monotonic() - last_diagnostics >= 1.0
+            status = {**self._status, **read_respeaker_dsp_status(self.config, diagnostics=diagnostics)}
+            if diagnostics:
+                last_diagnostics = time.monotonic()
+            status["ready"] = True
+            self._status = status
+            self._angles.append(float(status["doa_angle"]))
             self._stop_event.wait(0.1)
 
     def _read_serial(self) -> None:
@@ -151,7 +312,6 @@ class UtteranceSegmenter:
         pre_roll_frames = max(1, round(transcription.vad_pre_roll_ms / self._FRAME_MS))
         self._pre_roll: deque[np.ndarray] = deque(maxlen=pre_roll_frames)
         self._onset_frames_required = max(1, round(transcription.vad_min_contiguous_ms / self._FRAME_MS))
-        self._hangover_frames_required = max(1, round(transcription.vad_hangover_ms / self._FRAME_MS))
         self._max_frames = max(
             self._onset_frames_required,
             round(transcription.segment_seconds * 1000 / self._FRAME_MS),
@@ -164,53 +324,109 @@ class UtteranceSegmenter:
         self._utterance_frames: list[np.ndarray] = []
         self._voiced_streak = 0
         self._silence_streak = 0
+        self._voiced_frames = 0
+        self._continuation_count = 0
         self._pre_roll.clear()
         self._carry = np.empty(0, dtype=np.float32)
 
     def feed(self, samples: np.ndarray) -> list[np.ndarray]:
         """Consume newly captured raw samples; return zero or more completed
         utterances (raw, ungained mono float32 arrays) finalized by this call."""
+        return [
+            event.samples
+            for event in self.feed_events(samples)
+            if event.kind == "ended" and event.samples is not None
+        ]
+
+    def feed_events(self, samples: np.ndarray) -> list[UtteranceBoundary]:
+        """Consume samples and expose ordered onset/end events for barge-in."""
         combined = np.concatenate((self._carry, samples.astype(np.float32, copy=False)))
         frame_count = combined.size // self._frame_samples
         self._carry = combined[frame_count * self._frame_samples:]
-        completed: list[np.ndarray] = []
+        events: list[UtteranceBoundary] = []
         for index in range(frame_count):
             frame = combined[index * self._frame_samples: (index + 1) * self._frame_samples]
-            utterance = self._consume_frame(frame)
-            if utterance is not None:
-                completed.append(utterance)
-        return completed
+            events.extend(self._consume_frame(frame))
+        return events
 
-    def _consume_frame(self, frame: np.ndarray) -> np.ndarray | None:
+    def _consume_frame(self, frame: np.ndarray) -> list[UtteranceBoundary]:
         voiced = self._is_voiced(frame)
         if not self._recording:
             self._pre_roll.append(frame)
             self._voiced_streak = self._voiced_streak + 1 if voiced else 0
             if self._voiced_streak < self._onset_frames_required:
-                return None
+                return []
             self._recording = True
             self._utterance_frames = list(self._pre_roll)
             self._silence_streak = 0
-            return None
+            self._voiced_frames = self._onset_frames_required
+            self._continuation_count = 0
+            return [
+                UtteranceBoundary(
+                    "started",
+                    time.monotonic(),
+                    voiced_ms=self._voiced_frames * self._FRAME_MS,
+                    silence_target_ms=self._hangover_target_ms(),
+                )
+            ]
         self._utterance_frames.append(frame)
-        self._silence_streak = 0 if voiced else self._silence_streak + 1
-        if self._silence_streak >= self._hangover_frames_required or len(self._utterance_frames) >= self._max_frames:
-            return self._finalize()
-        return None
+        if voiced:
+            if self._silence_streak:
+                self._continuation_count += 1
+            self._silence_streak = 0
+            self._voiced_frames += 1
+        else:
+            self._silence_streak += 1
+        target_frames = max(1, round(self._hangover_target_ms() / self._FRAME_MS))
+        if self._silence_streak >= target_frames:
+            return [self._finalize("silence")]
+        if len(self._utterance_frames) >= self._max_frames:
+            return [self._finalize("max_utterance")]
+        return []
 
-    def _finalize(self) -> np.ndarray:
+    def _hangover_target_ms(self) -> int:
+        base_ms = float(self.transcription.vad_hangover_ms)
+        configured_max = self.transcription.vad_hangover_max_ms
+        max_ms = max(base_ms, float(configured_max if configured_max is not None else base_ms))
+        if max_ms <= base_ms:
+            return round(base_ms)
+        growth_ms = float(self.transcription.vad_hangover_growth_ms)
+        effective_voiced_ms = (
+            self._voiced_frames * self._FRAME_MS
+            + self._continuation_count
+            * growth_ms
+            * float(self.transcription.vad_continuation_growth)
+        )
+        extension = (max_ms - base_ms) * (1 - math.exp(-effective_voiced_ms / growth_ms))
+        return round(min(max_ms, max(base_ms, base_ms + extension)))
+
+    def _finalize(self, reason: str) -> UtteranceBoundary:
         utterance = (
-            np.concatenate(self._utterance_frames) if self._utterance_frames else np.empty(0, dtype=np.float32)
+            np.concatenate(self._utterance_frames)
+            if self._utterance_frames
+            else np.empty(0, dtype=np.float32)
+        )
+        event = UtteranceBoundary(
+            "ended",
+            time.monotonic(),
+            samples=utterance,
+            reason=reason,
+            voiced_ms=self._voiced_frames * self._FRAME_MS,
+            silence_target_ms=self._hangover_target_ms(),
+            continuation_count=self._continuation_count,
         )
         self._recording = False
         self._utterance_frames = []
         self._voiced_streak = 0
         self._silence_streak = 0
+        self._voiced_frames = 0
+        self._continuation_count = 0
         self._pre_roll.clear()
-        return utterance
+        return event
 
     def _is_voiced(self, frame: np.ndarray) -> bool:
-        gained = np.clip(frame * self.transcription.vad_input_gain, -1, 1)
+        speech_band = condition_speech_band(frame, self.audio.sample_rate)
+        gained = np.clip(speech_band * self.transcription.vad_input_gain, -1, 1)
         rms = float(np.sqrt(np.mean(np.square(gained))))
         if rms < self.transcription.vad_min_voiced_rms:
             return False
@@ -228,6 +444,8 @@ class ReSpeakerCapture:
         self.last_speech_ms = 0
         self.last_voiced_rms = 0.0
         self.last_speech_detected = False
+        self.last_conditioned_rms = 0.0
+        self.last_applied_gain = 1.0
 
     def capture_once(self) -> bytes | None:
         wav_audio, rms = self.capture_segment()
@@ -273,8 +491,14 @@ class ReSpeakerCapture:
 
     def process_samples(self, mono: np.ndarray) -> tuple[bytes, float]:
         rms = self.analyze_samples(mono)
-        gain = min(self.audio.asr_target_rms / max(rms, 1e-6), self.audio.asr_max_gain)
-        normalized = np.clip(mono * gain, -1, 1)
+        conditioned = condition_speech_band(mono, self.audio.sample_rate)
+        reference_rms = self.last_voiced_rms or self.last_conditioned_rms
+        gain = min(
+            self.audio.asr_target_rms / max(reference_rms, 1e-6),
+            self.audio.asr_max_gain,
+        )
+        self.last_applied_gain = float(gain)
+        normalized = np.clip(conditioned * gain, -1, 1)
         pcm = (normalized * 32767).astype("<i2")
         payload = io.BytesIO()
         with wave.open(payload, "wb") as wav:
@@ -289,7 +513,9 @@ class ReSpeakerCapture:
             raise RuntimeError("ReSpeaker ASR processing received no mono samples")
         mono = mono.astype(np.float32, copy=False)
         rms = float(np.sqrt(np.mean(np.square(mono))))
-        vad_input = np.clip(mono * self.transcription.vad_input_gain, -1, 1)
+        speech_band = condition_speech_band(mono, self.audio.sample_rate)
+        self.last_conditioned_rms = float(np.sqrt(np.mean(np.square(speech_band))))
+        vad_input = np.clip(speech_band * self.transcription.vad_input_gain, -1, 1)
         self.last_speech_detected = self._detect_speech(vad_input)
         return rms
 

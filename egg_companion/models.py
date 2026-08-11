@@ -64,7 +64,9 @@ class EvidenceRef:
 @dataclass(frozen=True)
 class PerceptualEvent:
     event_id: str
-    event_type: Literal["vision", "speech", "object", "identity", "user_correction", "attention"]
+    event_type: Literal[
+        "vision", "speech", "object", "identity", "ocr", "user_correction", "attention"
+    ]
     occurred_at: datetime
     source_id: str
     evidence: tuple[EvidenceRef, ...] = ()

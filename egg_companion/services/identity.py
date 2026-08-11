@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from dataclasses import dataclass
+from hashlib import sha256
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import numpy as np
 from egg_companion.adapters.vision import FaceCrop, VisionEngine
 from egg_companion.config import IdentityConfig
 from egg_companion.memory.fusion import EvidenceFusion
-from egg_companion.models import Detection
+from egg_companion.models import BoundingBox, Detection
 
 
 @dataclass
@@ -31,6 +32,21 @@ class IdentityProfile:
     kind: str = "face"
 
 
+@dataclass
+class _PersonTrack:
+    """Short-lived, camera-local continuity; deliberately not a person identity."""
+
+    track_id: str
+    camera_id: str
+    bbox: BoundingBox
+    first_seen: datetime
+    last_seen: datetime
+    observations: int = 1
+    profile_id: str | None = None
+    kind: str = "appearance-track"
+    face_embeddings: list[np.ndarray] = field(default_factory=list)
+
+
 class IdentityLibrary:
     """Persistent on-device identity profiles with face-first anonymous recall."""
 
@@ -39,7 +55,12 @@ class IdentityLibrary:
         self._directory = Path(config.storage_dir)
         self._lock = threading.RLock()
         self._profiles: dict[str, IdentityProfile] = {}
+        # Aliases remain intact as source profiles.  This map only changes the
+        # canonical identity used for recall and presentation.
+        self._aliases: dict[str, tuple[str, float, str]] = {}
         self._database: sqlite3.Connection | None = None
+        self._tracks: dict[str, list[_PersonTrack]] = {}
+        self._next_track_number = 1
         self._last_match_components: dict[str, float] = {}
         self._last_match_outcome = "new"
         if config.enabled:
@@ -48,6 +69,7 @@ class IdentityLibrary:
             self._database.row_factory = sqlite3.Row
             self._create_schema()
             self._load()
+            self._seed_face_galleries()
 
     def observe(
         self,
@@ -59,50 +81,66 @@ class IdentityLibrary:
         if not self.config.enabled:
             return {}
         matches: dict[int, dict[str, object]] = {}
+        now = datetime.now(timezone.utc)
+        used_tracks: set[str] = set()
         for index, detection in enumerate(detections):
             if detection.label != "person":
                 continue
+            track, new_track = self._associate_track(camera_id, detection.bbox, now, used_tracks)
+            used_tracks.add(track.track_id)
             faces = vision.face_crops(frame, detection)
             if not faces:
+                matches[index] = self._track_match(track, detection.confidence, new_track)
                 continue
             face = max(faces, key=lambda item: item.image.shape[0] * item.image.shape[1])
+            face_embedding = (
+                self._normalized(face.face_embedding)
+                if face.face_embedding is not None
+                and face.confidence >= self.config.minimum_face_quality
+                else None
+            )
+            if track.profile_id is not None:
+                with self._lock:
+                    profile = self._profiles.get(track.profile_id)
+                if profile is not None:
+                    self._update_profile(profile, camera_id, vision, face, now, similarity=1.0)
+                    matches[index] = self._profile_match(profile, False, 1.0, "track_continuity")
+                    continue
+                track.profile_id = None
+            if face_embedding is None:
+                track.kind = face.kind if face.kind != "face" else "low-quality-face-track"
+                matches[index] = self._track_match(track, face.confidence, new_track)
+                continue
+
+            # CLIP is retained as descriptive metadata for memory search, but it
+            # is not consulted when deciding whether two observations are one
+            # person. Face-specific evidence owns persistent identity.
             clip_embedding = self._normalized(vision.embed_image(face.image))
-            face_embedding = self._normalized(face.face_embedding) if face.face_embedding is not None else None
-            profile, created, similarity = self._match_or_create(clip_embedding, face_embedding, face.kind)
-            now = datetime.now(timezone.utc)
+            profile, created, similarity = self._match_or_create(
+                clip_embedding, face_embedding, allow_create=False
+            )
+            if profile is None:
+                self._accumulate_face_candidate(track, face_embedding)
+                track.kind = "face-candidate-track"
+                if len(track.face_embeddings) < self.config.enrollment_min_face_observations:
+                    matches[index] = self._track_match(track, face.confidence, new_track)
+                    continue
+                stable_embedding = self._normalized(np.sum(track.face_embeddings, axis=0))
+                profile, created, similarity = self._match_or_create(
+                    clip_embedding,
+                    stable_embedding,
+                    allow_create=True,
+                    initial_samples=len(track.face_embeddings),
+                )
+            assert profile is not None
+            track.profile_id = profile.profile_id
             with self._lock:
-                profile.last_seen = now
-                profile.last_camera = camera_id
-                if not created:
+                if not created and new_track:
                     profile.sightings += 1
-                profile.confidence = face.confidence if created else min(face.confidence, similarity)
-                if created:
-                    self._save(profile, face.image)
-                elif (now - profile.last_sample_at).total_seconds() >= self.config.sample_interval_seconds:
-                    profile.clip_embedding = self._normalized(
-                        (profile.clip_embedding * profile.samples) + vision.embed_image(face.image)
-                    )
-                    if face.face_embedding is not None and profile.face_embedding is not None:
-                        profile.face_embedding = self._normalized(
-                            (profile.face_embedding * profile.samples) + face.face_embedding
-                        )
-                    profile.samples += 1
-                    profile.last_sample_at = now
-                    self._save(profile, face.image)
-                else:
-                    self._store(profile)
-            matches[index] = {
-                "id": profile.profile_id,
-                "label": profile.name or profile.profile_id,
-                "confidence": round(profile.confidence, 3),
-                "needs_name": profile.name is None,
-                "new": created,
-                "recalled": not created,
-                "kind": profile.kind,
-                "sightings": profile.sightings,
-                "resolver_outcome": "new" if created else self._last_match_outcome,
-                "confidence_components": dict(self._last_match_components),
-            }
+            self._update_profile(profile, camera_id, vision, face, now, similarity)
+            matches[index] = self._profile_match(
+                profile, created, similarity, "new" if created else self._last_match_outcome
+            )
         return matches
 
     def name_most_recent(self, name: str) -> IdentityProfile | None:
@@ -110,7 +148,10 @@ class IdentityLibrary:
         if not normalized_name or len(normalized_name) > 64:
             return None
         with self._lock:
-            unnamed = [profile for profile in self._profiles.values() if profile.name is None]
+            unnamed = [
+                profile for profile in self._profiles.values()
+                if profile.name is None and profile.profile_id not in self._aliases
+            ]
             if not unnamed:
                 return None
             profile = max(unnamed, key=lambda item: item.last_seen)
@@ -123,7 +164,7 @@ class IdentityLibrary:
         if not normalized_name or len(normalized_name) > 64:
             return None
         with self._lock:
-            profile = self._profiles.get(profile_id)
+            profile = self._profiles.get(self._canonical_id(profile_id))
             if profile is None:
                 return None
             profile.name = normalized_name
@@ -136,27 +177,285 @@ class IdentityLibrary:
             if profile is None:
                 return False
             if self._database is not None:
+                self._database.execute("DELETE FROM face_samples WHERE profile_id=?", (profile_id,))
+                self._database.execute(
+                    "DELETE FROM profile_aliases WHERE alias_id=? OR canonical_id=?",
+                    (profile_id, profile_id),
+                )
                 self._database.execute("DELETE FROM profiles WHERE profile_id=?", (profile_id,))
                 self._database.commit()
+            self._aliases = {
+                alias_id: mapping for alias_id, mapping in self._aliases.items()
+                if alias_id != profile_id and mapping[0] != profile_id
+            }
             return True
 
     def snapshot(self) -> list[dict[str, object]]:
+        """Dashboard projection which never presents raw fragments as known people."""
+
+        with self._lock:
+            profiles = list(self._profiles.values())
+            face_groups = self._face_groups()
+            recurrent_faces = [
+                group for group in face_groups.values()
+                if any(profile.name is not None for profile in group)
+                or sum(profile.samples for profile in group) >= 2
+            ]
+            pending_faces = [
+                group[0] for group in face_groups.values()
+                if all(profile.name is None for profile in group)
+                and sum(profile.samples for profile in group) < 2
+            ]
+            appearance = [profile for profile in profiles if profile.face_embedding is None]
+            rows = [self._snapshot_group(group) for group in recurrent_faces]
+            pending = self._snapshot_stack(
+                pending_faces,
+                "stack:face-candidates",
+                "Face candidates awaiting another sighting",
+                "face-candidate-stack",
+            )
+            if pending is not None:
+                rows.append(pending)
+            by_camera: dict[str, list[IdentityProfile]] = {}
+            for profile in appearance:
+                by_camera.setdefault(profile.last_camera or "unknown camera", []).append(profile)
+            for camera, camera_profiles in by_camera.items():
+                stack = self._snapshot_stack(
+                    camera_profiles,
+                    f"stack:appearance:{camera}",
+                    f"Unconfirmed observations · {camera}",
+                    "appearance-observation-stack",
+                )
+                if stack is not None:
+                    rows.append(stack)
+            return sorted(rows, key=lambda item: str(item["last_seen"]), reverse=True)
+
+    def summary(self) -> dict[str, object]:
+        with self._lock:
+            profiles = list(self._profiles.values())
+            face_groups = self._face_groups()
+            gallery = (
+                self._database.execute(
+                    "SELECT COUNT(*) AS samples, COUNT(DISTINCT profile_id) AS profiles FROM face_samples"
+                ).fetchone()
+                if self._database is not None
+                else None
+            )
+            return {
+                "canonical_people": len(face_groups),
+                "coalesced_aliases": len(self._aliases),
+                "named_people": sum(
+                    any(profile.name is not None for profile in group)
+                    for group in face_groups.values()
+                ),
+                "recurrent_face_profiles": sum(
+                    all(profile.name is None for profile in group)
+                    and sum(profile.samples for profile in group) >= 2
+                    for group in face_groups.values()
+                ),
+                "provisional_face_profiles": sum(
+                    all(profile.name is None for profile in group)
+                    and sum(profile.samples for profile in group) < 2
+                    for group in face_groups.values()
+                ),
+                "legacy_appearance_fragments": sum(
+                    profile.face_embedding is None for profile in profiles
+                ),
+                "active_observation_tracks": sum(len(tracks) for tracks in self._tracks.values()),
+                "retained_face_samples": int(gallery["samples"]) if gallery else 0,
+                "profiles_with_face_gallery": int(gallery["profiles"]) if gallery else 0,
+                "persistent_identity_authority": "face-specific multi-view templates",
+                "appearance_policy": "temporal track only",
+                "coalescing_policy": "reciprocal AdaFace + SFace template clusters with repeated/spatial co-observation veto",
+            }
+
+    def coalesce_profiles(
+        self, conflicting_pairs: set[tuple[str, str]] | None = None
+    ) -> list[dict[str, object]]:
+        """Create conservative, reversible canonical aliases for legacy face fragments.
+
+        Profiles are never deleted or rewritten.  An alias must directly clear
+        the configured similarity threshold against a higher-evidence canonical
+        profile, and profiles observed together are never coalesced.
+        """
+
+        if not self.config.enabled or not self.config.retroactive_coalescing_enabled:
+            return []
+        conflicts = {
+            tuple(sorted((str(left), str(right))))
+            for left, right in (conflicting_pairs or set()) if left != right
+        }
+        with self._lock:
+            faces = [
+                profile for profile in self._profiles.values()
+                if profile.face_embedding is not None and profile.profile_id not in self._aliases
+            ]
+            faces.sort(
+                key=lambda profile: (
+                    profile.name is not None,
+                    profile.samples * max(1, profile.sightings),
+                    profile.samples,
+                    -int(profile.profile_id.removeprefix("person-") or 0)
+                    if profile.profile_id.removeprefix("person-").isdigit() else 0,
+                ),
+                reverse=True,
+            )
+            assigned: set[str] = set(self._aliases)
+            for canonical in faces:
+                if canonical.profile_id in assigned:
+                    continue
+                for candidate in faces:
+                    if candidate.profile_id == canonical.profile_id or candidate.profile_id in assigned:
+                        continue
+                    pair = tuple(sorted((canonical.profile_id, candidate.profile_id)))
+                    if pair in conflicts or not self._names_compatible(canonical, candidate):
+                        continue
+                    similarity = float(np.dot(canonical.face_embedding, candidate.face_embedding))
+                    if similarity < self.config.retroactive_merge_similarity:
+                        continue
+                    reason = "direct_face_similarity_no_coobservation_conflict"
+                    self._aliases[candidate.profile_id] = (
+                        canonical.profile_id, similarity, reason
+                    )
+                    assigned.add(candidate.profile_id)
+                    self._store_alias(candidate.profile_id, canonical.profile_id, similarity, reason)
+            return self.alias_mappings()
+
+    def alias_mappings(self) -> list[dict[str, object]]:
         with self._lock:
             return [
                 {
-                    "id": profile.profile_id,
-                    "label": profile.name or profile.profile_id,
-                    "samples": profile.samples,
-                    "sightings": profile.sightings,
-                    "confidence": round(profile.confidence, 3),
-                    "first_seen": profile.first_seen.isoformat(),
-                    "last_seen": profile.last_seen.isoformat(),
-                    "last_camera": profile.last_camera,
-                    "thumbnail_url": f"/api/identities/{profile.profile_id}/face.jpg",
-                    "kind": profile.kind,
+                    "alias_id": alias_id,
+                    "canonical_id": canonical_id,
+                    "similarity": round(similarity, 6),
+                    "reason": reason,
                 }
-                for profile in sorted(self._profiles.values(), key=lambda item: item.last_seen, reverse=True)
+                for alias_id, (canonical_id, similarity, reason) in sorted(self._aliases.items())
             ]
+
+    def create_alias(
+        self,
+        alias_id: str,
+        canonical_id: str,
+        similarity: float,
+        reason: str,
+        conflicting_pairs: set[tuple[str, str]] | None = None,
+    ) -> dict[str, object] | None:
+        """Apply one reversible dream merge after rechecking identity constraints."""
+
+        conflicts = {
+            tuple(sorted((str(left), str(right))))
+            for left, right in (conflicting_pairs or set()) if left != right
+        }
+        with self._lock:
+            alias_id = self._canonical_id(alias_id)
+            canonical_id = self._canonical_id(canonical_id)
+            if alias_id == canonical_id or alias_id in self._aliases:
+                return None
+            alias = self._profiles.get(alias_id)
+            canonical = self._profiles.get(canonical_id)
+            if alias is None or canonical is None:
+                return None
+            pair = tuple(sorted((alias_id, canonical_id)))
+            if pair in conflicts or not self._names_compatible(alias, canonical):
+                return None
+            bounded_similarity = max(0.0, min(1.0, float(similarity)))
+            self._aliases[alias_id] = (canonical_id, bounded_similarity, reason)
+            self._store_alias(alias_id, canonical_id, bounded_similarity, reason)
+            return {
+                "alias_id": alias_id,
+                "canonical_id": canonical_id,
+                "similarity": round(bounded_similarity, 6),
+                "reason": reason,
+            }
+
+    def face_sample_snapshot(self) -> list[dict[str, object]]:
+        """Return bounded retained face evidence for idle-time template aggregation."""
+
+        if self._database is None:
+            return []
+        with self._lock:
+            rows = self._database.execute(
+                """SELECT sample_id, profile_id, captured_at, camera_id, quality,
+                sface_embedding, image_jpeg FROM face_samples ORDER BY captured_at"""
+            ).fetchall()
+            return [
+                {
+                    "sample_id": str(row["sample_id"]),
+                    "profile_id": str(row["profile_id"]),
+                    "captured_at": str(row["captured_at"]),
+                    "camera_id": row["camera_id"],
+                    "quality": float(row["quality"]),
+                    "sface_embedding": self._vector(row["sface_embedding"]),
+                    "image_jpeg": bytes(row["image_jpeg"]),
+                }
+                for row in rows
+            ]
+
+    def identity_timeline_source(self, profile_id: str) -> dict[str, object] | None:
+        """Canonical identity metadata and retained crops across every source alias."""
+
+        with self._lock:
+            canonical_id = self._canonical_id(profile_id)
+            canonical = self._profiles.get(canonical_id)
+            if canonical is None or canonical.face_embedding is None:
+                return None
+            members = [
+                profile for profile in self._profiles.values()
+                if profile.face_embedding is not None
+                and self._canonical_id(profile.profile_id) == canonical_id
+            ]
+            member_ids = sorted(profile.profile_id for profile in members)
+            samples: list[dict[str, object]] = []
+            if self._database is not None and member_ids:
+                placeholders = ",".join("?" for _ in member_ids)
+                rows = self._database.execute(
+                    f"""SELECT sample_id, profile_id, captured_at, camera_id, quality
+                    FROM face_samples WHERE profile_id IN ({placeholders})
+                    ORDER BY captured_at DESC""",
+                    member_ids,
+                ).fetchall()
+                samples = [
+                    {
+                        "sample_id": str(row["sample_id"]),
+                        "source_profile_id": str(row["profile_id"]),
+                        "captured_at": str(row["captured_at"]),
+                        "camera_id": row["camera_id"],
+                        "quality": round(float(row["quality"]), 4),
+                        "artifact_url": (
+                            f"/api/identities/{canonical_id}/samples/{row['sample_id']}.jpg"
+                        ),
+                    }
+                    for row in rows
+                ]
+            representative = max(members, key=lambda item: item.last_seen)
+            name = next((profile.name for profile in members if profile.name), None)
+            return {
+                "id": canonical_id,
+                "label": name or canonical_id,
+                "alias_ids": [item for item in member_ids if item != canonical_id],
+                "source_profile_ids": member_ids,
+                "first_seen": min(profile.first_seen for profile in members).isoformat(),
+                "last_seen": representative.last_seen.isoformat(),
+                "last_camera": representative.last_camera,
+                "samples": sum(profile.samples for profile in members),
+                "sightings": sum(profile.sightings for profile in members),
+                "retained_face_samples": samples,
+                "thumbnail_url": f"/api/identities/{representative.profile_id}/face.jpg",
+            }
+
+    def face_sample(self, profile_id: str, sample_id: str) -> bytes | None:
+        if self._database is None:
+            return None
+        with self._lock:
+            canonical_id = self._canonical_id(profile_id)
+            row = self._database.execute(
+                "SELECT profile_id, image_jpeg FROM face_samples WHERE sample_id=?",
+                (sample_id,),
+            ).fetchone()
+            if row is None or self._canonical_id(str(row["profile_id"])) != canonical_id:
+                return None
+            return bytes(row["image_jpeg"])
 
     def thumbnail(self, profile_id: str) -> bytes | None:
         with self._lock:
@@ -184,61 +483,307 @@ class IdentityLibrary:
             ]
 
     def profile_record(self, profile_id: str) -> dict[str, object] | None:
+        profile_id = self._canonical_id(profile_id)
         return next(
             (profile for profile in self.migration_profiles() if profile["profile_id"] == profile_id),
             None,
         )
 
     def _match_or_create(
-        self, clip_embedding: np.ndarray, face_embedding: np.ndarray | None, kind: str
-    ) -> tuple[IdentityProfile, bool, float]:
+        self,
+        clip_embedding: np.ndarray,
+        face_embedding: np.ndarray,
+        *,
+        allow_create: bool,
+        initial_samples: int = 1,
+    ) -> tuple[IdentityProfile | None, bool, float]:
         with self._lock:
-            if face_embedding is not None:
-                candidates = [profile for profile in self._profiles.values() if profile.face_embedding is not None]
-                if candidates:
-                    profile, score = max(
-                        ((item, float(np.dot(face_embedding, item.face_embedding))) for item in candidates),
-                        key=lambda item: item[1],
-                    )
-                    if score >= self.config.face_similarity_threshold:
-                        clip_score = float(np.dot(clip_embedding, profile.clip_embedding))
-                        fusion = EvidenceFusion.person(score, clip_score)
-                        self._last_match_components = fusion.components
+            candidates = [profile for profile in self._profiles.values() if profile.face_embedding is not None]
+            best_score = 0.0
+            if candidates:
+                # Rank distinct canonical people rather than raw source rows.
+                # Otherwise two old fragments of one face become each other's
+                # runner-up and defeat the match-margin safety check.
+                grouped: dict[str, tuple[IdentityProfile, float]] = {}
+                for item in candidates:
+                    canonical_id = self._canonical_id(item.profile_id)
+                    score = float(np.dot(face_embedding, item.face_embedding))
+                    previous = grouped.get(canonical_id)
+                    if previous is None or score > previous[1]:
+                        grouped[canonical_id] = (item, score)
+                ranked = sorted(grouped.items(), key=lambda item: item[1][1], reverse=True)
+                canonical_id, (matched_source, score) = ranked[0]
+                profile = self._profiles[canonical_id]
+                best_score = score
+                runner_up = ranked[1][1][1] if len(ranked) > 1 else -1.0
+                separated = len(ranked) == 1 or score - runner_up >= self.config.face_match_margin
+                if score >= self.config.face_similarity_threshold and separated:
+                    clip_score = float(np.dot(clip_embedding, matched_source.clip_embedding))
+                    fusion = EvidenceFusion.person(score, clip_score)
+                    self._last_match_components = {
+                        **fusion.components,
+                        "runner_up_similarity": max(0.0, runner_up),
+                        "match_margin": max(0.0, score - runner_up),
+                    }
+                    if matched_source.profile_id != canonical_id:
+                        self._last_match_components["matched_alias"] = matched_source.profile_id
+                        self._last_match_outcome = "coalesced_recall"
+                    else:
                         self._last_match_outcome = "recalled"
-                        return profile, False, score
-            else:
-                candidates = [profile for profile in self._profiles.values() if profile.kind == kind]
-                if candidates:
-                    profile, score = max(
-                        ((item, float(np.dot(clip_embedding, item.clip_embedding))) for item in candidates),
-                        key=lambda item: item[1],
-                    )
-                    if score >= self.config.similarity_threshold:
-                        fusion = EvidenceFusion.person(None, score)
-                        self._last_match_components = fusion.components
-                        self._last_match_outcome = fusion.outcome
-                        return profile, False, score
+                    return profile, False, score
+            if not allow_create:
+                self._last_match_components = {
+                    "face_similarity": max(0.0, best_score),
+                    "enrollment_progress": 0.0,
+                }
+                self._last_match_outcome = "face_candidate"
+                return None, False, best_score
             now = datetime.now(timezone.utc)
             profile_id = f"person-{max(self._profile_numbers(), default=0) + 1:03d}"
             profile = IdentityProfile(
                 profile_id=profile_id,
                 clip_embedding=self._normalized(clip_embedding),
-                face_embedding=self._normalized(face_embedding) if face_embedding is not None else None,
-                samples=1,
+                face_embedding=self._normalized(face_embedding),
+                samples=max(1, initial_samples),
                 sightings=1,
                 first_seen=now,
                 last_seen=now,
                 last_sample_at=now,
-                kind=kind,
+                kind="face",
             )
             self._profiles[profile_id] = profile
             fusion = EvidenceFusion.person(
-                1.0 if face_embedding is not None else None,
+                1.0,
                 1.0,
             )
             self._last_match_components = fusion.components
             self._last_match_outcome = "new"
             return profile, True, 1.0
+
+    def _accumulate_face_candidate(
+        self, track: _PersonTrack, face_embedding: np.ndarray
+    ) -> None:
+        if track.face_embeddings:
+            centroid = self._normalized(np.sum(track.face_embeddings, axis=0))
+            if float(np.dot(centroid, face_embedding)) < self.config.enrollment_face_consistency:
+                track.face_embeddings.clear()
+        track.face_embeddings.append(face_embedding)
+        keep = self.config.enrollment_min_face_observations
+        if len(track.face_embeddings) > keep:
+            track.face_embeddings = track.face_embeddings[-keep:]
+
+    def _associate_track(
+        self,
+        camera_id: str,
+        bbox: BoundingBox,
+        now: datetime,
+        used_tracks: set[str],
+    ) -> tuple[_PersonTrack, bool]:
+        with self._lock:
+            tracks = [
+                track for track in self._tracks.get(camera_id, [])
+                if (now - track.last_seen).total_seconds() <= self.config.track_ttl_seconds
+            ]
+            self._tracks[camera_id] = tracks
+            ranked = sorted(
+                (
+                    (self._track_affinity(track.bbox, bbox), track)
+                    for track in tracks if track.track_id not in used_tracks
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            if ranked and ranked[0][0] > 0:
+                track = ranked[0][1]
+                track.bbox = bbox
+                track.last_seen = now
+                track.observations += 1
+                return track, False
+            track = _PersonTrack(
+                f"track-{self._next_track_number:06d}", camera_id, bbox, now, now
+            )
+            self._next_track_number += 1
+            tracks.append(track)
+            return track, True
+
+    def _track_affinity(self, prior: BoundingBox, current: BoundingBox) -> float:
+        intersection_width = max(0.0, min(prior.x2, current.x2) - max(prior.x1, current.x1))
+        intersection_height = max(0.0, min(prior.y2, current.y2) - max(prior.y1, current.y1))
+        intersection = intersection_width * intersection_height
+        union = prior.area + current.area - intersection
+        iou = intersection / union if union > 0 else 0.0
+        if iou >= self.config.track_iou_threshold:
+            return 1.0 + iou
+        prior_width = max(1.0, prior.x2 - prior.x1)
+        prior_height = max(1.0, prior.y2 - prior.y1)
+        prior_x = (prior.x1 + prior.x2) / 2
+        prior_y = (prior.y1 + prior.y2) / 2
+        current_x = (current.x1 + current.x2) / 2
+        current_y = (current.y1 + current.y2) / 2
+        normalized_distance = (
+            ((current_x - prior_x) / prior_width) ** 2
+            + ((current_y - prior_y) / prior_height) ** 2
+        ) ** 0.5
+        return 1.0 - normalized_distance if normalized_distance <= self.config.track_center_distance else 0.0
+
+    def _track_match(
+        self, track: _PersonTrack, confidence: float, new_track: bool
+    ) -> dict[str, object]:
+        continuity = min(1.0, track.observations / 3)
+        fusion = EvidenceFusion.person(None, None, continuity)
+        return {
+            "id": track.track_id,
+            "label": "Unconfirmed person",
+            "confidence": round(float(confidence) * continuity, 3),
+            "needs_name": False,
+            "new": new_track,
+            "recalled": not new_track,
+            "kind": track.kind,
+            "sightings": track.observations,
+            "resolver_outcome": "appearance_track",
+            "confidence_components": fusion.components,
+            "persistent": False,
+            "enrollment_observations": len(track.face_embeddings),
+            "enrollment_required": self.config.enrollment_min_face_observations,
+        }
+
+    def _profile_match(
+        self, profile: IdentityProfile, created: bool, similarity: float, outcome: str
+    ) -> dict[str, object]:
+        return {
+            "id": profile.profile_id,
+            "label": profile.name or profile.profile_id,
+            "confidence": round(profile.confidence, 3),
+            "needs_name": profile.name is None,
+            "new": created,
+            "recalled": not created,
+            "kind": profile.kind,
+            "sightings": profile.sightings,
+            "resolver_outcome": outcome,
+            "confidence_components": dict(self._last_match_components),
+            "persistent": True,
+        }
+
+    def _update_profile(
+        self,
+        profile: IdentityProfile,
+        camera_id: str,
+        vision: VisionEngine,
+        face: FaceCrop,
+        now: datetime,
+        similarity: float,
+    ) -> None:
+        with self._lock:
+            profile.last_seen = now
+            profile.last_camera = camera_id
+            profile.confidence = face.confidence if similarity >= 1 else min(face.confidence, similarity)
+            if profile.thumbnail is None:
+                self._save(profile, face.image, face.face_embedding, face.confidence, camera_id, now)
+            elif (now - profile.last_sample_at).total_seconds() >= self.config.sample_interval_seconds:
+                profile.clip_embedding = self._normalized(
+                    (profile.clip_embedding * profile.samples) + vision.embed_image(face.image)
+                )
+                if face.face_embedding is not None and profile.face_embedding is not None:
+                    profile.face_embedding = self._normalized(
+                        (profile.face_embedding * profile.samples) + face.face_embedding
+                    )
+                profile.samples += 1
+                profile.last_sample_at = now
+                self._save(profile, face.image, face.face_embedding, face.confidence, camera_id, now)
+            else:
+                self._store(profile)
+
+    @staticmethod
+    def _snapshot_profile(profile: IdentityProfile, status: str) -> dict[str, object]:
+        return {
+            "id": profile.profile_id,
+            "label": profile.name or profile.profile_id,
+            "samples": profile.samples,
+            "sightings": profile.sightings,
+            "confidence": round(profile.confidence, 3),
+            "first_seen": profile.first_seen.isoformat(),
+            "last_seen": profile.last_seen.isoformat(),
+            "last_camera": profile.last_camera,
+            "thumbnail_url": f"/api/identities/{profile.profile_id}/face.jpg",
+            "kind": profile.kind,
+            "status": status,
+            "stack_count": 1,
+        }
+
+    def _snapshot_group(self, profiles: list[IdentityProfile]) -> dict[str, object]:
+        canonical_id = self._canonical_id(profiles[0].profile_id)
+        canonical = self._profiles[canonical_id]
+        representative = max(profiles, key=lambda profile: profile.last_seen)
+        named = next((profile.name for profile in profiles if profile.name), None)
+        return {
+            "id": canonical_id,
+            "label": named or canonical_id,
+            "samples": sum(profile.samples for profile in profiles),
+            "sightings": sum(profile.sightings for profile in profiles),
+            "confidence": round(max(profile.confidence for profile in profiles), 3),
+            "first_seen": min(profile.first_seen for profile in profiles).isoformat(),
+            "last_seen": representative.last_seen.isoformat(),
+            "last_camera": representative.last_camera,
+            "thumbnail_url": f"/api/identities/{representative.profile_id}/face.jpg",
+            "kind": canonical.kind,
+            "status": "coalesced" if len(profiles) > 1 else ("named" if named else "recurrent"),
+            "stack_count": len(profiles),
+            "alias_ids": sorted(
+                profile.profile_id for profile in profiles if profile.profile_id != canonical_id
+            ),
+            "representative_id": representative.profile_id,
+        }
+
+    def _face_groups(self) -> dict[str, list[IdentityProfile]]:
+        groups: dict[str, list[IdentityProfile]] = {}
+        for profile in self._profiles.values():
+            if profile.face_embedding is None:
+                continue
+            groups.setdefault(self._canonical_id(profile.profile_id), []).append(profile)
+        return groups
+
+    def _canonical_id(self, profile_id: str) -> str:
+        seen: set[str] = set()
+        while profile_id not in seen:
+            seen.add(profile_id)
+            mapping = self._aliases.get(profile_id)
+            if mapping is None or mapping[0] not in self._profiles:
+                break
+            profile_id = mapping[0]
+        return profile_id
+
+    @staticmethod
+    def _names_compatible(left: IdentityProfile, right: IdentityProfile) -> bool:
+        return not (
+            left.name and right.name and left.name.strip().casefold() != right.name.strip().casefold()
+        )
+
+    @classmethod
+    def _snapshot_stack(
+        cls,
+        profiles: list[IdentityProfile],
+        stack_id: str,
+        label: str,
+        kind: str,
+    ) -> dict[str, object] | None:
+        if not profiles:
+            return None
+        representative = max(profiles, key=lambda profile: profile.last_seen)
+        return {
+            "id": stack_id,
+            "label": label,
+            "samples": sum(profile.samples for profile in profiles),
+            "sightings": sum(profile.sightings for profile in profiles),
+            "confidence": round(max(profile.confidence for profile in profiles), 3),
+            "first_seen": min(profile.first_seen for profile in profiles).isoformat(),
+            "last_seen": representative.last_seen.isoformat(),
+            "last_camera": representative.last_camera,
+            "thumbnail_url": f"/api/identities/{representative.profile_id}/face.jpg",
+            "kind": kind,
+            "status": "observation-stack",
+            "stack_count": len(profiles),
+            "representative_id": representative.profile_id,
+        }
 
     def _create_schema(self) -> None:
         if self._database is None:
@@ -261,6 +806,24 @@ class IdentityLibrary:
                 thumbnail BLOB
             );
             CREATE INDEX IF NOT EXISTS profiles_last_seen ON profiles(last_seen DESC);
+            CREATE TABLE IF NOT EXISTS profile_aliases (
+                alias_id TEXT PRIMARY KEY REFERENCES profiles(profile_id) ON DELETE CASCADE,
+                canonical_id TEXT NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE,
+                similarity REAL NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS profile_aliases_canonical ON profile_aliases(canonical_id);
+            CREATE TABLE IF NOT EXISTS face_samples (
+                sample_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE,
+                captured_at TEXT NOT NULL,
+                camera_id TEXT,
+                quality REAL NOT NULL,
+                sface_embedding BLOB NOT NULL,
+                image_jpeg BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS face_samples_profile ON face_samples(profile_id, captured_at DESC);
             """
         )
         self._database.commit()
@@ -287,8 +850,35 @@ class IdentityLibrary:
                 kind=row["kind"],
             )
             self._profiles[profile.profile_id] = profile
+        for row in self._database.execute("SELECT * FROM profile_aliases"):
+            if row["alias_id"] in self._profiles and row["canonical_id"] in self._profiles:
+                self._aliases[str(row["alias_id"])] = (
+                    str(row["canonical_id"]), float(row["similarity"]), str(row["reason"])
+                )
 
-    def _save(self, profile: IdentityProfile, crop: np.ndarray) -> None:
+    def _store_alias(
+        self, alias_id: str, canonical_id: str, similarity: float, reason: str
+    ) -> None:
+        if self._database is None:
+            return
+        self._database.execute(
+            """INSERT INTO profile_aliases
+            (alias_id, canonical_id, similarity, reason, created_at) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(alias_id) DO UPDATE SET canonical_id=excluded.canonical_id,
+            similarity=excluded.similarity, reason=excluded.reason""",
+            (alias_id, canonical_id, similarity, reason, datetime.now(timezone.utc).isoformat()),
+        )
+        self._database.commit()
+
+    def _save(
+        self,
+        profile: IdentityProfile,
+        crop: np.ndarray,
+        face_embedding: np.ndarray | None = None,
+        quality: float | None = None,
+        camera_id: str | None = None,
+        captured_at: datetime | None = None,
+    ) -> None:
         import cv2
 
         success, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -296,6 +886,91 @@ class IdentityLibrary:
             raise RuntimeError("failed to encode identity crop")
         profile.thumbnail = encoded.tobytes()
         self._store(profile)
+        retained_embedding = face_embedding if face_embedding is not None else profile.face_embedding
+        if retained_embedding is not None:
+            self._store_face_sample(
+                profile.profile_id,
+                profile.thumbnail,
+                retained_embedding,
+                quality if quality is not None else profile.confidence,
+                camera_id or profile.last_camera,
+                captured_at or profile.last_sample_at,
+            )
+
+    def _seed_face_galleries(self) -> None:
+        if self._database is None:
+            return
+        for profile in self._profiles.values():
+            if profile.face_embedding is None or profile.thumbnail is None:
+                continue
+            existing = self._database.execute(
+                "SELECT 1 FROM face_samples WHERE profile_id=? LIMIT 1", (profile.profile_id,)
+            ).fetchone()
+            if existing is None:
+                self._store_face_sample(
+                    profile.profile_id,
+                    profile.thumbnail,
+                    profile.face_embedding,
+                    profile.confidence,
+                    profile.last_camera,
+                    profile.last_sample_at,
+                )
+
+    def _store_face_sample(
+        self,
+        profile_id: str,
+        image_jpeg: bytes,
+        sface_embedding: np.ndarray,
+        quality: float,
+        camera_id: str | None,
+        captured_at: datetime,
+    ) -> None:
+        if self._database is None:
+            return
+        normalized = self._normalized(sface_embedding)
+        sample_id = sha256(profile_id.encode("utf-8") + b"\0" + image_jpeg).hexdigest()
+        if self._database.execute(
+            "SELECT 1 FROM face_samples WHERE sample_id=?", (sample_id,)
+        ).fetchone() is not None:
+            return
+        existing = self._database.execute(
+            "SELECT quality, sface_embedding FROM face_samples WHERE profile_id=?",
+            (profile_id,),
+        ).fetchall()
+        if existing:
+            similarities = [
+                float(np.dot(normalized, self._vector(row["sface_embedding"]))) for row in existing
+            ]
+            if (
+                min(similarities) >= self.config.gallery_diversity_similarity
+                and max(float(row["quality"]) for row in existing) >= float(quality)
+            ):
+                return
+        self._database.execute(
+            """INSERT INTO face_samples
+            (sample_id, profile_id, captured_at, camera_id, quality, sface_embedding, image_jpeg)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                sample_id,
+                profile_id,
+                captured_at.isoformat(),
+                camera_id,
+                max(0.0, min(1.0, float(quality))),
+                normalized.astype(np.float32).tobytes(),
+                image_jpeg,
+            ),
+        )
+        overflow = self._database.execute(
+            """SELECT sample_id FROM face_samples WHERE profile_id=?
+            ORDER BY quality DESC, captured_at DESC LIMIT -1 OFFSET ?""",
+            (profile_id, self.config.gallery_max_samples),
+        ).fetchall()
+        if overflow:
+            self._database.executemany(
+                "DELETE FROM face_samples WHERE sample_id=?",
+                [(str(row["sample_id"]),) for row in overflow],
+            )
+        self._database.commit()
 
     def _store(self, profile: IdentityProfile) -> None:
         if self._database is None:

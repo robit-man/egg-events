@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import hashlib
 import os
 import sqlite3
 import threading
 import uuid
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +96,20 @@ class MemoryStore:
         path.write_bytes(data)
         return str(path.relative_to(root)), hashlib.sha256(data).hexdigest()
 
+    def evidence_media(self, evidence_id: str) -> tuple[bytes, str] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT media_key FROM evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+        if row is None or not row["media_key"]:
+            return None
+        root = self.root.resolve()
+        media_root = self.media_root.resolve()
+        path = (root / str(row["media_key"])).resolve()
+        if media_root not in path.parents or not path.is_file():
+            return None
+        return path.read_bytes(), path.suffix.casefold()
+
     def upsert_entity(
         self, entity_type: str, display_name: str | None = None, metadata: dict[str, Any] | None = None,
         entity_id: str | None = None, state: str = "active", now: datetime | None = None,
@@ -152,6 +166,223 @@ class MemoryStore:
                 "INSERT OR IGNORE INTO entity_evidence (entity_id, evidence_id, role) VALUES (?, ?, ?)",
                 (entity_id, evidence_id, role),
             )
+
+    def identity_coobservation_conflicts(
+        self, profile_ids: list[str]
+    ) -> set[tuple[str, str]]:
+        """Return face-profile pairs backed by evidence that they were distinct together."""
+
+        ids = sorted({str(profile_id) for profile_id in profile_ids if profile_id})
+        if len(ids) < 2:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        values: tuple[str, ...] = tuple(ids)
+        with self._lock:
+            shared_evidence = self._connection.execute(
+                f"""SELECT DISTINCT a.entity_id AS left_id, b.entity_id AS right_id
+                FROM entity_evidence a JOIN entity_evidence b
+                ON a.evidence_id=b.evidence_id AND a.entity_id < b.entity_id
+                WHERE a.entity_id IN ({placeholders}) AND b.entity_id IN ({placeholders})""",
+                values + values,
+            ).fetchall()
+            shared_episodes = self._connection.execute(
+                f"""SELECT DISTINCT a.entity_id AS left_id, b.entity_id AS right_id
+                FROM episode_entities a JOIN episode_entities b
+                ON a.episode_id=b.episode_id AND a.entity_id < b.entity_id
+                WHERE a.entity_id IN ({placeholders}) AND b.entity_id IN ({placeholders})""",
+                values + values,
+            ).fetchall()
+            explicit_edges = self._connection.execute(
+                f"""SELECT source_id AS left_id, target_id AS right_id FROM edges
+                WHERE relation='co_observed_with' AND state='active'
+                AND source_id IN ({placeholders}) AND target_id IN ({placeholders})""",
+                values + values,
+            ).fetchall()
+        return {
+            tuple(sorted((str(row["left_id"]), str(row["right_id"]))))
+            for row in (*shared_evidence, *shared_episodes, *explicit_edges)
+        }
+
+    def identity_strong_coobservation_conflicts(
+        self, profile_ids: list[str], minimum_confirmations: int = 3
+    ) -> set[tuple[str, str]]:
+        """Return only repeatable or spatially explicit distinct-person constraints.
+
+        Legacy events attached every detection in a frame/episode to every other
+        detection. A single duplicate detector box therefore cannot safely veto a
+        strong face-template match. Repeated events remain a hard constraint, as
+        does one event containing clearly separated boxes for both identities.
+        """
+
+        ids = sorted({str(profile_id) for profile_id in profile_ids if profile_id})
+        if len(ids) < 2:
+            return set()
+        minimum = max(1, int(minimum_confirmations))
+        placeholders = ",".join("?" for _ in ids)
+        values: tuple[str, ...] = tuple(ids)
+        with self._lock:
+            shared_evidence = self._connection.execute(
+                f"""SELECT a.entity_id AS left_id, b.entity_id AS right_id,
+                a.evidence_id, evidence.payload_json
+                FROM entity_evidence a JOIN entity_evidence b
+                ON a.evidence_id=b.evidence_id AND a.entity_id < b.entity_id
+                JOIN evidence ON evidence.evidence_id=a.evidence_id
+                WHERE a.entity_id IN ({placeholders}) AND b.entity_id IN ({placeholders})""",
+                values + values,
+            ).fetchall()
+            shared_episodes = self._connection.execute(
+                f"""SELECT a.entity_id AS left_id, b.entity_id AS right_id,
+                COUNT(DISTINCT a.episode_id) AS confirmations
+                FROM episode_entities a JOIN episode_entities b
+                ON a.episode_id=b.episode_id AND a.entity_id < b.entity_id
+                WHERE a.entity_id IN ({placeholders}) AND b.entity_id IN ({placeholders})
+                GROUP BY a.entity_id, b.entity_id""",
+                values + values,
+            ).fetchall()
+            explicit_edges = self._connection.execute(
+                f"""SELECT source_id AS left_id, target_id AS right_id,
+                MAX(confirmation_count) AS confirmations FROM edges
+                WHERE relation='co_observed_with' AND state='active'
+                AND source_id IN ({placeholders}) AND target_id IN ({placeholders})
+                GROUP BY source_id, target_id""",
+                values + values,
+            ).fetchall()
+        confirmations: dict[tuple[str, str], set[str]] = defaultdict(set)
+        hard: set[tuple[str, str]] = set()
+        for row in shared_evidence:
+            pair = tuple(sorted((str(row["left_id"]), str(row["right_id"]))))
+            confirmations[pair].add(str(row["evidence_id"]))
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if self._payload_has_spatially_distinct_identities(payload, pair):
+                hard.add(pair)
+        for row in (*shared_episodes, *explicit_edges):
+            pair = tuple(sorted((str(row["left_id"]), str(row["right_id"]))))
+            if int(row["confirmations"] or 0) >= minimum:
+                hard.add(pair)
+        hard.update(pair for pair, rows in confirmations.items() if len(rows) >= minimum)
+        return hard
+
+    @staticmethod
+    def _payload_has_spatially_distinct_identities(
+        payload: dict[str, Any], pair: tuple[str, str]
+    ) -> bool:
+        detections = payload.get("detections")
+        if not isinstance(detections, list):
+            return False
+        boxes: dict[str, list[dict[str, float]]] = defaultdict(list)
+        for detection in detections:
+            if not isinstance(detection, dict):
+                continue
+            identity_id = str(detection.get("identity_id") or "")
+            bbox = detection.get("bbox")
+            if identity_id not in pair or not isinstance(bbox, dict):
+                continue
+            try:
+                parsed = {key: float(bbox[key]) for key in ("x1", "y1", "x2", "y2")}
+            except (KeyError, TypeError, ValueError):
+                continue
+            if parsed["x2"] > parsed["x1"] and parsed["y2"] > parsed["y1"]:
+                boxes[identity_id].append(parsed)
+        for left in boxes.get(pair[0], []):
+            for right in boxes.get(pair[1], []):
+                intersection_width = max(
+                    0.0, min(left["x2"], right["x2"]) - max(left["x1"], right["x1"])
+                )
+                intersection_height = max(
+                    0.0, min(left["y2"], right["y2"]) - max(left["y1"], right["y1"])
+                )
+                intersection = intersection_width * intersection_height
+                left_area = (left["x2"] - left["x1"]) * (left["y2"] - left["y1"])
+                right_area = (right["x2"] - right["x1"]) * (right["y2"] - right["y1"])
+                iou = intersection / max(1.0, left_area + right_area - intersection)
+                left_center = ((left["x1"] + left["x2"]) / 2, (left["y1"] + left["y2"]) / 2)
+                right_center = ((right["x1"] + right["x2"]) / 2, (right["y1"] + right["y2"]) / 2)
+                separation = ((left_center[0] - right_center[0]) ** 2 + (left_center[1] - right_center[1]) ** 2) ** 0.5
+                scale = max(
+                    1.0,
+                    ((left["x2"] - left["x1"]) ** 2 + (left["y2"] - left["y1"]) ** 2) ** 0.5,
+                    ((right["x2"] - right["x1"]) ** 2 + (right["y2"] - right["y1"]) ** 2) ** 0.5,
+                )
+                if iou < 0.10 and separation / scale > 0.55:
+                    return True
+        return False
+
+    def coalesce_identity_evidence(
+        self, aliases: list[dict[str, object]]
+    ) -> dict[str, int]:
+        """Project reversible identity aliases into the graph and canonical evidence view."""
+
+        linked = copied_evidence = copied_episodes = 0
+        now = _timestamp(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            for mapping in aliases:
+                alias_id = str(mapping.get("alias_id") or "")
+                canonical_id = str(mapping.get("canonical_id") or "")
+                if not alias_id or not canonical_id or alias_id == canonical_id:
+                    continue
+                entities = connection.execute(
+                    "SELECT entity_id FROM entities WHERE entity_id IN (?, ?)",
+                    (alias_id, canonical_id),
+                ).fetchall()
+                if len(entities) != 2:
+                    continue
+                try:
+                    similarity = max(0.0, min(1.0, float(mapping.get("similarity") or 0.0)))
+                except (TypeError, ValueError):
+                    similarity = 0.0
+                reason = str(mapping.get("reason") or "face_identity_coalescing")
+                alias_row = connection.execute(
+                    "SELECT metadata_json FROM entities WHERE entity_id=?", (alias_id,)
+                ).fetchone()
+                metadata = json.loads(alias_row["metadata_json"]) if alias_row else {}
+                metadata.update(
+                    {
+                        "canonical_identity_id": canonical_id,
+                        "coalesced_similarity": round(similarity, 6),
+                        "coalescing_reason": reason,
+                    }
+                )
+                connection.execute(
+                    "UPDATE entities SET merged_into=?, updated_at=?, metadata_json=? WHERE entity_id=?",
+                    (canonical_id, now, json.dumps(metadata, sort_keys=True), alias_id),
+                )
+                edge_id = f"identity-alias:{alias_id}:{canonical_id}"
+                connection.execute(
+                    """INSERT INTO edges
+                    (edge_id, source_id, relation, target_id, confidence, valid_from, state, metadata_json)
+                    VALUES (?, ?, 'same_person_as', ?, ?, ?, 'active', ?)
+                    ON CONFLICT(edge_id) DO UPDATE SET confidence=excluded.confidence,
+                    state='active', metadata_json=excluded.metadata_json""",
+                    (
+                        edge_id, alias_id, canonical_id, similarity, now,
+                        json.dumps({"reason": reason, "reversible": True}, sort_keys=True),
+                    ),
+                )
+                before = connection.total_changes
+                connection.execute(
+                    """INSERT OR IGNORE INTO entity_evidence (entity_id, evidence_id, role)
+                    SELECT ?, evidence_id, role FROM entity_evidence WHERE entity_id=?""",
+                    (canonical_id, alias_id),
+                )
+                copied_evidence += connection.total_changes - before
+                before = connection.total_changes
+                connection.execute(
+                    """INSERT INTO episode_entities (episode_id, entity_id, role, confidence)
+                    SELECT episode_id, ?, role, confidence FROM episode_entities WHERE entity_id=?
+                    ON CONFLICT(episode_id, entity_id, role) DO UPDATE SET
+                    confidence=MAX(episode_entities.confidence, excluded.confidence)""",
+                    (canonical_id, alias_id),
+                )
+                copied_episodes += connection.total_changes - before
+                linked += 1
+        return {
+            "aliases": linked,
+            "evidence_links_copied": copied_evidence,
+            "episode_links_copied": copied_episodes,
+        }
 
     def link_entities(
         self, source_id: str, relation: str, target_id: str, confidence: float, valid_from: datetime,
@@ -416,6 +647,204 @@ class MemoryStore:
             frontier = next_frontier
         return results[: self.config.graph_max_nodes]
 
+    def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
+        """Return a bounded, presentation-safe multimodal property graph.
+
+        Entity nodes include people, appearance tracks, objects, categories, and
+        OCR-derived content. Recent evidence, claims, and episodes remain distinct
+        nodes so the browser can show cross-modal provenance instead of flattening
+        everything into labels.
+        """
+        entity_limit = max(50, min(int(node_limit), 2000))
+        evidence_limit = min(500, max(50, entity_limit // 3))
+        claim_limit = min(500, max(50, entity_limit // 3))
+        episode_limit = min(200, max(25, entity_limit // 8))
+        link_limit = min(6000, entity_limit * 6)
+        with self._lock:
+            entities = self._connection.execute(
+                """SELECT * FROM entities WHERE state='active' AND merged_into IS NULL
+                ORDER BY updated_at DESC LIMIT ?""",
+                (entity_limit,),
+            ).fetchall()
+            evidence = self._connection.execute(
+                "SELECT * FROM evidence ORDER BY captured_at DESC LIMIT ?",
+                (evidence_limit,),
+            ).fetchall()
+            claims = self._connection.execute(
+                "SELECT * FROM claims WHERE state='active' ORDER BY created_at DESC LIMIT ?",
+                (claim_limit,),
+            ).fetchall()
+            episodes = self._connection.execute(
+                "SELECT * FROM episodes ORDER BY started_at DESC LIMIT ?",
+                (episode_limit,),
+            ).fetchall()
+            edges = self._connection.execute(
+                "SELECT * FROM edges WHERE state='active' ORDER BY confidence DESC LIMIT ?",
+                (link_limit,),
+            ).fetchall()
+            entity_evidence = self._connection.execute(
+                """SELECT ee.entity_id, ee.evidence_id, ee.role
+                FROM entity_evidence ee JOIN evidence ev ON ev.evidence_id=ee.evidence_id
+                ORDER BY ev.captured_at DESC LIMIT ?""",
+                (link_limit,),
+            ).fetchall()
+            episode_entities = self._connection.execute(
+                """SELECT episode_id, entity_id, role, confidence
+                FROM episode_entities ORDER BY rowid DESC LIMIT ?""",
+                (link_limit,),
+            ).fetchall()
+            episode_evidence = self._connection.execute(
+                """SELECT episode_id, evidence_id, role
+                FROM episode_evidence ORDER BY rowid DESC LIMIT ?""",
+                (link_limit,),
+            ).fetchall()
+
+        entity_records = [_row(row) for row in entities]
+        evidence_records = [_row(row) for row in evidence]
+        claim_records = [_row(row) for row in claims]
+        episode_records = [_row(row) for row in episodes]
+        entity_ids = {str(item["entity_id"]) for item in entity_records}
+        evidence_ids = {str(item["evidence_id"]) for item in evidence_records}
+        episode_ids = {str(item["episode_id"]) for item in episode_records}
+
+        nodes: list[dict[str, object]] = []
+        for item in entity_records:
+            label = item.get("display_name") or item["entity_id"]
+            if item["entity_type"] == "appearance_track" and not item.get("display_name"):
+                suffix = str(item["entity_id"]).removeprefix("person-")
+                label = f"Unconfirmed observation {suffix}"
+            nodes.append(
+                {
+                    "id": f"entity:{item['entity_id']}",
+                    "source_id": item["entity_id"],
+                    "kind": "entity",
+                    "subtype": item["entity_type"],
+                    "label": label,
+                    "updated_at": item.get("updated_at"),
+                    "metadata": item.get("metadata", {}),
+                }
+            )
+        for item in evidence_records:
+            payload = item.get("payload", {})
+            label = (
+                (payload.get("text") or payload.get("transcript"))
+                if isinstance(payload, dict) else None
+            ) or f"{item['modality']} evidence"
+            nodes.append(
+                {
+                    "id": f"evidence:{item['evidence_id']}",
+                    "source_id": item["evidence_id"],
+                    "kind": "evidence",
+                    "subtype": item["modality"],
+                    "label": str(label)[:120],
+                    "confidence": item.get("quality", 0.0),
+                    "updated_at": item.get("captured_at"),
+                    "metadata": payload,
+                }
+            )
+        for item in claim_records:
+            nodes.append(
+                {
+                    "id": f"claim:{item['claim_id']}",
+                    "source_id": item["claim_id"],
+                    "kind": "claim",
+                    "subtype": item["predicate"],
+                    "label": f"{item['predicate']}: {item['object_id_or_text']}",
+                    "confidence": item.get("confidence", 0.0),
+                    "updated_at": item.get("created_at"),
+                    "metadata": item.get("metadata", {}),
+                }
+            )
+        for item in episode_records:
+            nodes.append(
+                {
+                    "id": f"episode:{item['episode_id']}",
+                    "source_id": item["episode_id"],
+                    "kind": "episode",
+                    "subtype": item.get("state", "episode"),
+                    "label": item.get("summary") or f"Episode {str(item['episode_id'])[:8]}",
+                    "confidence": item.get("novelty", 0.0),
+                    "updated_at": item.get("started_at"),
+                    "metadata": {"ended_at": item.get("ended_at")},
+                }
+            )
+
+        links: list[dict[str, object]] = []
+        for row in edges:
+            item = _row(row)
+            if str(item["source_id"]) not in entity_ids or str(item["target_id"]) not in entity_ids:
+                continue
+            links.append(
+                {
+                    "id": f"edge:{item['edge_id']}",
+                    "source": f"entity:{item['source_id']}",
+                    "target": f"entity:{item['target_id']}",
+                    "relation": item["relation"],
+                    "confidence": item.get("confidence", 0.0),
+                    "confirmations": item.get("confirmation_count", 1),
+                }
+            )
+        for row in entity_evidence:
+            if str(row["entity_id"]) in entity_ids and str(row["evidence_id"]) in evidence_ids:
+                links.append(
+                    {
+                        "id": f"entity-evidence:{row['entity_id']}:{row['evidence_id']}:{row['role']}",
+                        "source": f"entity:{row['entity_id']}",
+                        "target": f"evidence:{row['evidence_id']}",
+                        "relation": row["role"],
+                        "confidence": 0.8,
+                        "confirmations": 1,
+                    }
+                )
+        for item in claim_records:
+            if str(item["subject_id"]) in entity_ids:
+                links.append(
+                    {
+                        "id": f"entity-claim:{item['claim_id']}",
+                        "source": f"entity:{item['subject_id']}",
+                        "target": f"claim:{item['claim_id']}",
+                        "relation": item["predicate"],
+                        "confidence": item.get("confidence", 0.0),
+                        "confirmations": 1,
+                    }
+                )
+        for row in episode_entities:
+            if str(row["episode_id"]) in episode_ids and str(row["entity_id"]) in entity_ids:
+                links.append(
+                    {
+                        "id": f"episode-entity:{row['episode_id']}:{row['entity_id']}:{row['role']}",
+                        "source": f"episode:{row['episode_id']}",
+                        "target": f"entity:{row['entity_id']}",
+                        "relation": row["role"],
+                        "confidence": row["confidence"],
+                        "confirmations": 1,
+                    }
+                )
+        for row in episode_evidence:
+            if str(row["episode_id"]) in episode_ids and str(row["evidence_id"]) in evidence_ids:
+                links.append(
+                    {
+                        "id": f"episode-evidence:{row['episode_id']}:{row['evidence_id']}:{row['role']}",
+                        "source": f"episode:{row['episode_id']}",
+                        "target": f"evidence:{row['evidence_id']}",
+                        "relation": row["role"],
+                        "confidence": 0.7,
+                        "confirmations": 1,
+                    }
+                )
+        return {
+            "nodes": nodes,
+            "links": links[:link_limit],
+            "counts": {
+                "entities": len(entity_records),
+                "evidence": len(evidence_records),
+                "claims": len(claim_records),
+                "episodes": len(episode_records),
+                "links": min(len(links), link_limit),
+            },
+            "node_limit": entity_limit,
+        }
+
     def search_evidence(self, terms: list[str], limit: int | None = None) -> list[dict[str, Any]]:
         normalized = [term.casefold().strip() for term in terms if term.strip()]
         if not normalized:
@@ -445,6 +874,49 @@ class MemoryStore:
             "entities": [_row(row) for row in entities],
             "episodes": [_row(row) for row in episodes],
         }
+
+    def evidence_detail(self, evidence_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            claims = self._connection.execute(
+                "SELECT * FROM claims WHERE evidence_id=? ORDER BY created_at DESC",
+                (evidence_id,),
+            ).fetchall()
+            edges = self._connection.execute(
+                "SELECT * FROM edges WHERE evidence_id=? ORDER BY confidence DESC",
+                (evidence_id,),
+            ).fetchall()
+        evidence = _row(row)
+        if evidence.get("media_key"):
+            evidence["artifact_url"] = f"/api/memory/evidence/{evidence_id}/media"
+        return {
+            "evidence": evidence,
+            **self.associations_for_evidence(evidence_id),
+            "claims": [_row(item) for item in claims],
+            "edges": [_row(item) for item in edges],
+        }
+
+    def graph_node_detail(self, kind: str, source_id: str) -> dict[str, Any] | None:
+        if kind == "entity":
+            return self.entity_detail(source_id)
+        if kind == "evidence":
+            return self.evidence_detail(source_id)
+        if kind == "episode":
+            return self.episode_detail(source_id)
+        if kind == "claim":
+            claim = self.claim_detail(source_id)
+            if claim is None:
+                return None
+            result: dict[str, Any] = {"claim": claim}
+            result["subject"] = self.entity_detail(str(claim["subject_id"]))
+            if claim.get("evidence_id"):
+                result["evidence_detail"] = self.evidence_detail(str(claim["evidence_id"]))
+            return result
+        return None
 
     def episode_detail(self, episode_id: str) -> dict[str, Any] | None:
         with self._lock:

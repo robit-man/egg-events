@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,6 +18,8 @@ class DialogueEvidence:
     seconds_since_tts: float | None = None
     interaction_pending: bool = False
     language_directed: bool | None = None
+    playback_overlap: bool = False
+    interruption_genuine: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,61 @@ class DialogueDecision:
     act: DialogueAct
     components: dict[str, float]
     reason: str
+
+
+@dataclass(frozen=True)
+class InterruptionDecision:
+    version: int
+    genuine: bool
+    confidence: float
+    reason: str
+    summary: str
+    should_cancel_playback: bool
+
+
+def parse_interruption_decision(content: object) -> InterruptionDecision | None:
+    """Validate the semantic barge classifier's exact typed contract."""
+    if not isinstance(content, str) or not content.strip():
+        return None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    required = {
+        "version",
+        "genuine",
+        "confidence",
+        "reason",
+        "summary",
+        "should_cancel_playback",
+    }
+    if not isinstance(parsed, dict) or set(parsed) != required:
+        return None
+    if parsed["version"] != 1 or isinstance(parsed["version"], bool):
+        return None
+    if not isinstance(parsed["genuine"], bool):
+        return None
+    confidence = parsed["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
+    if not 0 <= float(confidence) <= 1:
+        return None
+    reason = parsed["reason"]
+    summary = parsed["summary"]
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 120:
+        return None
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 500:
+        return None
+    if not isinstance(parsed["should_cancel_playback"], bool):
+        return None
+    return InterruptionDecision(
+        version=1,
+        genuine=parsed["genuine"],
+        confidence=float(confidence),
+        reason=reason.strip(),
+        summary=summary.strip(),
+        should_cancel_playback=parsed["should_cancel_playback"],
+    )
 
 
 class DialogueClassifier:
@@ -63,14 +121,29 @@ class DialogueClassifier:
                 if evidence.seconds_since_tts is not None and evidence.seconds_since_tts < 2.0
                 else 0.0
             ),
+            "playback_overlap": 1.0 if evidence.playback_overlap else 0.0,
+            "semantic_interruption": (
+                1.0
+                if evidence.interruption_genuine is True
+                else 0.0 if evidence.interruption_genuine is False
+                else 0.5
+            ),
         }
         directed_score = (
             0.35 * components["doa_alignment"]
             + 0.35 * components["pending_interaction"]
             + 0.45 * components["language_direction"]
-            - 0.65 * components["tts_echo_risk"]
         )
-        directed = bool(normalized and directed_score >= 0.35)
+        directed = bool(
+            normalized
+            and (
+                evidence.interruption_genuine is True
+                or (
+                    evidence.language_directed is not False
+                    and directed_score >= 0.35
+                )
+            )
+        )
         reason = (
             "grounded dialogue evidence indicates Egg was addressed"
             if directed

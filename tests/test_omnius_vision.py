@@ -1,4 +1,9 @@
+import asyncio
+import io
+import wave
+
 from egg_companion.adapters.omnius import OmniusClient
+from egg_companion.config import OmniusConfig
 
 
 def test_vlm_object_response_requires_bounded_json_label() -> None:
@@ -43,3 +48,107 @@ def test_asr_grounding_falls_back_to_text_repetition_when_engine_omits_quality_m
 
     assert OmniusClient.transcription_rejection_reason(repetition_loop) == "repetitive transcript compression"
     assert OmniusClient.transcription_rejection_reason(real_sentence) is None
+
+
+def test_asr_grounding_rejects_backend_silence_artifact_without_quality_metadata() -> None:
+    artifact = {
+        "text": "Thank you for watching!",
+        "segments": [{"id": 0, "start": 0, "end": 2, "text": "Thank you for watching!"}],
+    }
+
+    assert OmniusClient.transcription_rejection_reason(artifact) == "known silence hallucination"
+
+    no_segments = {"text": "Thanks for watching!", "segments": []}
+    assert OmniusClient.transcription_rejection_reason(no_segments) == (
+        "known silence hallucination"
+    )
+
+    repeated = {"text": "Thanks for watching. Thanks for watching."}
+    assert OmniusClient.transcription_rejection_reason(repeated) == (
+        "known silence hallucination"
+    )
+
+    translated_artifact = {
+        "text": "ご視聴ありがとうございました",
+        "segments": [{"id": 0, "start": 0, "end": 12, "text": "ご視聴ありがとうございました"}],
+    }
+    assert OmniusClient.transcription_rejection_reason(translated_artifact) == (
+        "known silence hallucination"
+    )
+
+
+def test_asr_grounding_rejects_sparse_text_from_fragmented_max_window() -> None:
+    sparse = {
+        "text": "Ah! Ah! Shit!",
+        "duration": 12,
+        "segments": [
+            {"id": 0, "start": 0, "end": 1, "text": "Ah!"},
+            {"id": 1, "start": 2, "end": 3, "text": "Ah!"},
+            {"id": 2, "start": 4, "end": 5, "text": "Shit!"},
+        ],
+    }
+    substantive = {
+        "text": "Please stop and tell me why the camera moved toward the window just now",
+        "duration": 12,
+        "segments": [],
+    }
+    evidence = {"duration": 12, "boundary_reason": "max_utterance"}
+
+    assert OmniusClient.transcription_rejection_reason(sparse, evidence) == (
+        "sparse transcript over max-length acoustic window"
+    )
+    assert OmniusClient.transcription_rejection_reason(substantive, evidence) is None
+
+
+def test_asr_rejects_digital_silence_before_calling_backend() -> None:
+    wav_audio = io.BytesIO()
+    with wave.open(wav_audio, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(16000)
+        target.writeframes(b"\x00\x00" * 48000)
+    client = OmniusClient(OmniusConfig(model="test-model", voice_model="test-voice"))
+
+    transcript = asyncio.run(client.transcribe(wav_audio.getvalue()))
+
+    assert transcript is None
+    assert client.last_transcription_metadata["rejection_reason"] == "digital silence input"
+    assert client.last_transcription_metadata["accepted"] is False
+
+
+def test_asr_rejects_failed_source_acoustic_evidence_after_normalization() -> None:
+    evidence = {
+        "source_rms": 0.0008,
+        "minimum_rms": 0.001,
+        "speech_detected": True,
+        "wav_rms": 0.08,
+        "wav_peak": 0.2,
+    }
+
+    assert OmniusClient.acoustic_rejection_reason(evidence) == (
+        "source RMS below admission threshold"
+    )
+
+
+def test_asr_rejects_near_floor_ambient_window_before_backend() -> None:
+    evidence = {
+        "source_rms": 0.061,
+        "minimum_rms": 0.05,
+        "speech_detected": True,
+        "speech_ratio": 0.38,
+        "boundary_reason": "max_utterance",
+        "wav_rms": 0.12,
+        "wav_peak": 0.98,
+    }
+
+    assert OmniusClient.acoustic_rejection_reason(evidence) == (
+        "near-threshold max-window ambience"
+    )
+
+
+def test_rejected_asr_segment_metadata_does_not_retain_hallucinated_text() -> None:
+    segments = [{"id": 0, "start": 0, "end": 12, "text": "Thank you for watching!"}]
+    redacted = OmniusClient._segment_metadata(segments, redact_text=True)
+
+    assert redacted == [{"id": 0, "start": 0, "end": 12}]
+    assert "watching" not in str(redacted).casefold()

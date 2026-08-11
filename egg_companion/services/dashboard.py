@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+import re
+from pathlib import Path
 
 from aiohttp import web
 
 from egg_companion.config import EggConfig
 from egg_companion.runtime import CompanionRuntime
 from egg_companion.services.audit import AuditCheck, audit_hardware
+from egg_companion.services.dashboard_ui import PAGE as APPLICATION_PAGE
 
 
 PAGE = """<!doctype html>
@@ -41,6 +45,9 @@ function renderGpu(gpu){if(!gpu||!gpu.updated_at){$('#gpu-stats').innerHTML='<sp
 function render(state){$('#status').textContent=state.runtime.toUpperCase();const telemetry=state.telemetry||{},voice=telemetry.voice||{},vad=telemetry.vad||{},asr=telemetry.asr||{},learning=telemetry.object_learning||{};renderCameras(telemetry.cameras||[]);$('#asr-state').textContent=`${voice.asr_input||'ASR input'} · VAD ${vad.speech?'SPEECH':'SILENCE'} ${Math.round(Number(vad.speech_ratio||0)*100)}%/${Number(vad.speech_ms||0)}ms · RMS ${Number(telemetry.audio_rms||0).toFixed(4)} · ${telemetry.latest_transcript_at?`LAST ${telemetry.latest_transcript_at.slice(11,19)}`:'LISTENING'}`;$('#asr-metrics').innerHTML=`<span class="chip">accepted ${esc(asr.accepted||0)}</span><span class="chip">rejected ${esc(asr.rejected||0)}</span><span class="chip">errors ${esc(asr.errors||0)}</span>${asr.last_rejection?`<span class="chip">last reject ${esc(asr.last_rejection)}</span>`:''}`;$('#conversation').innerHTML=`<b>HEARD #${esc(telemetry.transcript_count||0)}</b> ${esc(telemetry.latest_transcript||'—')}\n\n<b>EGG</b> ${esc(telemetry.latest_reply||'—')}`;$('#object-learning-state').innerHTML=`<span class="chip">stable ${esc(learning.stable_candidates||0)}</span><span class="chip">CLIP ${esc(learning.clip_recalls||0)}/${esc(learning.clip_queries||0)}</span><span class="chip">VLM ${esc(learning.vlm_successes||0)}/${esc(learning.vlm_requests||0)}</span><span class="chip">OCR ${esc(learning.ocr_hits||0)}/${esc(learning.ocr_requests||0)}</span><span class="chip">rejected ${esc(learning.vlm_rejections||0)}</span><span class="chip">${esc(learning.last_stage||'idle')}</span>`;$('#review-queue-state').innerHTML=`<span class="chip">queue ${esc(learning.review_queue_depth||0)}</span><span class="chip">audited ok ${esc(learning.audit_consistent||0)}</span><span class="chip">flagged ${esc(learning.audit_flagged||0)}</span><span class="chip">failures ${esc(learning.vlm_errors||0)}</span>`;renderPeople(state.identities||[]);$('#seen').innerHTML=(telemetry.seen||[]).map(item=>`<span class="chip">${esc(item.label)} ×${esc(item.count)}</span>`).join('')||'<span class="sub">No scene categories observed.</span>';for(const [key,value] of Object.entries({segment_seconds:voice.asr_segment_seconds,rms_threshold:voice.asr_rms_threshold}))if(document.activeElement!==$(`#voice [name=${key}]`))$(`#voice [name=${key}]`).value=value??'';voiceChoices(state);renderIdentityGroups(state);renderCognition(telemetry);renderGpu(telemetry.gpu);renderMemory(state.memory);$('#checks').innerHTML=(state.checks||[]).map(check=>`<div class="check ${esc(check.status)}"><span class="dot"></span><div><b>${esc(check.name)}</b><div class="detail">${esc(check.detail)}</div></div></div>`).join('')}
 async function refresh(){try{render(await fetch('/api/state',{cache:'no-store'}).then(response=>response.json()))}catch(_){$('#status').textContent='OFFLINE'}}async function loadCatalog(){catalog=await fetch('/api/voice/catalog').then(response=>response.json())}$('#voice [name=voice_model]').addEventListener('change',()=>voiceChoices({telemetry:{voice:{tts_model:$('#voice [name=voice_model]').value}}}));$('#voice').addEventListener('submit',async event=>{event.preventDefault();const response=await fetch('/api/voice/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});$('#voice-result').textContent=response.ok?'APPLIED':await response.text();if(response.ok){catalog=null;await loadCatalog();await refresh()}});$('#memory-entities').addEventListener('click',async event=>{const row=event.target.closest('[data-entity]');if(!row)return;const response=await fetch(`/api/memory/entities/${encodeURIComponent(row.dataset.entity)}`);$('#memory-inspector').textContent=response.ok?JSON.stringify(await response.json(),null,2):await response.text()});$('#memory-controls').addEventListener('submit',async event=>{event.preventDefault();const data=Object.fromEntries(new FormData(event.target)),response=await fetch(`/api/memory/entities/${encodeURIComponent(data.entity_id)}/aliases`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({alias:data.alias})});$('#memory-result').textContent=response.ok?'ALIAS APPENDED':await response.text();await refresh()});$('#memory-controls [name=action][value=correct]').addEventListener('click',async event=>{event.preventDefault();const data=Object.fromEntries(new FormData($('#memory-controls'))),response=await fetch(`/api/memory/claims/${encodeURIComponent(data.claim_id)}/correct`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({replacement:data.replacement})});$('#memory-result').textContent=response.ok?'CLAIM REVISED':await response.text();await refresh()});$('#delete-memory').addEventListener('click',async()=>{const id=$('#memory-controls [name=entity_id]').value;if(!id||!confirm(`Delete ${id} from graph and profile libraries?`))return;const response=await fetch(`/api/memory/entities/${encodeURIComponent(id)}`,{method:'DELETE'});$('#memory-result').textContent=response.ok?'ENTITY DELETED':await response.text();await refresh()});$('#export-memory').addEventListener('click',()=>window.open('/api/memory/export','_blank'));function connectLiveWaveform(){const protocol=location.protocol==='https:'?'wss':'ws',socket=new WebSocket(`${protocol}://${location.host}/api/audio/stream`);socket.addEventListener('message',event=>{try{drawWave(JSON.parse(event.data).samples||[])}catch(_){}});socket.addEventListener('close',()=>setTimeout(connectLiveWaveform,500));socket.addEventListener('error',()=>socket.close())}loadCatalog().then(refresh).catch(refresh);setInterval(refresh,1000);connectLiveWaveform();
 </script></body></html>"""
+
+
+PAGE = APPLICATION_PAGE
 
 
 async def serve_dashboard(config: EggConfig, port: int) -> None:
@@ -114,12 +121,69 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             "omnius": str(config.omnius.base_url),
             "telemetry": telemetry,
             "identities": runtime.identities.snapshot() if isinstance(runtime, CompanionRuntime) else [],
+            "identity_summary": runtime.identities.summary() if isinstance(runtime, CompanionRuntime) else {},
+            "dreams": runtime.dreams_snapshot() if isinstance(runtime, CompanionRuntime) else {},
             "objects": runtime.objects.snapshot() if isinstance(runtime, CompanionRuntime) else [],
             "memory": runtime.memory_snapshot() if isinstance(runtime, CompanionRuntime) else {},
         })
 
     async def index_handler(_: web.Request) -> web.Response:
-        return web.Response(text=PAGE, content_type="text/html")
+        return web.Response(
+            text=PAGE,
+            content_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def config_handler(_: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "config": config.model_dump(mode="json"),
+                "live_mutable": [
+                    "transcription.segment_seconds",
+                    "transcription.rms_threshold",
+                    "transcription.asr_model",
+                    "transcription.asr_language",
+                    "transcription.vad_input_gain",
+                    "audio.asr_target_rms",
+                    "audio.asr_max_gain",
+                    "omnius.voice_model",
+                    "omnius.voice_name",
+                ],
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def graph_handler(request: web.Request) -> web.Response:
+        try:
+            node_limit = max(50, min(2000, int(request.query.get("limit", "1500"))))
+        except ValueError as error:
+            raise web.HTTPBadRequest(text="limit must be an integer") from error
+        payload = await asyncio.to_thread(companion().knowledge_graph_snapshot, node_limit)
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+
+    async def graph_node_handler(request: web.Request) -> web.Response:
+        kind = request.query.get("kind", "")
+        source_id = request.query.get("id", "")
+        if kind not in {"entity", "evidence", "claim", "episode"} or not source_id:
+            raise web.HTTPBadRequest(text="kind and id identify a graph node")
+        detail = await asyncio.to_thread(companion().graph_node_detail, kind, source_id)
+        if detail is None:
+            raise web.HTTPNotFound(text="graph node is not available")
+        return web.json_response(detail, headers={"Cache-Control": "no-store"})
+
+    async def evidence_media_handler(request: web.Request) -> web.Response:
+        artifact = await asyncio.to_thread(
+            companion().evidence_media, request.match_info["evidence_id"]
+        )
+        if artifact is None:
+            raise web.HTTPNotFound(text="evidence artifact is not retained")
+        payload, suffix = artifact
+        content_type = mimetypes.types_map.get(suffix, "application/octet-stream")
+        return web.Response(
+            body=payload,
+            content_type=content_type,
+            headers={"Cache-Control": "private, max-age=60"},
+        )
 
     async def raw_frame_handler(request: web.Request) -> web.Response:
         frame = companion().telemetry.frame(request.match_info["camera_id"])
@@ -177,14 +241,39 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             raise web.HTTPNotFound(text="identity crop is not available")
         return web.Response(body=face, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
+    async def identity_sample_handler(request: web.Request) -> web.Response:
+        face = companion().identities.face_sample(
+            request.match_info["profile_id"], request.match_info["sample_id"]
+        )
+        if face is None:
+            raise web.HTTPNotFound(text="identity evidence crop is not available")
+        return web.Response(
+            body=face,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+
+    async def identity_timeline_handler(request: web.Request) -> web.Response:
+        timeline = await asyncio.to_thread(
+            companion().identity_timeline, request.match_info["profile_id"]
+        )
+        if timeline is None:
+            raise web.HTTPNotFound(text="identity timeline is not available")
+        return web.json_response(timeline, headers={"Cache-Control": "no-store"})
+
     async def object_handler(request: web.Request) -> web.Response:
         object_crop = companion().objects.thumbnail(request.match_info["profile_id"])
         if object_crop is None:
             raise web.HTTPNotFound(text="segmented object crop is not available")
         return web.Response(body=object_crop, content_type="image/png", headers={"Cache-Control": "no-store"})
 
-    async def voice_catalog_handler(_: web.Request) -> web.Response:
-        return web.json_response(await companion()._omnius.voice_catalog())
+    async def voice_catalog_handler(request: web.Request) -> web.Response:
+        return web.json_response(
+            await companion()._omnius.voice_catalog(
+                force=request.query.get("refresh") == "1"
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def voice_config_handler(request: web.Request) -> web.Response:
         require_loopback(request)
@@ -195,19 +284,71 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             voice_model = str(body["voice_model"]).strip()
             voice_name = str(body.get("voice_name", "")).strip() or None
             asr_model = str(body["asr_model"]).strip()
-            if not 1 <= segment_seconds <= 15 or not 0.001 <= rms_threshold <= 1 or not voice_model or not asr_model:
+            asr_language = str(body["asr_language"]).strip()
+            asr_target_rms = float(body["asr_target_rms"])
+            asr_max_gain = float(body["asr_max_gain"])
+            vad_input_gain = float(body["vad_input_gain"])
+            if (
+                not 1 <= segment_seconds <= 15
+                or not 0.001 <= rms_threshold <= 1
+                or not 0.001 <= asr_target_rms <= 1
+                or not 1 <= asr_max_gain <= 48
+                or not 1 <= vad_input_gain <= 32
+                or re.fullmatch(r"(?:auto|[a-z]{2,3}(?:-[A-Z]{2})?)", asr_language) is None
+                or not voice_model or not asr_model
+            ):
                 raise ValueError("invalid voice settings")
         except (KeyError, TypeError, ValueError) as error:
-            raise web.HTTPBadRequest(text="segment_seconds, rms_threshold, voice_model, and asr_model are required") from error
+            raise web.HTTPBadRequest(
+                text="segment_seconds, rms_threshold, asr_target_rms, asr_max_gain, "
+                "vad_input_gain, asr_language, voice_model, and asr_model are required"
+            ) from error
         runtime = companion()
         try:
-            await runtime.update_voice_config(segment_seconds, rms_threshold, voice_model, voice_name, asr_model)
+            await runtime.update_voice_config(
+                segment_seconds, rms_threshold, voice_model, voice_name, asr_model,
+                asr_target_rms, asr_max_gain, vad_input_gain, asr_language,
+            )
         except RuntimeError as error:
             raise web.HTTPBadGateway(text=str(error)) from error
         return web.json_response(runtime.telemetry.snapshot(config)["voice"])
 
+    async def voice_action_handler(request: web.Request) -> web.Response:
+        require_loopback(request)
+        body = await request.json()
+        action = str(body.get("action", "")).strip().lower()
+        if action != "reconnect":
+            raise web.HTTPBadRequest(text="action must be reconnect")
+        runtime = companion()
+        try:
+            await runtime._omnius.ensure_voice_ready(runtime.config.omnius.voice_model)
+            await runtime._omnius.configure_supertonic_voice(
+                runtime.config.omnius.voice_name
+            )
+            await runtime._omnius.ensure_asr_model(
+                runtime.config.transcription.asr_model
+            )
+            payload = {"ok": True, "action": action}
+        except RuntimeError as error:
+            raise web.HTTPBadGateway(text=str(error)) from error
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+
     async def memory_handler(_: web.Request) -> web.Response:
         return web.json_response(await asyncio.to_thread(companion().memory_snapshot))
+
+    async def dreams_handler(_: web.Request) -> web.Response:
+        return web.json_response(
+            await asyncio.to_thread(companion().dreams_snapshot),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def dreams_run_handler(request: web.Request) -> web.Response:
+        require_loopback(request)
+        try:
+            result = await companion().run_identity_dream("manual")
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
 
     async def memory_entity_handler(request: web.Request) -> web.Response:
         detail = await asyncio.to_thread(
@@ -325,19 +466,30 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app = web.Application()
     app.router.add_get("/", index_handler)
     app.router.add_get("/api/state", state_handler)
+    app.router.add_get("/api/config", config_handler)
+    app.router.add_get("/api/graph", graph_handler)
+    app.router.add_get("/api/graph/node", graph_node_handler)
     app.router.add_get("/api/cameras/{camera_id}/raw.jpg", raw_frame_handler)
     app.router.add_get("/api/cameras/{camera_id}/stream.mjpg", camera_stream_handler)
     app.router.add_get("/api/audio/stream", audio_stream_handler)
     app.router.add_get("/api/identities/{profile_id}/face.jpg", identity_handler)
+    app.router.add_get("/api/identities/{profile_id}/timeline", identity_timeline_handler)
+    app.router.add_get(
+        "/api/identities/{profile_id}/samples/{sample_id}.jpg", identity_sample_handler
+    )
     app.router.add_get("/api/objects/{profile_id}/mask.png", object_handler)
     app.router.add_get("/api/voice/catalog", voice_catalog_handler)
     app.router.add_put("/api/voice/config", voice_config_handler)
+    app.router.add_post("/api/voice/action", voice_action_handler)
+    app.router.add_get("/api/dreams", dreams_handler)
+    app.router.add_post("/api/dreams/run", dreams_run_handler)
     app.router.add_get("/api/memory", memory_handler)
     app.router.add_get("/api/memory/episodes", memory_episodes_handler)
     app.router.add_get("/api/memory/claims", memory_claims_handler)
     app.router.add_get("/api/memory/export", memory_export_handler)
     app.router.add_get("/api/memory/export/{entity_id}", memory_entity_export_handler)
     app.router.add_get("/api/memory/entities/{entity_id}", memory_entity_handler)
+    app.router.add_get("/api/memory/evidence/{evidence_id}/media", evidence_media_handler)
     app.router.add_post("/api/memory/entities/{entity_id}/aliases", memory_alias_handler)
     app.router.add_post("/api/memory/entities/{entity_id}/alias", memory_alias_handler)
     app.router.add_delete("/api/memory/entities/{entity_id}", memory_delete_handler)
@@ -345,6 +497,14 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app.router.add_post("/api/memory/revisions", memory_revision_handler)
     app.router.add_post("/api/memory/consolidate", memory_consolidate_handler)
     app.router.add_get("/api/cognition/state", cognition_state_handler)
+    app.router.add_static(
+        "/assets/",
+        Path(__file__).with_name("vendor"),
+        name="dashboard-assets",
+        show_index=False,
+        append_version=False,
+    )
+    app.router.add_get("/{route:.*}", index_handler)
     await refresh()
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

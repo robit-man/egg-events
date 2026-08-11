@@ -1,23 +1,44 @@
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
+import io
 import json
+import math
+import os
+import time
+import wave
 import zlib
 
-import os
-
 import aiohttp
+import numpy as np
 
 from egg_companion.config import OmniusConfig
+from egg_companion.cognition.dialogue import (
+    InterruptionDecision,
+    parse_interruption_decision,
+)
 
 
 class OmniusClient:
+    _KNOWN_SILENCE_HALLUCINATIONS = {
+        "ご視聴ありがとうございました",
+        "thank you for watching",
+        "thanks for watching",
+    }
+
     def __init__(self, config: OmniusConfig) -> None:
         self.config = config
         self._conversation: list[dict[str, str]] = []
         self._model_gate = asyncio.Lock()
+        # ASR must stay responsive while conversational inference is running;
+        # its own gate preserves one-at-a-time transcription ordering without
+        # letting an obsolete reply hold ingress behind the chat model.
+        self._asr_gate = asyncio.Lock()
+        self._ocr_gate = asyncio.Lock()
         self.last_transcription_metadata: dict[str, object] = {}
+        self._voice_catalog_cache: dict[str, object] | None = None
+        self._voice_catalog_cached_at = 0.0
 
     def _headers(self) -> dict[str, str]:
         if not self.config.bearer_token_env:
@@ -65,7 +86,7 @@ class OmniusClient:
         return content.strip()
 
     async def voice_state(self) -> dict[str, object]:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(
                 f"{str(self.config.base_url).rstrip('/')}/v1/voice/state", headers=self._headers()
             ) as response:
@@ -75,28 +96,66 @@ class OmniusClient:
             raise RuntimeError("Omnius voice state is not an object")
         return payload
 
-    async def voice_catalog(self) -> dict[str, object]:
-        timeout = aiohttp.ClientTimeout(total=10)
+    async def voice_catalog(self, *, force: bool = False) -> dict[str, object]:
+        # Model discovery may stat several local model trees on first access.
+        # Keep it outside the low-latency health budget and fetch independent
+        # catalog surfaces concurrently so the dashboard remains responsive.
+        state = await self.voice_state()
+        if (
+            not force
+            and self._voice_catalog_cache is not None
+            and time.monotonic() - self._voice_catalog_cached_at < 300
+        ):
+            return {**self._voice_catalog_cache, "state": state}
+
+        timeout = aiohttp.ClientTimeout(total=90)
         base_url = str(self.config.base_url).rstrip("/")
+
+        async def get_json(
+            session: aiohttp.ClientSession,
+            path: str,
+            *,
+            unavailable: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            async with session.get(f"{base_url}{path}", headers=self._headers()) as response:
+                if response.status == 404 and unavailable is not None:
+                    return unavailable
+                response.raise_for_status()
+                payload = await response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Omnius returned an invalid voice payload for {path}")
+            return payload
+
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(f"{base_url}/v1/voice/models", headers=self._headers()) as response:
+            tts, asr, supertonic = await asyncio.gather(
+                get_json(session, "/v1/voice/models"),
+                get_json(session, "/v1/voice/asr-models"),
+                get_json(
+                    session,
+                    "/v1/voice/supertonic-settings",
+                    unavailable={"supported": False, "settings": {}, "options": {"voices": []}},
+                ),
+            )
+        self._voice_catalog_cache = {"tts": tts, "asr": asr, "supertonic": supertonic}
+        self._voice_catalog_cached_at = time.monotonic()
+        return {**self._voice_catalog_cache, "state": state}
+
+    async def asr_catalog(self) -> dict[str, object]:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{str(self.config.base_url).rstrip('/')}/v1/voice/asr-models",
+                headers=self._headers(),
+            ) as response:
                 response.raise_for_status()
-                tts = await response.json()
-            async with session.get(f"{base_url}/v1/voice/asr-models", headers=self._headers()) as response:
-                response.raise_for_status()
-                asr = await response.json()
-            async with session.get(f"{base_url}/v1/voice/supertonic-settings", headers=self._headers()) as response:
-                if response.status == 404:
-                    supertonic = {"supported": False, "settings": {}, "options": {"voices": []}}
-                else:
-                    response.raise_for_status()
-                    supertonic = await response.json()
-        return {"tts": tts, "asr": asr, "supertonic": supertonic}
+                payload = await response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Omnius ASR catalog is not an object")
+        return payload
 
     async def ensure_asr_model(self, model_id: str) -> None:
-        catalog = await self.voice_catalog()
-        asr = catalog.get("asr")
-        if isinstance(asr, dict) and asr.get("current") == model_id:
+        asr = await self.asr_catalog()
+        if asr.get("current") == model_id:
             return
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -160,13 +219,51 @@ class OmniusClient:
             f"Observed scene: {scene}"
         )
 
-    async def conversation_reply(self, utterance: str, scene: str) -> str:
+    async def conversation_reply(
+        self,
+        utterance: str,
+        scene: str,
+        history: list[dict[str, object]] | None = None,
+    ) -> str:
+        ordered_history = json.dumps(history or [], ensure_ascii=False)
         return await self._chat(
             "Local speech, already verified as human speech by VAD:\n"
             f"{utterance!r}\n\nEmbodied context:\n{scene}\n\n"
+            f"Complete ordered audible conversation ledger:\n{ordered_history}\n\n"
+            "The ledger distinguishes completed and interrupted agent utterances. "
+            "Never answer in the human's voice, answer Egg's own prior question, or treat an "
+            "interrupted agent utterance as fully heard. "
             "Decide from the conversational history and context whether this is directed to Egg. "
-            "If it is not directed to Egg or does not merit an audible interruption, reply exactly [[SILENT]]."
+            "If it is not directed to Egg or does not merit an audible interruption, "
+            "reply exactly [[SILENT]].",
+            remember=False,
+            include_memory=False,
         )
+
+    async def classify_interruption(
+        self,
+        heard_text: str,
+        agent_text: str,
+        history: list[dict[str, object]],
+        context: str,
+    ) -> InterruptionDecision | None:
+        raw = await self._structured_chat(
+            "You are Egg's silent secondary interruption-triage analyst. Never answer the speaker. "
+            "Decide whether new human audio overlapping Egg's playback is a genuine interruption. "
+            "Use the complete ordered conversation, current agent playback, latest heard transcript, and "
+            "embodied context. Treat timing as transport metadata only, never as semantic proof. "
+            "A correction, stop/redirect command, answer to Egg, substantive question, or other change "
+            "to what Egg must do next is genuine. Speaker echo, a backchannel, room noise, duplicated "
+            "agent speech, or ambiguous audio is not.\n"
+            f"Ordered conversation: {json.dumps(history, ensure_ascii=False)}\n"
+            f"Current agent playback: {agent_text!r}\n"
+            f"Latest heard-audio candidate: {heard_text!r}\n"
+            f"Embodied context: {context[:1600]}\n"
+            "Return exactly this JSON shape with no extra keys: "
+            '{"version":1,"genuine":boolean,"confidence":number,"reason":string,'
+            '"summary":string,"should_cancel_playback":boolean}.'
+        )
+        return parse_interruption_decision(raw)
 
     async def reason_about_utterance(
         self, utterance: str, context: str
@@ -277,28 +374,54 @@ class OmniusClient:
         normalized = " ".join(name.strip().split())
         return normalized if normalized and len(normalized) <= 64 else None
 
-    async def transcribe(self, wav_audio: bytes) -> str | None:
+    async def transcribe(
+        self,
+        wav_audio: bytes,
+        *,
+        acoustic_evidence: dict[str, object] | None = None,
+        language: str = "auto",
+    ) -> str | None:
+        evidence = {
+            **self._wav_acoustic_evidence(wav_audio),
+            **dict(acoustic_evidence or {}),
+        }
+        acoustic_rejection = self.acoustic_rejection_reason(evidence)
+        if acoustic_rejection is not None:
+            self.last_transcription_metadata = {
+                "duration": evidence.get("duration"),
+                "language": None,
+                "segments": [],
+                "acoustic": evidence,
+                "accepted": False,
+                "rejection_reason": acoustic_rejection,
+            }
+            return None
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         headers = {**self._headers(), "Content-Type": "audio/wav"}
-        async with self._model_gate:
+        async with self._asr_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/voice/transcribe",
                     data=wav_audio,
                     headers=headers,
+                    params={"language": language},
                 ) as response:
                     if response.status >= 400:
                         detail = (await response.text())[:500]
                         raise RuntimeError(f"Omnius ASR HTTP {response.status}: {detail}")
                     payload = await response.json()
         text = payload.get("text")
-        rejection_reason = self.transcription_rejection_reason(payload)
+        rejection_reason = self.transcription_rejection_reason(payload, evidence)
         if not isinstance(text, str) or not text.strip():
             rejection_reason = "empty transcript"
+        segment_metadata = self._segment_metadata(
+            payload.get("segments"), redact_text=rejection_reason is not None
+        )
         self.last_transcription_metadata = {
             "duration": payload.get("duration"),
             "language": payload.get("language"),
-            "segments": payload.get("segments") if isinstance(payload.get("segments"), list) else [],
+            "segments": segment_metadata,
+            "acoustic": evidence,
             "accepted": rejection_reason is None,
             "rejection_reason": rejection_reason,
         }
@@ -307,15 +430,27 @@ class OmniusClient:
         return text.strip()
 
     @staticmethod
-    def transcription_is_grounded(payload: dict[str, object]) -> bool:
-        return OmniusClient.transcription_rejection_reason(payload) is None
+    def transcription_is_grounded(
+        payload: dict[str, object], acoustic_evidence: dict[str, object] | None = None
+    ) -> bool:
+        return OmniusClient.transcription_rejection_reason(payload, acoustic_evidence) is None
 
     @staticmethod
-    def transcription_rejection_reason(payload: dict[str, object]) -> str | None:
+    def transcription_rejection_reason(
+        payload: dict[str, object], acoustic_evidence: dict[str, object] | None = None
+    ) -> str | None:
+        text = payload.get("text")
+        if isinstance(text, str) and OmniusClient._is_known_silence_hallucination(text):
+            # Some backends return text with no segment array. This guard must
+            # precede segment-quality handling or their most common silence
+            # hallucination bypasses grounding entirely.
+            return "known silence hallucination"
         segments = payload.get("segments")
-        if not isinstance(segments, list) or not segments:
-            return None
-        scored = [segment for segment in segments if isinstance(segment, dict)]
+        scored = (
+            [segment for segment in segments if isinstance(segment, dict)]
+            if isinstance(segments, list)
+            else []
+        )
         no_speech = [
             float(segment["no_speech_prob"])
             for segment in scored
@@ -345,10 +480,118 @@ class OmniusClient:
             # transcript text, using Whisper's own algorithm and threshold, to
             # still catch its most common hallucination class: word/phrase
             # repetition loops (e.g. "Allah Allah Allah Allah Allah Allah").
-            text = payload.get("text")
             if isinstance(text, str) and OmniusClient._text_compression_ratio(text) >= 2.4:
                 return "repetitive transcript compression"
+        evidence = acoustic_evidence or {}
+        duration = evidence.get("duration", payload.get("duration"))
+        if (
+            isinstance(text, str)
+            and evidence.get("boundary_reason") == "max_utterance"
+            and isinstance(duration, (int, float))
+            and float(duration) >= 8
+        ):
+            symbol_count = sum(
+                character.isalnum() for character in OmniusClient._normalized_transcript(text)
+            )
+            if symbol_count / float(duration) < 1.75:
+                return "sparse transcript over max-length acoustic window"
         return None
+
+    @staticmethod
+    def acoustic_rejection_reason(evidence: dict[str, object]) -> str | None:
+        speech_detected = evidence.get("speech_detected")
+        if speech_detected is False:
+            return "source VAD rejected speech"
+        source_rms = evidence.get("source_rms", evidence.get("wav_rms"))
+        minimum_rms = evidence.get("minimum_rms")
+        if (
+            isinstance(source_rms, (int, float))
+            and isinstance(minimum_rms, (int, float))
+            and math.isfinite(float(source_rms))
+            and float(source_rms) < float(minimum_rms)
+        ):
+            return "source RMS below admission threshold"
+        if (
+            evidence.get("boundary_reason") == "max_utterance"
+            and isinstance(source_rms, (int, float))
+            and isinstance(minimum_rms, (int, float))
+            and math.isfinite(float(source_rms))
+            and math.isfinite(float(minimum_rms))
+            and float(source_rms) < float(minimum_rms) * 1.5
+        ):
+            # A room-noise spike can scrape over the absolute RMS floor while
+            # WebRTC VAD accumulates a fragmented utterance until the hard cap.
+            # Do not spend a Whisper invocation on that near-floor window.
+            return "near-threshold max-window ambience"
+        wav_rms = evidence.get("wav_rms")
+        wav_peak = evidence.get("wav_peak")
+        if (
+            isinstance(wav_rms, (int, float))
+            and isinstance(wav_peak, (int, float))
+            and float(wav_rms) <= 0.0001
+            and float(wav_peak) <= 0.0005
+        ):
+            return "digital silence input"
+        return None
+
+    @staticmethod
+    def _wav_acoustic_evidence(wav_audio: bytes) -> dict[str, object]:
+        try:
+            with wave.open(io.BytesIO(wav_audio), "rb") as source:
+                channels = source.getnchannels()
+                sample_width = source.getsampwidth()
+                sample_rate = source.getframerate()
+                frame_count = source.getnframes()
+                frames = source.readframes(frame_count)
+        except (EOFError, OSError, wave.Error):
+            return {}
+        if channels <= 0 or sample_width != 2 or sample_rate <= 0 or not frames:
+            return {"duration": frame_count / sample_rate if sample_rate else None}
+        samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768
+        if channels > 1:
+            complete = samples.size - samples.size % channels
+            samples = samples[:complete].reshape(-1, channels).mean(axis=1)
+        if not samples.size:
+            return {"duration": frame_count / sample_rate}
+        return {
+            "duration": frame_count / sample_rate,
+            "wav_rms": float(np.sqrt(np.mean(np.square(samples)))),
+            "wav_peak": float(np.max(np.abs(samples))),
+        }
+
+    @staticmethod
+    def _normalized_transcript(text: str) -> str:
+        normalized = "".join(
+            character if character.isalnum() or character.isspace() else " "
+            for character in text.casefold()
+        )
+        return " ".join(normalized.split())
+
+    @staticmethod
+    def _is_known_silence_hallucination(text: str) -> bool:
+        normalized = OmniusClient._normalized_transcript(text)
+        for phrase in OmniusClient._KNOWN_SILENCE_HALLUCINATIONS:
+            phrase_words = phrase.split()
+            words = normalized.split()
+            if words and len(words) % len(phrase_words) == 0 and words == phrase_words * (
+                len(words) // len(phrase_words)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _segment_metadata(segments: object, *, redact_text: bool) -> list[dict[str, object]]:
+        if not isinstance(segments, list):
+            return []
+        return [
+            {
+                key: value
+                for key, value in segment.items()
+                if not redact_text or key != "text"
+            }
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
 
     @staticmethod
     def _text_compression_ratio(text: str) -> float:
@@ -362,21 +605,22 @@ class OmniusClient:
     async def ocr_advanced(self, image_path: str) -> dict[str, object] | None:
         """Read text from a local image path via Omnius's multi-PSM tesseract + optional
         vision-refinement OCR pipeline. Returns None when the tool is unavailable (501)
-        or the response is malformed, so callers can treat it as purely corroborating
+        or the response is malformed, so call sites can treat it as purely corroborating
         evidence alongside the Ornith VLM classification rather than a hard dependency."""
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{str(self.config.base_url).rstrip('/')}/v1/ocr/advanced",
-                json={"imagePath": image_path},
-                headers=self._headers(),
-            ) as response:
-                if response.status == 501:
-                    return None
-                if response.status >= 400:
-                    detail = (await response.text())[:500]
-                    raise RuntimeError(f"Omnius OCR HTTP {response.status}: {detail}")
-                result = await response.json()
+        async with self._ocr_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.base_url).rstrip('/')}/v1/ocr/advanced",
+                    json={"imagePath": image_path},
+                    headers=self._headers(),
+                ) as response:
+                    if response.status == 501:
+                        return None
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(f"Omnius OCR HTTP {response.status}: {detail}")
+                    result = await response.json()
         if not isinstance(result, dict) or not result.get("success"):
             return None
         text = result.get("ocrText")
@@ -446,7 +690,7 @@ class OmniusClient:
         Uses the cognition model rather than the vision model: it triages which
         profiles are worth a real image-grounded VLM re-classification instead of
         overwriting a label itself. Returns None on any malformed response so the
-        caller always falls back to the VLM path rather than trusting a silent pass.
+        call site always falls back to the VLM path rather than trusting a silent pass.
         """
         raw = await self._structured_chat(
             "Audit whether a previously assigned object label is still plausible, given its history. "
@@ -514,7 +758,9 @@ class OmniusClient:
             raise RuntimeError("Omnius structured chat returned an empty completion")
         return reply.strip()
 
-    async def _chat(self, prompt: str) -> str:
+    async def _chat(
+        self, prompt: str, *, remember: bool = True, include_memory: bool = True
+    ) -> str:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         payload = {
             "model": self.config.model,
@@ -534,7 +780,7 @@ class OmniusClient:
                         "and never claim first-person perceptual certainty beyond the supplied live evidence."
                     ),
                 },
-                *self._conversation,
+                *(self._conversation if include_memory else []),
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
@@ -559,6 +805,9 @@ class OmniusClient:
         if not isinstance(reply, str) or not reply.strip():
             raise RuntimeError("Omnius returned an empty chat completion")
         response = reply.strip()
-        self._conversation.extend(({"role": "user", "content": prompt}, {"role": "assistant", "content": response}))
-        self._conversation = self._conversation[-12:]
+        if remember:
+            self._conversation.extend(
+                ({"role": "user", "content": prompt}, {"role": "assistant", "content": response})
+            )
+            self._conversation = self._conversation[-12:]
         return response

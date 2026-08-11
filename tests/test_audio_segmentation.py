@@ -89,3 +89,32 @@ def test_reset_discards_in_progress_utterance() -> None:
     # frames using the same fake_is_voiced indices as before will not appear
     # voiced again (indices keep incrementing), so nothing should finalize yet.
     assert utterances == []
+
+
+def test_adaptive_hangover_keeps_long_speech_open_beyond_fixed_boundary() -> None:
+    audio = AudioConfig(input_device="default")
+    transcription = TranscriptionConfig(
+        segment_seconds=2.0,
+        vad_min_contiguous_ms=60,
+        vad_hangover_ms=100,
+        vad_hangover_max_ms=1000,
+        vad_hangover_growth_ms=300,
+        vad_pre_roll_ms=60,
+    )
+    segmenter = UtteranceSegmenter(audio, transcription)
+    frame_calls: list[int] = []
+
+    def fake_is_voiced(frame: np.ndarray) -> bool:
+        index = len(frame_calls)
+        frame_calls.append(index)
+        return index < 12
+
+    segmenter._is_voiced = fake_is_voiced  # type: ignore[method-assign]
+
+    early = segmenter.feed_events(_frames(22))
+    late = segmenter.feed_events(_frames(24))
+
+    assert [event.kind for event in early] == ["started"]
+    ended = [event for event in late if event.kind == "ended"]
+    assert len(ended) == 1
+    assert ended[0].silence_target_ms > transcription.vad_hangover_ms

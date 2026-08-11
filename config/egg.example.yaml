@@ -23,16 +23,30 @@ audio:
   input_device: default
   output_device: default
   doa_mode: respeaker_usb
+  respeaker_led_enabled: true
+  respeaker_led_brightness: 8
   respeaker_vendor_id: 10374 # 0x2886
   respeaker_product_id: 24 # 0x0018
   sample_rate: 16000
   channels: 6
   asr_channel: 0
   asr_target_rms: 0.08
+  asr_max_gain: 24
+  barge_in_enabled: true
+  playback_resume_rewind_ms: 80
+  playback_timeout_seconds: 30
 
 transcription:
-  segment_seconds: 3
-  rms_threshold: 0.004
+  segment_seconds: 12
+  rms_threshold: 0.012
+  asr_model: base
+  asr_language: en
+  vad_input_gain: 1
+  vad_min_voiced_rms: 0.02
+  vad_hangover_ms: 600
+  vad_hangover_max_ms: 1800
+  vad_hangover_growth_ms: 1600
+  vad_continuation_growth: 1
 
 omnius:
   base_url: http://127.0.0.1:11435
@@ -54,6 +68,49 @@ attention:
   min_priority: 0.35
   greeting_cooldown_seconds: 45
 
+identity:
+  enabled: true
+  storage_dir: data/identity-library
+  # Appearance is temporal context only. Durable people require face evidence.
+  similarity_threshold: 0.88
+  face_similarity_threshold: 0.45
+  face_match_margin: 0.04
+  minimum_face_quality: 0.75
+  enrollment_min_face_observations: 3
+  enrollment_face_consistency: 0.65
+  retroactive_coalescing_enabled: true
+  retroactive_merge_similarity: 0.80
+  track_ttl_seconds: 8
+  track_iou_threshold: 0.18
+  track_center_distance: 0.65
+  sample_interval_seconds: 15
+  gallery_max_samples: 8
+  gallery_diversity_similarity: 0.985
+
+dreams:
+  enabled: true
+  model_path: models/cvlface_adaface_ir18_webface4m
+  model_id: minchul/cvlface_adaface_ir18_webface4m
+  model_revision: 0dd53f188fa27968b0a1326970ebf4aeb37ce2ca
+  device: cuda
+  batch_size: 64
+  use_half_precision: true
+  idle_seconds: 45
+  interval_min_seconds: 600
+  interval_max_seconds: 1800
+  proposal_similarity: 0.35
+  modern_merge_similarity: 0.46
+  modern_strong_similarity: 0.54
+  legacy_merge_similarity: 0.40
+  legacy_strong_similarity: 0.60
+  legacy_similarity_floor: 0.30
+  separated_modern_similarity: 0.38
+  separated_legacy_floor: 0.15
+  mutual_neighbor_margin: 0.025
+  reciprocal_neighbor_rank: 8
+  coobservation_min_confirmations: 3
+  auto_merge_enabled: true
+
 object_learning:
   enabled: true
   storage_dir: data/object-library
@@ -69,6 +126,15 @@ object_learning:
   vlm_max_image_size: 512
   stable_candidate_frames: 3
   speech_priority_seconds: 8
+
+ocr:
+  enabled: true
+  full_frame_interval_seconds: 20
+  text_object_interval_seconds: 8
+  queue_size: 8
+  max_image_size: 1280
+  min_text_characters: 2
+  max_fragments: 8
 
 memory:
   enabled: true
