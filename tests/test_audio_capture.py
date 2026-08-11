@@ -83,3 +83,37 @@ def test_asr_gain_uses_conditioned_voiced_energy_instead_of_raw_rumble() -> None
     assert processor.last_conditioned_rms < 0.01
     assert not processor.last_speech_detected
     assert np.sqrt(np.mean(np.square(output))) < 0.1
+
+
+def test_vad_boost_does_not_cancel_quiet_speech_asr_normalization() -> None:
+    sample_rate = 16000
+    audio = AudioConfig(
+        input_device="default",
+        sample_rate=sample_rate,
+        asr_target_rms=0.16,
+        asr_max_gain=48,
+    )
+    processor = ReSpeakerCapture(
+        audio,
+        TranscriptionConfig(
+            vad_input_gain=8,
+            vad_min_voiced_rms=0.02,
+            vad_aggressiveness=3,
+        ),
+    )
+    timeline = np.arange(sample_rate * 3, dtype=np.float32) / sample_rate
+    quiet_speech = (
+        0.005 * np.sin(2 * np.pi * 220 * timeline)
+        + 0.0025 * np.sin(2 * np.pi * 440 * timeline)
+    ).astype(np.float32)
+
+    wav_audio, _ = processor.process_samples(quiet_speech)
+    with wave.open(io.BytesIO(wav_audio), "rb") as source:
+        output = np.frombuffer(source.readframes(source.getnframes()), dtype="<i2").astype(
+            np.float32
+        ) / 32768
+
+    assert processor.last_speech_detected
+    assert processor.last_voiced_rms < 0.01
+    assert processor.last_applied_gain > 20
+    assert 0.12 <= np.sqrt(np.mean(np.square(output))) <= 0.18

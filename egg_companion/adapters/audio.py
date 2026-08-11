@@ -516,10 +516,15 @@ class ReSpeakerCapture:
         speech_band = condition_speech_band(mono, self.audio.sample_rate)
         self.last_conditioned_rms = float(np.sqrt(np.mean(np.square(speech_band))))
         vad_input = np.clip(speech_band * self.transcription.vad_input_gain, -1, 1)
-        self.last_speech_detected = self._detect_speech(vad_input)
+        self.last_speech_detected = self._detect_speech(
+            vad_input, reference_mono=speech_band
+        )
         return rms
 
-    def _detect_speech(self, mono: np.ndarray) -> bool:
+    def _detect_speech(
+        self, mono: np.ndarray, *, reference_mono: np.ndarray | None = None
+    ) -> bool:
+        """Detect on boosted VAD audio but measure ASR gain from raw speech-band audio."""
         try:
             import webrtcvad
         except ImportError as error:
@@ -535,6 +540,13 @@ class ReSpeakerCapture:
         detector = webrtcvad.Vad(self.transcription.vad_aggressiveness)
         frames = pcm.reshape(frame_count, frame_samples)
         frame_rms = np.sqrt(np.mean(np.square(frames.astype(np.float32) / 32768), axis=1))
+        reference = mono if reference_mono is None else reference_mono
+        reference_frames = reference[: frame_count * frame_samples].reshape(
+            frame_count, frame_samples
+        )
+        reference_rms = np.sqrt(
+            np.mean(np.square(reference_frames.astype(np.float32)), axis=1)
+        )
         voiced = [
             detector.is_speech(frame.tobytes(), self.audio.sample_rate)
             and rms >= self.transcription.vad_min_voiced_rms
@@ -543,7 +555,9 @@ class ReSpeakerCapture:
         voiced_frames = int(sum(voiced))
         self.last_speech_ratio = float(voiced_frames / frame_count)
         self.last_speech_ms = int(voiced_frames * frame_ms)
-        self.last_voiced_rms = float(frame_rms[voiced].mean()) if voiced_frames else 0.0
+        self.last_voiced_rms = (
+            float(reference_rms[voiced].mean()) if voiced_frames else 0.0
+        )
         longest_run = 0
         run = 0
         for is_voiced in voiced:

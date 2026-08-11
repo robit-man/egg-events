@@ -73,3 +73,33 @@ def test_repair_makes_bundled_nemotron_fail_over_and_normalize_model_id(tmp_path
     assert "already-compatible" in second.stdout
     assert "except Exception as e:" in source
     assert 'args.model = f"nvidia/{args.model}"' in source
+
+
+def test_repair_accepts_renumbered_esbuild_script_symbols(tmp_path: Path) -> None:
+    target = tmp_path / "index.js"
+    target.write_text(
+        '''function locateScript(name10) {
+  const candidates = [
+    join135(MODULE_DIR, "..", "scripts", name10),
+    join135(process.cwd(), "scripts", name10)
+  ];
+}
+const cuda = "CUDA-only ASR is enabled torch.version.cuda=%s";
+const options = { language: options2.language ?? "auto" };
+const result = { language: result.language };
+''',
+        encoding="utf-8",
+    )
+    script = Path(__file__).parents[1] / "scripts" / "repair_omnius_asr_runtime.py"
+
+    first = subprocess.run(
+        [sys.executable, str(script), str(target)], check=True, capture_output=True, text=True
+    )
+    second = subprocess.run(
+        [sys.executable, str(script), str(target)], check=True, capture_output=True, text=True
+    )
+
+    source = target.read_text(encoding="utf-8")
+    assert "repaired-1" in first.stdout
+    assert "already-compatible" in second.stdout
+    assert 'join135(MODULE_DIR, "scripts", name10)' in source

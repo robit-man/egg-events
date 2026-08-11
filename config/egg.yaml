@@ -50,7 +50,7 @@ audio:
   channels: 6
   # 6-channel firmware: channel 0 is the ReSpeaker DSP/AEC ASR stream.
   asr_channel: 0
-  asr_target_rms: 0.12
+  asr_target_rms: 0.16
   asr_max_gain: 48
   # Keep the AEC microphone live during output so verified heard speech can
   # provisionally stop playback while semantic interruption triage runs.
@@ -64,10 +64,10 @@ transcription:
   # segment_seconds is a hard cap on utterance length, not a fixed capture window:
   # utterances are bounded by VAD onset (vad_min_contiguous_ms) and trailing
   # silence (vad_hangover_ms), so speech is never chopped mid-word.
-  segment_seconds: 12
+  segment_seconds: 6
   # The DSP channel is quiet by design; post-admission audio is normalized to
   # the target above. WebRTC VAD plus ASR grounding rejects steady ambience.
-  rms_threshold: 0.012
+  rms_threshold: 0.003
   asr_model: base
   # This installation is used for English conversation and room media. Set to
   # auto live in the dashboard when multilingual recognition is intentional.
@@ -75,10 +75,10 @@ transcription:
   # Aggressive mode plus a frame-level floor separates measured fan/chassis
   # ambience from speech without suppressing room-scale speech and podcasts.
   vad_aggressiveness: 3
-  vad_input_gain: 1
-  vad_min_speech_ms: 450
+  vad_input_gain: 8
+  vad_min_speech_ms: 240
   vad_min_speech_ratio: 0.15
-  vad_min_contiguous_ms: 300
+  vad_min_contiguous_ms: 180
   vad_min_voiced_rms: 0.02
   vad_pre_roll_ms: 300
   vad_hangover_ms: 600
@@ -171,10 +171,14 @@ object_learning:
   recall_interval_seconds: 0.75
   recall_cache_seconds: 12
   auto_label_max_retries: 2
-  auto_label_failure_backoff_seconds: 10
+  auto_label_failure_backoff_seconds: 3
   vlm_max_image_size: 512
   stable_candidate_frames: 3
   speech_priority_seconds: 8
+  review_sweep_interval_seconds: 120
+  review_stale_after_seconds: 1800
+  confidence_audit_enabled: false
+  confidence_audit_batch_size: 8
 
 ocr:
   enabled: true
@@ -227,6 +231,7 @@ privacy:
 
 runtime:
   event_queue_size: 8
-  speech_queue_size: 4
+  # Reject overload instead of transcribing stale room audio minutes later.
+  speech_queue_size: 1
   reasoning_queue_size: 4
   log_level: INFO

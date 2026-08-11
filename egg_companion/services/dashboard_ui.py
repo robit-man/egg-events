@@ -748,7 +748,7 @@ PAGE = r"""<!doctype html>
       const signature = JSON.stringify(options);
       const existing = node.value;
       if (node.dataset.options !== signature) {
-        node.innerHTML = options.map(option => `<option value="${esc(option.id)}">${esc(option.label)}</option>`).join('');
+        node.innerHTML = options.map(option => `<option value="${esc(option.id)}" ${option.disabled ? 'disabled' : ''}>${esc(option.label)}</option>`).join('');
         node.dataset.options = signature;
       }
       const desired = voiceFormDirty && options.some(option => option.id === existing) ? existing : value;
@@ -758,7 +758,7 @@ PAGE = r"""<!doctype html>
       if (!catalog) return;
       const voice = state.telemetry?.voice || {};
       const tts = (catalog.tts?.models || []).filter(model => model.enabled !== false).map(model => ({id:model.id,label:`${model.label || model.id} · ${model.backend || 'TTS'}`}));
-      const asr = (catalog.asr?.models || []).map(model => ({id:model.id,label:model.id + (model.isActive ? ' · active' : '')}));
+      const asr = (catalog.asr?.models || []).map(model => ({id:model.id,disabled:model.liveEligible === false,label:model.id + (model.isActive ? ' · active' : '') + (model.liveEligible === false ? ` · unavailable: ${model.liveReason || 'not ready'}` : '')}));
       selectOption('voice_model', tts, voice.tts_model);
       selectOption('asr_model', asr, voice.asr_model);
       const selected = $('#voice [name=voice_model]').value;

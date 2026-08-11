@@ -211,7 +211,9 @@ class CompanionRuntime:
         if voice_name is not None and normalized_voice_name != self.config.omnius.voice_name:
             await self._omnius.configure_supertonic_voice(normalized_voice_name)
             self.config.omnius.voice_name = normalized_voice_name
-        if asr_model and asr_model != self.config.transcription.asr_model:
+        if asr_model:
+            # Reconcile Omnius even when the requested ID matches local config;
+            # another client may have switched the backend underneath this runtime.
             await self._omnius.ensure_asr_model(asr_model)
             self.config.transcription.asr_model = asr_model
 
@@ -540,6 +542,7 @@ class CompanionRuntime:
         while True:
             await asyncio.sleep(60)
             await self._omnius.health()
+            await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
 
     async def _maintain_vision(self) -> None:
         if self._vision is None:
@@ -1741,6 +1744,15 @@ class CompanionRuntime:
                 if result is None or result[1] < self.config.object_learning.auto_label_min_confidence:
                     detail = "invalid response" if result is None else f"{result[0]}:{result[1]:.3f}"
                     self.telemetry.record_object_learning("vlm_rejection", detail)
+                    if attempt < self.config.object_learning.auto_label_max_retries:
+                        await asyncio.sleep(
+                            self.config.object_learning.auto_label_failure_backoff_seconds
+                            * (attempt + 1)
+                        )
+                        if not self._object_candidates.full():
+                            self._object_candidates.put_nowait(
+                                (camera_id, detection, segmented, fingerprint, attempt + 1)
+                            )
                     continue
                 label, confidence = result
                 provenance = {

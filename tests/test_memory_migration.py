@@ -96,3 +96,61 @@ def test_pipeline_persists_only_accepted_event_and_links_entities(tmp_path) -> N
     assert detail is not None
     assert [item["evidence_id"] for item in detail["evidence"]] == ["evidence-episode-1"]
     assert detail["episodes"][0]["episode_id"] == "episode-1"
+
+
+def test_ornith_relabel_persists_crop_and_supersedes_automatic_memory_labels(tmp_path) -> None:
+    memory = MemoryConfig(storage_dir=str(tmp_path / "memory"))
+    config = SimpleNamespace(
+        memory=memory, event_segmentation=EventSegmentationConfig(), privacy=PrivacyConfig()
+    )
+    store = MemoryStore(memory)
+    pipeline = MemoryPipeline(config, store)
+    now = datetime.now(timezone.utc)
+    embedding = np.array([1.0, 0.0], dtype=np.float32)
+    base = {
+        "profile_id": "object-001",
+        "label": "tv genre",
+        "embedding": embedding,
+        "confidence": 0.62,
+        "label_confidence": 0.62,
+        "label_source": "detector",
+        "review_state": "pending",
+        "last_seen": now,
+        "thumbnail": b"segmented-png-evidence",
+        "label_history": [],
+        "label_provenance": {},
+    }
+    pipeline.sync_object_profile(base)
+    store.assert_claim_once(
+        "object-001", "has_alias", "tv genre", 0.62, now, source="runtime"
+    )
+
+    corrected = {
+        **base,
+        "label": "computer monitor",
+        "label_confidence": 0.94,
+        "label_source": "ornith-vlm",
+        "review_state": "vlm_verified",
+        "label_history": [
+            {
+                "label": "tv genre",
+                "source": "detector",
+                "confidence": 0.62,
+                "revised_at": now.isoformat(),
+                "revised_by": "robit/ornith-vision:9b",
+            }
+        ],
+        "label_provenance": {"model_id": "robit/ornith-vision:9b"},
+    }
+    pipeline.sync_object_profile(corrected)
+
+    detail = store.entity_detail("object-001")
+    assert detail is not None
+    assert detail["entity"]["display_name"] == "computer monitor"
+    assert len(detail["evidence"]) == 2
+    assert all(item.get("media_key") for item in detail["evidence"])
+    active = store.list_claims("object-001", state="active", limit=20)
+    assert {(item["predicate"], item["object_id_or_text"]) for item in active} == {
+        ("has_label", "computer monitor")
+    }
+    assert store.memory_stats()["revisions"] >= 2

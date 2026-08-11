@@ -76,6 +76,11 @@ def test_asr_grounding_rejects_backend_silence_artifact_without_quality_metadata
         "known silence hallucination"
     )
 
+    embellished_artifact = {"text": "Oh, thanks for watching!"}
+    assert OmniusClient.transcription_rejection_reason(embellished_artifact) == (
+        "known silence hallucination"
+    )
+
 
 def test_asr_grounding_rejects_sparse_text_from_fragmented_max_window() -> None:
     sparse = {
@@ -98,6 +103,42 @@ def test_asr_grounding_rejects_sparse_text_from_fragmented_max_window() -> None:
         "sparse transcript over max-length acoustic window"
     )
     assert OmniusClient.transcription_rejection_reason(substantive, evidence) is None
+
+
+def test_asr_grounding_rejects_live_repetition_sparse_and_language_mismatch() -> None:
+    repeated = {
+        "text": "I can't believe it. I can't believe it. I can't believe it.",
+        "segments": [
+            {"text": "I can't believe it."},
+            {"text": "I can't believe it."},
+            {"text": "I can't believe it."},
+        ],
+    }
+    max_window = {"duration": 6, "boundary_reason": "max_utterance"}
+    assert OmniusClient.transcription_rejection_reason(repeated, max_window) == (
+        "repetitive transcript loop"
+    )
+    assert OmniusClient.transcription_rejection_reason(
+        {"text": "Thank you.", "duration": 6}, max_window
+    ) == "sparse transcript over max-length acoustic window"
+    assert OmniusClient.transcription_rejection_reason(
+        {"text": "JR東日本E233系電車", "duration": 6},
+        {**max_window, "requested_language": "en"},
+    ) == "transcript script conflicts with requested language"
+
+
+def test_large_whisper_is_blocked_from_live_jetson_runtime() -> None:
+    model = {
+        "id": "large-v3",
+        "readiness": {"weightsReady": True, "device": "cuda:0"},
+    }
+    assert "memory budget" in str(OmniusClient._live_asr_unavailable_reason(model))
+
+    base = {
+        "id": "base",
+        "readiness": {"weightsReady": True, "device": "cuda:0"},
+    }
+    assert OmniusClient._live_asr_unavailable_reason(base) is None
 
 
 def test_asr_rejects_digital_silence_before_calling_backend() -> None:

@@ -40,6 +40,24 @@ def test_rejected_asr_switch_does_not_mutate_config() -> None:
     asyncio.run(scenario())
 
 
+def test_matching_asr_selection_is_still_reconciled_with_backend() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        requested: list[str] = []
+
+        async def ensure_asr_model(model_id: str) -> None:
+            requested.append(model_id)
+
+        runtime._omnius.ensure_asr_model = ensure_asr_model
+        current = runtime.config.transcription.asr_model
+
+        await runtime.update_voice_config(None, None, None, None, current)
+
+        assert requested == [current]
+
+    asyncio.run(scenario())
+
+
 def test_rejected_voice_model_switch_does_not_mutate_config() -> None:
     async def scenario() -> None:
         runtime = CompanionRuntime(degraded_config())

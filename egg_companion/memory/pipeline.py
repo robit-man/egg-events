@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from egg_companion.config import EggConfig
 from egg_companion.memory.entities import EntityResolver
 from egg_companion.memory.context import ContextAssembler
@@ -7,7 +9,7 @@ from egg_companion.memory.consolidation import MemoryConsolidator
 from egg_companion.memory.governance import MemoryGovernance
 from egg_companion.memory.segmentation import EventSegmenter
 from egg_companion.memory.store import MemoryStore
-from egg_companion.models import EpisodeDraft, PerceptualEvent
+from egg_companion.models import EpisodeDraft, EvidenceRef, PerceptualEvent
 
 
 class MemoryPipeline:
@@ -34,7 +36,44 @@ class MemoryPipeline:
         return accepted, len(drafts)
 
     def sync_object_profile(self, profile: dict[str, object]) -> str:
-        return self.entities.sync_object_profile(profile)
+        thumbnail = profile.get("thumbnail")
+        evidence_id = None
+        if isinstance(thumbnail, bytes) and thumbnail:
+            profile_id = str(profile["profile_id"])
+            label = str(profile["label"])
+            checksum = hashlib.sha256(thumbnail).hexdigest()
+            label_key = hashlib.sha256(label.casefold().encode()).hexdigest()[:12]
+            evidence_id = f"object-label:{profile_id}:{checksum[:16]}:{label_key}"
+            media_key, persisted_checksum = self.store.persist_media(
+                f"object-labels/{profile_id}/{checksum}.png", thumbnail
+            )
+            captured_at = self.entities._datetime(profile["last_seen"])
+            evidence = EvidenceRef(
+                evidence_id,
+                "vision",
+                captured_at,
+                str(profile.get("label_source") or "object-library"),
+                profile_id,
+                media_key,
+                self.entities._bounded_confidence(profile.get("label_confidence")),
+                {
+                    "label": label,
+                    "label_source": profile.get("label_source"),
+                    "review_state": profile.get("review_state"),
+                    "label_provenance": profile.get("label_provenance")
+                    if isinstance(profile.get("label_provenance"), dict)
+                    else {},
+                    "transparent_mask": True,
+                    "automatic_classification": profile.get("label_source") == "ornith-vlm",
+                },
+            )
+            self.store.append_evidence(evidence, checksum=persisted_checksum)
+        entity_id = self.entities.sync_object_profile(profile, evidence_id)
+        if evidence_id:
+            self.store.link_entity_evidence(
+                entity_id, evidence_id, "object-label-evidence"
+            )
+        return entity_id
 
     def sync_identity_profile(self, profile: dict[str, object]) -> str:
         return self.entities.sync_identity_profile(profile)

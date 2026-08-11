@@ -30,18 +30,18 @@ audio:
   sample_rate: 16000
   channels: 6
   asr_channel: 0
-  asr_target_rms: 0.08
-  asr_max_gain: 24
+  asr_target_rms: 0.16
+  asr_max_gain: 48
   barge_in_enabled: true
   playback_resume_rewind_ms: 80
   playback_timeout_seconds: 30
 
 transcription:
-  segment_seconds: 12
-  rms_threshold: 0.012
+  segment_seconds: 6
+  rms_threshold: 0.003
   asr_model: base
   asr_language: en
-  vad_input_gain: 1
+  vad_input_gain: 8
   vad_min_voiced_rms: 0.02
   vad_hangover_ms: 600
   vad_hangover_max_ms: 1800

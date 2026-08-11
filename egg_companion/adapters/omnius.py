@@ -21,6 +21,9 @@ from egg_companion.cognition.dialogue import (
 
 
 class OmniusClient:
+    _UNSAFE_LIVE_ASR_MODELS = {
+        "large-v3": "exceeds the live Jetson memory budget and can terminate Omnius",
+    }
     _KNOWN_SILENCE_HALLUCINATIONS = {
         "ご視聴ありがとうございました",
         "thank you for watching",
@@ -136,6 +139,21 @@ class OmniusClient:
                     unavailable={"supported": False, "settings": {}, "options": {"voices": []}},
                 ),
             )
+        models = asr.get("models")
+        if isinstance(models, list):
+            asr = {
+                **asr,
+                "models": [
+                    {
+                        **model,
+                        "liveEligible": self._live_asr_unavailable_reason(model) is None,
+                        "liveReason": self._live_asr_unavailable_reason(model),
+                    }
+                    if isinstance(model, dict)
+                    else model
+                    for model in models
+                ],
+            }
         self._voice_catalog_cache = {"tts": tts, "asr": asr, "supertonic": supertonic}
         self._voice_catalog_cached_at = time.monotonic()
         return {**self._voice_catalog_cache, "state": state}
@@ -155,6 +173,18 @@ class OmniusClient:
 
     async def ensure_asr_model(self, model_id: str) -> None:
         asr = await self.asr_catalog()
+        models = asr.get("models")
+        selected = next(
+            (
+                model
+                for model in models
+                if isinstance(model, dict) and model.get("id") == model_id
+            ),
+            None,
+        ) if isinstance(models, list) else None
+        reason = self._live_asr_unavailable_reason(selected)
+        if reason:
+            raise RuntimeError(f"ASR model {model_id} is unavailable for live use: {reason}")
         if asr.get("current") == model_id:
             return
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -167,6 +197,20 @@ class OmniusClient:
                 if response.status >= 400:
                     detail = (await response.text())[:500]
                     raise RuntimeError(f"Omnius ASR model switch HTTP {response.status}: {detail}")
+
+    @classmethod
+    def _live_asr_unavailable_reason(cls, model: object) -> str | None:
+        if not isinstance(model, dict):
+            return "model is not present in the Omnius catalog"
+        model_id = str(model.get("id") or "")
+        if model_id in cls._UNSAFE_LIVE_ASR_MODELS:
+            return cls._UNSAFE_LIVE_ASR_MODELS[model_id]
+        readiness = model.get("readiness")
+        if not isinstance(readiness, dict) or readiness.get("weightsReady") is not True:
+            if isinstance(readiness, dict) and readiness.get("lastError"):
+                return str(readiness["lastError"])
+            return "model weights are not ready"
+        return None
 
     async def configure_supertonic_voice(self, voice_name: str | None) -> bool:
         if self.config.voice_model != "supertonic" or not voice_name:
@@ -384,6 +428,7 @@ class OmniusClient:
         evidence = {
             **self._wav_acoustic_evidence(wav_audio),
             **dict(acoustic_evidence or {}),
+            "requested_language": language,
         }
         acoustic_rejection = self.acoustic_rejection_reason(evidence)
         if acoustic_rejection is not None:
@@ -482,19 +527,28 @@ class OmniusClient:
             # repetition loops (e.g. "Allah Allah Allah Allah Allah Allah").
             if isinstance(text, str) and OmniusClient._text_compression_ratio(text) >= 2.4:
                 return "repetitive transcript compression"
+        if isinstance(text, str) and OmniusClient._is_repeated_transcript(text, scored):
+            return "repetitive transcript loop"
         evidence = acoustic_evidence or {}
         duration = evidence.get("duration", payload.get("duration"))
         if (
             isinstance(text, str)
             and evidence.get("boundary_reason") == "max_utterance"
             and isinstance(duration, (int, float))
-            and float(duration) >= 8
+            and float(duration) >= 4
         ):
             symbol_count = sum(
                 character.isalnum() for character in OmniusClient._normalized_transcript(text)
             )
             if symbol_count / float(duration) < 1.75:
                 return "sparse transcript over max-length acoustic window"
+        requested_language = evidence.get("requested_language")
+        if (
+            isinstance(text, str)
+            and requested_language == "en"
+            and OmniusClient._non_latin_letter_ratio(text) > 0.40
+        ):
+            return "transcript script conflicts with requested language"
         return None
 
     @staticmethod
@@ -570,9 +624,15 @@ class OmniusClient:
     @staticmethod
     def _is_known_silence_hallucination(text: str) -> bool:
         normalized = OmniusClient._normalized_transcript(text)
+        words = normalized.split()
+        if len(words) <= 10 and (
+            "thanks for watching" in normalized
+            or "thank you for watching" in normalized
+            or "thank you so much for watching" in normalized
+        ):
+            return True
         for phrase in OmniusClient._KNOWN_SILENCE_HALLUCINATIONS:
             phrase_words = phrase.split()
-            words = normalized.split()
             if words and len(words) % len(phrase_words) == 0 and words == phrase_words * (
                 len(words) // len(phrase_words)
             ):
@@ -601,6 +661,39 @@ class OmniusClient:
         compressor = zlib.compressobj(level=9, wbits=-15)
         compressed = compressor.compress(data) + compressor.flush()
         return len(data) / max(len(compressed), 1)
+
+    @staticmethod
+    def _is_repeated_transcript(text: str, segments: list[dict[str, object]]) -> bool:
+        segment_text = [
+            OmniusClient._normalized_transcript(str(segment.get("text") or ""))
+            for segment in segments
+            if str(segment.get("text") or "").strip()
+        ]
+        if len(segment_text) >= 2 and len(set(segment_text)) == 1:
+            return True
+        words = OmniusClient._normalized_transcript(text).split()
+        for width in range(1, len(words) // 2 + 1):
+            if len(words) % width:
+                continue
+            repetitions = len(words) // width
+            if repetitions >= 3 and words == words[:width] * repetitions:
+                return True
+        return False
+
+    @staticmethod
+    def _non_latin_letter_ratio(text: str) -> float:
+        letters = [character for character in text if character.isalpha()]
+        if not letters:
+            return 0.0
+        non_latin = sum(
+            not (
+                "A" <= character <= "Z"
+                or "a" <= character <= "z"
+                or "À" <= character <= "ɏ"
+            )
+            for character in letters
+        )
+        return non_latin / len(letters)
 
     async def ocr_advanced(self, image_path: str) -> dict[str, object] | None:
         """Read text from a local image path via Omnius's multi-PSM tesseract + optional
@@ -641,6 +734,9 @@ class OmniusClient:
                     "role": "user",
                     "content": (
                         "Classify only the opaque segmented object in this PNG; ignore transparent pixels and background. "
+                        "Identify the specific physical item with a short ordinary noun phrase. Correct the detector "
+                        "when its category is vague, stylistic, or unsupported by the pixels. Do not return a scene, "
+                        "genre, material, person occupation, or visual style as the object label. "
                         "Return JSON only: {\"label\": string|null, \"confidence\": number}. "
                         f"Detector candidate: {detector_label!r} at {detector_confidence:.2f}."
                     ),
@@ -649,8 +745,12 @@ class OmniusClient:
             ],
             "stream": False,
             "format": "json",
+            # This bounded classification does not need a hidden chain of thought.
+            # Ornith otherwise spends the entire generation budget reasoning and
+            # can finish with an empty content field before it emits the JSON.
+            "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64},
-            "keep_alive": 0,
+            "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._model_gate:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import re
 import tempfile
 
 
@@ -207,6 +208,25 @@ def repair(path: Path) -> str:
     script_lookup_count = repaired.count(BAD_SCRIPT_LOOKUP)
     occurrences += script_lookup_count
     repaired = repaired.replace(BAD_SCRIPT_LOOKUP, GOOD_SCRIPT_LOOKUP)
+    # esbuild's numeric suffixes change between Omnius releases (join134,
+    # join135, name10, ...). Repair the generated lookup structurally so an
+    # innocuous bundle renumbering cannot prevent the daemon from starting.
+    script_pattern = re.compile(
+        r'(const candidates = \[\n)(\s+)(join\d+)\(MODULE_DIR, "\.\.", "scripts", (name\d+)\),'
+    )
+
+    def add_dist_script_candidate(match: re.Match[str]) -> str:
+        return (
+            f"{match.group(1)}{match.group(2)}{match.group(3)}"
+            f'(MODULE_DIR, "scripts", {match.group(4)}),\n'
+            f"{match.group(2)}{match.group(3)}"
+            f'(MODULE_DIR, "..", "scripts", {match.group(4)}),'
+        )
+
+    repaired, structural_script_count = script_pattern.subn(
+        add_dist_script_candidate, repaired, count=1
+    )
+    occurrences += structural_script_count
     route_start = repaired.find(HTTP_TRANSCRIBE_START)
     if route_start >= 0:
         route_end = repaired.find(HTTP_TRANSCRIBE_END, route_start)
@@ -224,17 +244,25 @@ def repair(path: Path) -> str:
         occurrences += count
         repaired = repaired.replace(broken, compatible)
     if occurrences == 0:
-        if (
-            any(compatible in source for _, compatible in REPLACEMENTS)
-            and (
-                "function locateScript" not in source
-                or GOOD_SCRIPT_LOOKUP in source
+        cuda_compatible = (
+            "CUDA-only ASR is enabled" not in source
+            or "torch.version.cuda=%s" in source
+        )
+        script_compatible = (
+            "function locateScript" not in source
+            or re.search(
+                r'join\d+\(MODULE_DIR, "scripts", name\d+\)', source
             )
-            and (
-                '/v1/voice/transcribe" || pathname' not in source
-                or HTTP_TRANSCRIBE_GOOD in source
+            is not None
+        )
+        language_compatible = (
+            "/v1/voice/transcribe" not in source
+            or (
+                'language: options2.language ?? "auto"' in source
+                and "language: result.language" in source
             )
-        ):
+        )
+        if cuda_compatible and script_compatible and language_compatible:
             return "already-compatible"
         raise RuntimeError(f"expected Omnius ASR probe was not found in {path}")
     mode = path.stat().st_mode

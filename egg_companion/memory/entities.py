@@ -119,8 +119,17 @@ class EntityResolver:
                     source=str(previous.get("source") or "legacy"), evidence_id=evidence_id,
                     metadata={"revised_by": previous.get("revised_by")}, state="superseded",
                 )
-        for claim in self.store.list_claims(profile_id, state="active", limit=self.configured_claim_limit()):
-            if claim["predicate"] == "has_label" and claim["object_id_or_text"].casefold() != label.casefold():
+        for claim in self.store.list_claims(
+            profile_id, state="active", limit=self.configured_claim_limit()
+        ):
+            predicate = claim["predicate"]
+            stale_automatic_alias = (
+                predicate == "has_alias" and claim.get("source") != "user"
+            )
+            if (
+                (predicate == "has_label" or stale_automatic_alias)
+                and claim["object_id_or_text"].casefold() != label.casefold()
+            ):
                 self.store.revise_claim(
                     str(claim["claim_id"]), "correct", label_source, label,
                     evidence_id, last_seen,

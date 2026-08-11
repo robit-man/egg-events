@@ -159,6 +159,8 @@ class ObjectLibrary:
             for profile in self._profiles.values():
                 if not profile.thumbnail:
                     continue
+                if profile.label_source == "user" and profile.review_state == "user_corrected":
+                    continue
                 if profile.review_state in {"pending", "failed"}:
                     due.append(profile)
                     continue
