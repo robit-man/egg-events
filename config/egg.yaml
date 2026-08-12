@@ -89,6 +89,16 @@ transcription:
   vad_hangover_growth_ms: 1600
   vad_continuation_growth: 1
 
+# Grounded environmental-audio labels run behind the live ASR path. The queue
+# coalesces under load so YAMNet/TensorFlow can never delay a spoken turn.
+audio_comprehension:
+  enabled: true
+  queue_size: 1
+  minimum_interval_seconds: 15
+  minimum_confidence: 0.12
+  top_k: 5
+  context_ttl_seconds: 90
+
 omnius:
   base_url: http://127.0.0.1:11435
   # JetPack-matched CUDA Whisper container. Omnius still owns conversation and TTS.

@@ -102,7 +102,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'href="/dreams" data-route="/dreams"' in dashboard.PAGE
     assert 'data-page="/dreams"' in dashboard.PAGE
     assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
-    assert 'src="/assets/knowledge_graph.js?v=20260811f"' in dashboard.PAGE
+    assert 'src="/assets/knowledge_graph.js?v=20260812a"' in dashboard.PAGE
     assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE
     assert "window.open(" not in dashboard.PAGE
     assert "graphDataSignature" in dashboard.PAGE
@@ -117,6 +117,8 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "voiceFormDirty" in dashboard.PAGE
     assert "Complete durable audible ledger" in dashboard.PAGE
     assert "telemetry.conversation_history" in dashboard.PAGE
+    assert "message-tags" in dashboard.PAGE
+    assert "turn.tags" in dashboard.PAGE
     assert "border-radius: 0 !important" in dashboard.PAGE
     assert 'data-person-id=' in dashboard.PAGE
     assert 'id="person-inspector"' in dashboard.PAGE

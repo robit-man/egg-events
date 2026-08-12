@@ -65,7 +65,8 @@ class EvidenceRef:
 class PerceptualEvent:
     event_id: str
     event_type: Literal[
-        "vision", "speech", "object", "identity", "ocr", "user_correction", "attention"
+        "vision", "speech", "audio_comprehension", "object", "identity", "ocr",
+        "user_correction", "attention"
     ]
     occurred_at: datetime
     source_id: str

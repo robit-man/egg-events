@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import tempfile
 import time
 import wave
 import zlib
@@ -492,6 +493,121 @@ class OmniusClient:
         if not isinstance(output, str) or not output.strip():
             raise RuntimeError("Omnius web_search returned no evidence")
         return output.strip()[:10000]
+
+    async def analyze_audio_scene(
+        self, wav_audio: bytes, *, top_k: int = 5
+    ) -> dict[str, object]:
+        """Run Omnius' grounded YAMNet/AudioSet classifier off the ASR path.
+
+        Omnius can expose a broader ``comprehend`` action, but that action may
+        legitimately report ``mock semantic scaffold`` when no live AV sidecar
+        roles are loaded. Egg never promotes scaffold events into memory. This
+        method intentionally consumes only the independent YAMNet classifier's
+        numeric output and locally measured WAV facts.
+        """
+        acoustic = self._wav_acoustic_evidence(wav_audio)
+        if not acoustic or float(acoustic.get("duration") or 0) <= 0:
+            raise ValueError("audio comprehension requires a valid WAV payload")
+        temporary_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="egg-audio-comprehension-", suffix=".wav", delete=False
+            ) as temporary:
+                temporary.write(wav_audio)
+                temporary_path = temporary.name
+            tool_result = await self._call_tool(
+                "audio_analyze",
+                {
+                    "action": "classify",
+                    "file": temporary_path,
+                    "top_k": max(1, min(int(top_k), 20)),
+                },
+                timeout_seconds=max(30.0, self.config.timeout_seconds),
+            )
+        finally:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+        output = tool_result.get("output")
+        if not isinstance(output, str):
+            raise RuntimeError("Omnius audio_analyze returned no classifier output")
+        parsed = self._parse_audio_classification(output)
+        if parsed is None:
+            raise RuntimeError("Omnius audio_analyze returned invalid YAMNet output")
+        return {
+            "classifications": parsed["classifications"],
+            "total_classes": parsed.get("total_classes", 521),
+            "duration_seconds": parsed.get("duration_s", acoustic.get("duration")),
+            "acoustic": acoustic,
+            "model": "google/yamnet/1",
+            "taxonomy": "AudioSet",
+            "semantic_quality": "grounded classifier",
+            "mock_evidence_discarded": True,
+        }
+
+    async def _call_tool(
+        self,
+        name: str,
+        args: dict[str, object],
+        *,
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{str(self.config.base_url).rstrip('/')}/v1/tools/{name}/call",
+                json={"args": args},
+                headers=self._headers(),
+            ) as response:
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(
+                        f"Omnius {name} HTTP {response.status}: {detail}"
+                    )
+                result = await response.json()
+        tool_result = result.get("result", result) if isinstance(result, dict) else result
+        if not isinstance(tool_result, dict) or tool_result.get("success") is not True:
+            detail = (
+                tool_result.get("error", "invalid tool result")
+                if isinstance(tool_result, dict)
+                else "invalid tool result"
+            )
+            raise RuntimeError(f"Omnius {name} failed: {detail}")
+        return tool_result
+
+    @staticmethod
+    def _parse_audio_classification(output: str) -> dict[str, object] | None:
+        # runPythonScript prefixes its JSON with ``Audio scene classification:``.
+        start = output.find("{")
+        if start < 0:
+            return None
+        try:
+            payload = json.loads(output[start:])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return None
+        classifications = payload.get("classifications")
+        if not isinstance(classifications, list):
+            return None
+        normalized: list[dict[str, object]] = []
+        for item in classifications:
+            if not isinstance(item, dict) or not isinstance(item.get("class"), str):
+                continue
+            try:
+                score = max(0.0, min(1.0, float(item.get("score"))))
+            except (TypeError, ValueError):
+                continue
+            label = " ".join(str(item["class"]).split())[:120]
+            if label:
+                normalized.append({"label": label, "confidence": score})
+        return {
+            "classifications": normalized,
+            "total_classes": int(payload.get("total_classes") or 521),
+            "duration_s": float(payload.get("duration_s") or 0),
+        }
 
     @staticmethod
     def parse_person_name(content: object) -> str | None:

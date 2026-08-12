@@ -57,6 +57,15 @@ class _SpeechSegment:
 
 
 @dataclass(frozen=True)
+class _AudioComprehensionJob:
+    context_id: str
+    audio: bytes
+    transcript: str
+    captured_at: datetime
+    entities: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
 class _OcrCandidate:
     camera_id: str
     image_png: bytes
@@ -130,6 +139,9 @@ class CompanionRuntime:
         self._speech_segments: asyncio.Queue[_SpeechSegment] = asyncio.Queue(
             config.runtime.speech_queue_size
         )
+        self._audio_comprehension_jobs: asyncio.Queue[_AudioComprehensionJob] = (
+            asyncio.Queue(config.audio_comprehension.queue_size)
+        )
         self._utterances: asyncio.Queue[AudioTurn] = asyncio.Queue(
             config.runtime.reasoning_queue_size
         )
@@ -200,6 +212,10 @@ class CompanionRuntime:
         self._curiosity_asked: set[tuple[str, str]] = set()
         self._curiosity_spoken_at: deque[float] = deque()
         self._last_curiosity_at = 0.0
+        self._last_audio_comprehension_queued_at = 0.0
+        self._latest_audio_comprehension: dict[str, object] | None = None
+        self._turn_tool_calls: dict[str, list[dict[str, object]]] = {}
+        self._active_turn_context_id: str | None = None
         self._record_voice_transition("runtime_initialized")
 
     async def update_voice_config(
@@ -258,7 +274,55 @@ class CompanionRuntime:
     def conversation_history(self, limit: int = 5000) -> list[dict[str, object]]:
         if self._memory is None:
             return []
-        return self._memory.conversation_history(limit)
+        history = self._memory.conversation_history(limit)
+        telemetry = self.telemetry.snapshot(self.config)
+        live_by_context: dict[str, list[dict[str, object]]] = {}
+        for call in telemetry.get("tool_calls", []):
+            if not isinstance(call, dict) or not call.get("context_id"):
+                continue
+            live_by_context.setdefault(str(call["context_id"]), []).append(call)
+        comprehension = telemetry.get("audio_comprehension", {})
+        for turn in history:
+            context_id = str(turn.get("context_id") or "")
+            tags = turn.setdefault("tags", [])
+            tools = turn.setdefault("tool_calls", [])
+            if not isinstance(tags, list) or not isinstance(tools, list):
+                continue
+            for call in live_by_context.get(context_id, []):
+                status = str(call.get("status") or "completed")
+                tool = {
+                    "name": str(call.get("name") or "tool")[:80],
+                    "success": call.get("success"),
+                    "status": status,
+                    "duration_ms": call.get("duration_ms"),
+                }
+                if tool not in tools:
+                    tools.append(tool)
+                tag = {
+                    "kind": "tool",
+                    "label": (
+                        tool["name"].replace("_", " ")
+                        + (
+                            " running…"
+                            if status == "running"
+                            else " ✓" if tool["success"] else " failed"
+                        )
+                    ),
+                }
+                if tag not in tags:
+                    tags.append(tag)
+            if (
+                isinstance(comprehension, dict)
+                and str(comprehension.get("context_id") or "") == context_id
+                and comprehension.get("state") in {"queued", "running"}
+            ):
+                tag = {
+                    "kind": "tool",
+                    "label": f"audio comprehension {comprehension['state']}…",
+                }
+                if tag not in tags:
+                    tags.append(tag)
+        return history
 
     def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
         if self._memory is None:
@@ -521,6 +585,10 @@ class CompanionRuntime:
             ("default-mode-network", self._default_mode_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
         ]
+        if self.config.audio_comprehension.enabled:
+            component_specs.append(
+                ("audio-comprehension", self._process_audio_comprehension)
+            )
         tasks = camera_tasks + [
             asyncio.create_task(self._run_component(name, component), name=name)
             for name, component in component_specs
@@ -1086,6 +1154,7 @@ class CompanionRuntime:
                 )
             )
             self._queue_speech_memory(transcript, segment)
+            self._queue_audio_comprehension(transcript, segment)
             turn = self._conversation_turns.finalize_audio_turn(
                 transcript,
                 utterance_id=segment.utterance_id,
@@ -1109,6 +1178,206 @@ class CompanionRuntime:
                 self._record_voice_transition("reasoning_ingress_rejected")
                 continue
             self._utterances.put_nowait(turn)
+
+    def _queue_audio_comprehension(
+        self, transcript: str, segment: _SpeechSegment
+    ) -> None:
+        settings = self.config.audio_comprehension
+        if not settings.enabled:
+            return
+        now = time.monotonic()
+        if (
+            self._last_audio_comprehension_queued_at > 0
+            and now - self._last_audio_comprehension_queued_at
+            < settings.minimum_interval_seconds
+        ):
+            self.telemetry.record_audio_comprehension(
+                "rate_limited", context_id=segment.utterance_id
+            )
+            return
+        job = _AudioComprehensionJob(
+            context_id=segment.utterance_id,
+            audio=segment.audio,
+            transcript=transcript,
+            captured_at=datetime.now(timezone.utc),
+            entities=self._current_audio_associations(),
+        )
+        if self._audio_comprehension_jobs.full():
+            # Semantic scene analysis is contextual and lossy by design. Keep
+            # the newest admitted sound window; never let it backpressure ASR.
+            self._audio_comprehension_jobs.get_nowait()
+            self.telemetry.record_audio_comprehension(
+                "coalesced", context_id=segment.utterance_id
+            )
+        self._audio_comprehension_jobs.put_nowait(job)
+        self._last_audio_comprehension_queued_at = now
+        self.telemetry.record_audio_comprehension(
+            "queued", context_id=segment.utterance_id
+        )
+
+    def _current_audio_associations(self) -> tuple[dict[str, object], ...]:
+        latest = self._latest_observation
+        if latest is None or (
+            datetime.now(timezone.utc) - latest.timestamp
+        ).total_seconds() > 5:
+            return ()
+        entities: dict[str, dict[str, object]] = {}
+        for detection in latest.detections:
+            identity_id = detection.attributes.get("identity_id")
+            if identity_id:
+                persistent = bool(detection.attributes.get("identity_persistent"))
+                entities[str(identity_id)] = {
+                    "id": str(identity_id),
+                    "type": "person" if persistent else "face_observation",
+                    "label": str(
+                        detection.attributes.get("identity")
+                        or "Unconfirmed face observation"
+                    ),
+                    "confidence": detection.attributes.get("identity_confidence", 0.5),
+                    "source": "visible-during-audio",
+                }
+            object_id = detection.attributes.get("object_id")
+            if object_id:
+                entities[str(object_id)] = {
+                    "id": str(object_id),
+                    "type": "object",
+                    "label": str(
+                        detection.attributes.get("object_label") or detection.label
+                    ),
+                    "confidence": detection.attributes.get(
+                        "object_confidence", detection.confidence
+                    ),
+                    "source": "visible-during-audio",
+                }
+        return tuple(entities.values())
+
+    async def _process_audio_comprehension(self) -> None:
+        while True:
+            job = await self._audio_comprehension_jobs.get()
+            started = time.monotonic()
+            self.telemetry.record_audio_comprehension(
+                "running", context_id=job.context_id
+            )
+            try:
+                result = await self._omnius.analyze_audio_scene(
+                    job.audio, top_k=self.config.audio_comprehension.top_k
+                )
+                classifications = [
+                    item
+                    for item in result.get("classifications", [])
+                    if isinstance(item, dict)
+                    and float(item.get("confidence") or 0)
+                    >= self.config.audio_comprehension.minimum_confidence
+                ]
+                result = {**result, "classifications": classifications}
+                self._latest_audio_comprehension = {
+                    **result,
+                    "context_id": job.context_id,
+                    "captured_at": job.captured_at.isoformat(),
+                    "completed_monotonic": time.monotonic(),
+                }
+                self._queue_audio_comprehension_memory(job, result)
+                detail = ", ".join(
+                    f"{item['label']} {float(item['confidence']):.0%}"
+                    for item in classifications[:5]
+                ) or "no class above grounded confidence threshold"
+                self.telemetry.record_audio_comprehension(
+                    "completed",
+                    context_id=job.context_id,
+                    classifications=classifications,
+                    detail=detail,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("grounded audio comprehension unavailable: %s", error)
+                self.telemetry.record_audio_comprehension(
+                    "error",
+                    context_id=job.context_id,
+                    detail=f"{type(error).__name__}: {error}",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+
+    def _queue_audio_comprehension_memory(
+        self, job: _AudioComprehensionJob, result: dict[str, object]
+    ) -> None:
+        if self._memory is None:
+            return
+        classifications = [
+            item for item in result.get("classifications", [])
+            if isinstance(item, dict)
+        ]
+        sound_entities: list[dict[str, object]] = []
+        for item in classifications:
+            label = str(item.get("label") or "").strip()
+            if not label:
+                continue
+            sound_entities.append(
+                {
+                    "id": "sound-event:"
+                    + hashlib.sha256(label.casefold().encode()).hexdigest()[:16],
+                    "type": "sound_event",
+                    "label": label,
+                    "confidence": float(item.get("confidence") or 0),
+                    "source": "omnius-yamnet",
+                }
+            )
+        entities = [*sound_entities, *job.entities]
+        relations = [
+            {
+                "source_id": str(sound["id"]),
+                "relation": "heard_with",
+                "target_id": str(visible["id"]),
+                "confidence": min(
+                    float(sound.get("confidence") or 0),
+                    float(visible.get("confidence") or 0.5),
+                ),
+                "metadata": {"context_id": job.context_id},
+            }
+            for sound in sound_entities
+            for visible in job.entities
+        ]
+        evidence = EvidenceRef(
+            str(uuid4()),
+            "audio_semantics",
+            job.captured_at,
+            "omnius-audio-analyze",
+            "respeaker-asr",
+            quality=max(
+                (float(item.get("confidence") or 0) for item in classifications),
+                default=0.5,
+            ),
+            metadata={
+                "context_id": job.context_id,
+                "utterance_id": job.context_id,
+                "transcript_context": job.transcript,
+                "classifications": classifications,
+                "model": result.get("model"),
+                "taxonomy": result.get("taxonomy"),
+                "semantic_quality": result.get("semantic_quality"),
+                "acoustic": result.get("acoustic"),
+                "mock_evidence_discarded": True,
+                "associated_entity_ids": [str(item["id"]) for item in job.entities],
+            },
+        )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "audio_comprehension",
+                job.captured_at,
+                "respeaker-audio-comprehension",
+                (evidence,),
+                tuple(str(item["id"]) for item in entities),
+                payload={
+                    "labels": [str(item["label"]) for item in sound_entities],
+                    "entities": entities,
+                    "relations": relations,
+                    "skip_pairwise_co_observation": True,
+                    "context_id": job.context_id,
+                },
+            )
+        )
 
     def _queue_vision_memory(
         self, observation: Observation, frame: np.ndarray | None = None
@@ -1283,6 +1552,7 @@ class CompanionRuntime:
             quality=self._capture.last_speech_ratio,
             metadata={
                 "transcript": transcript,
+                "context_id": segment.utterance_id,
                 "utterance_id": segment.utterance_id,
                 "duration_seconds": max(0.0, segment.ended_at - segment.started_at),
                 "rms": self.telemetry.snapshot(self.config)["audio_rms"],
@@ -1292,7 +1562,9 @@ class CompanionRuntime:
                 "doa": self._direction.latest_angle(),
                 "respeaker_dsp": self._direction.latest_status(),
                 "asr_model": self.config.transcription.asr_model,
-                "asr_service": str(self.config.omnius.base_url),
+                "asr_service": str(
+                    self.config.omnius.asr_base_url or self.config.omnius.base_url
+                ),
                 "asr_metadata": dict(self._omnius.last_transcription_metadata),
                 "visible_face_ids": [item["id"] for item in visible_faces],
                 **({"_media_checksum": media_checksum} if media_checksum else {}),
@@ -1352,7 +1624,11 @@ class CompanionRuntime:
                 )
                 if accepted:
                     modalities = {item.modality for item in event.evidence}
-                    if "audio" in modalities or "speech" in modalities:
+                    if (
+                        "audio" in modalities
+                        or "speech" in modalities
+                        or "audio_semantics" in modalities
+                    ):
                         source = "voice"
                     elif "vision" in modalities or event.event_type in {"vision", "ocr"}:
                         source = "vision"
@@ -2328,6 +2604,7 @@ class CompanionRuntime:
         return True
 
     async def _handle_audio_turn(self, turn: AudioTurn) -> None:
+        self._active_turn_context_id = turn.utterance_id
         transcript = turn.text
         pending = self.telemetry.pending_observation()
         pending_identity = self._active_identity_question()
@@ -2392,7 +2669,7 @@ class CompanionRuntime:
                     reply = "No problem. I'll leave that open."
                 else:
                     self._queue_curiosity_answer_memory(
-                        pending_curiosity, normalized_answer
+                        pending_curiosity, normalized_answer, turn.utterance_id
                     )
                     reply = f"Got it. I'll remember: {normalized_answer.rstrip('.')}."
                 spoken = await self._speak(reply, expected_revision=turn.revision)
@@ -2401,7 +2678,8 @@ class CompanionRuntime:
                     spoken, reason, transcript, reply
                 )
                 self._queue_interaction_memory(
-                    transcript, reply, spoken, reason
+                    transcript, reply, spoken, reason,
+                    context_id=turn.utterance_id,
                 )
                 return
 
@@ -2497,7 +2775,10 @@ class CompanionRuntime:
                 return
             if object_label:
                 learned = await self._learn_held_object(
-                    object_label, expected_revision=turn.revision
+                    object_label,
+                    expected_revision=turn.revision,
+                    transcript=transcript,
+                    context_id=turn.utterance_id,
                 )
                 if learned:
                     logger.info("user-labelled segmented object as %s", learned)
@@ -2536,14 +2817,31 @@ class CompanionRuntime:
                             str(pending.get("label")),
                             profile.label,
                             transcript,
+                            turn.utterance_id,
                         )
-                await self._speak(feedback["reply"], expected_revision=turn.revision)
+                spoken = await self._speak(
+                    feedback["reply"], expected_revision=turn.revision
+                )
+                reason = "human visual-label feedback applied to memory"
+                self.telemetry.record_interaction(
+                    spoken, reason, transcript, feedback["reply"]
+                )
+                self._queue_interaction_memory(
+                    transcript,
+                    feedback["reply"],
+                    spoken,
+                    reason,
+                    context_id=turn.utterance_id,
+                )
                 return
         if self._is_visual_question(transcript):
             visual = self._visual_question_frame()
             if visual is not None:
                 camera_id, frame = visual
                 started = time.monotonic()
+                self._record_turn_tool_start(
+                    turn.utterance_id, "fresh_vision", transcript
+                )
                 try:
                     image = await asyncio.to_thread(self._encode_visual_question_frame, frame)
                     reply = await self._omnius.answer_visual_question(
@@ -2552,12 +2850,14 @@ class CompanionRuntime:
                 except Exception as error:
                     logger.warning("fresh visual question path unavailable: %s", error)
                     reply = None
-                    self.telemetry.record_tool_call(
+                    self._record_turn_tool_call(
+                        turn.utterance_id,
                         "fresh_vision", transcript, False, str(error),
                         (time.monotonic() - started) * 1000,
                     )
                 else:
-                    self.telemetry.record_tool_call(
+                    self._record_turn_tool_call(
+                        turn.utterance_id,
                         "fresh_vision", transcript, bool(reply), reply or "no answer",
                         (time.monotonic() - started) * 1000,
                     )
@@ -2574,17 +2874,24 @@ class CompanionRuntime:
                         if spoken else decision.reason
                     )
                     self.telemetry.record_interaction(spoken, reason, transcript, reply)
-                    self._queue_interaction_memory(transcript, reply, spoken, reason)
+                    self._queue_interaction_memory(
+                        transcript, reply, spoken, reason,
+                        context_id=turn.utterance_id,
+                    )
                     return
         context = await self._cognitive_context(transcript)
         if not self._conversation_turns.can_publish(turn.revision):
             return
         if web_query:
             started = time.monotonic()
+            self._record_turn_tool_start(
+                turn.utterance_id, "web_search", web_query
+            )
             try:
                 web_evidence = await self._omnius.web_search(web_query)
                 duration_ms = (time.monotonic() - started) * 1000
-                self.telemetry.record_tool_call(
+                self._record_turn_tool_call(
+                    turn.utterance_id,
                     "web_search", web_query, True, web_evidence, duration_ms
                 )
                 context = (
@@ -2594,7 +2901,8 @@ class CompanionRuntime:
             except Exception as error:
                 duration_ms = (time.monotonic() - started) * 1000
                 logger.warning("web_search tool invocation failed: %s", error)
-                self.telemetry.record_tool_call(
+                self._record_turn_tool_call(
+                    turn.utterance_id,
                     "web_search", web_query, False, str(error), duration_ms
                 )
                 context = (
@@ -2621,15 +2929,23 @@ class CompanionRuntime:
                 else "response superseded before audible publication"
             )
             self.telemetry.record_interaction(spoken, reason, transcript, reply)
-            self._queue_interaction_memory(transcript, reply, spoken, reason)
+            self._queue_interaction_memory(
+                transcript, reply, spoken, reason,
+                context_id=turn.utterance_id,
+            )
             return
         self.telemetry.record_interaction(False, decision.reason, transcript, reply)
         self._queue_interaction_memory(
-            transcript, reply, False, decision.reason
+            transcript, reply, False, decision.reason,
+            context_id=turn.utterance_id,
         )
 
     async def _learn_held_object(
-        self, label: str, expected_revision: int | None = None
+        self,
+        label: str,
+        expected_revision: int | None = None,
+        transcript: str = "",
+        context_id: str | None = None,
     ) -> str | None:
         vision = self._vision
         if not self.config.object_learning.enabled or self._latest_frame is None or vision is None:
@@ -2652,6 +2968,13 @@ class CompanionRuntime:
             return None
         if profile:
             await self._sync_object_profile(profile.profile_id)
+            self._queue_user_correction_memory(
+                profile.profile_id,
+                "unlabeled held object",
+                profile.label,
+                transcript,
+                context_id,
+            )
         return profile.label if profile else None
 
     async def _sync_object_profile(self, profile_id: str) -> None:
@@ -2698,7 +3021,13 @@ class CompanionRuntime:
         transcript: str,
         expected_revision: int,
         camera_id: str | None,
+        context_id: str | None = None,
     ) -> bool:
+        context_id = (
+            context_id
+            or self._active_turn_context_id
+            or f"turn-revision:{expected_revision}"
+        )
         profile = await asyncio.to_thread(self.identities.name_profile, profile_id, name)
         if profile is None:
             return False
@@ -2709,7 +3038,9 @@ class CompanionRuntime:
             self._pending_identity_name = None
         self._identity_name_questions.add(profile_id)
         await self._sync_identity_profile(profile.profile_id)
-        self._queue_identity_name_memory(profile.profile_id, profile.name or name, transcript)
+        self._queue_identity_name_memory(
+            profile.profile_id, profile.name or name, transcript, context_id
+        )
         preferred_name = profile.name or name
         self.telemetry.record_identity_dialogue(
             "named", profile.profile_id, camera_id, preferred_name
@@ -2722,7 +3053,9 @@ class CompanionRuntime:
             else "preferred name saved; acknowledgement superseded before playback"
         )
         self.telemetry.record_interaction(spoken, reason, transcript, reply)
-        self._queue_interaction_memory(transcript, reply, spoken, reason)
+        self._queue_interaction_memory(
+            transcript, reply, spoken, reason, context_id=context_id
+        )
         return True
 
     @staticmethod
@@ -2747,13 +3080,22 @@ class CompanionRuntime:
         normalized = f" {' '.join(normalized_text.split())} "
         return any(phrase in normalized for phrase in (" my name is ", " i'm ", " i am ", " call me "))
 
-    def _queue_identity_name_memory(self, profile_id: str, name: str, transcript: str) -> None:
+    def _queue_identity_name_memory(
+        self, profile_id: str, name: str, transcript: str, context_id: str
+    ) -> None:
         if self._memory is None:
             return
         now = datetime.now(timezone.utc)
         evidence = EvidenceRef(
             str(uuid4()), "speech", now, "user-correction", "respeaker-asr", quality=1.0,
-            metadata={"transcript": transcript, "identity_id": profile_id, "preferred_name": name},
+            metadata={
+                "transcript": transcript,
+                "context_id": context_id,
+                "utterance_id": context_id,
+                "identity_id": profile_id,
+                "preferred_name": name,
+                "memory_update": "preferred_name",
+            },
         )
         self._queue_memory_event(
             PerceptualEvent(
@@ -2765,7 +3107,12 @@ class CompanionRuntime:
         )
 
     def _queue_user_correction_memory(
-        self, profile_id: str, previous_label: str, corrected_label: str, transcript: str
+        self,
+        profile_id: str,
+        previous_label: str,
+        corrected_label: str,
+        transcript: str,
+        context_id: str | None = None,
     ) -> None:
         if self._memory is None:
             return
@@ -2774,9 +3121,12 @@ class CompanionRuntime:
             str(uuid4()), "speech", now, "user-correction", "respeaker-asr", quality=1.0,
             metadata={
                 "transcript": transcript,
+                "context_id": context_id,
+                "utterance_id": context_id,
                 "object_id": profile_id,
                 "previous_label": previous_label,
                 "corrected_label": corrected_label,
+                "memory_update": "object_label",
             },
         )
         self._queue_memory_event(
@@ -3014,8 +3364,55 @@ class CompanionRuntime:
             )
         )
 
+    def _record_turn_tool_start(
+        self, context_id: str, name: str, query: str
+    ) -> None:
+        self.telemetry.record_tool_call(
+            name,
+            query,
+            None,
+            "tool invocation in progress",
+            0.0,
+            context_id=context_id,
+        )
+
+    def _record_turn_tool_call(
+        self,
+        context_id: str,
+        name: str,
+        query: str,
+        success: bool,
+        detail: str,
+        duration_ms: float,
+    ) -> None:
+        call = {
+            "name": name,
+            "query": query[:300],
+            "success": success,
+            "detail": detail[:500],
+            "duration_ms": round(duration_ms, 1),
+        }
+        self._turn_tool_calls.setdefault(context_id, []).append(call)
+        self._turn_tool_calls[context_id] = self._turn_tool_calls[context_id][-12:]
+        while len(self._turn_tool_calls) > 128:
+            self._turn_tool_calls.pop(next(iter(self._turn_tool_calls)))
+        self.telemetry.record_tool_call(
+            name,
+            query,
+            success,
+            detail,
+            duration_ms,
+            context_id=context_id,
+        )
+
     def _queue_interaction_memory(
-        self, transcript: str, response: str, allowed: bool, reason: str
+        self,
+        transcript: str,
+        response: str,
+        allowed: bool,
+        reason: str,
+        *,
+        context_id: str | None = None,
     ) -> None:
         if self._memory is None:
             return
@@ -3046,8 +3443,12 @@ class CompanionRuntime:
                 "candidate_response": response,
                 "spoken": allowed,
                 "reason": reason,
+                "context_id": context_id,
+                "utterance_id": context_id,
                 "graph_influences": influences,
                 "retrieval_influences": retrieval[:12],
+                "tool_calls": list(self._turn_tool_calls.get(context_id, ()))
+                if context_id else [],
             },
         )
         self._queue_memory_event(
@@ -3063,7 +3464,10 @@ class CompanionRuntime:
         )
 
     def _queue_curiosity_answer_memory(
-        self, pending: _PendingCuriosityQuestion, answer: str
+        self,
+        pending: _PendingCuriosityQuestion,
+        answer: str,
+        context_id: str,
     ) -> None:
         if self._memory is None:
             return
@@ -3072,9 +3476,12 @@ class CompanionRuntime:
             str(uuid4()), "speech", now, "human-answer", "respeaker-asr", quality=1.0,
             metadata={
                 "transcript": answer,
+                "context_id": context_id,
+                "utterance_id": context_id,
                 "question": pending.question,
                 "subject_id": pending.subject_id,
                 "predicate": pending.predicate,
+                "memory_update": "claim",
             },
         )
         self._queue_memory_event(
@@ -3166,9 +3573,27 @@ class CompanionRuntime:
                     "(user-provided preferred name)"
                 )
         people = f"; people: {', '.join(visible_people)}" if visible_people else ""
+        audio = ""
+        comprehension = self._latest_audio_comprehension
+        if (
+            comprehension is not None
+            and time.monotonic()
+            - float(comprehension.get("completed_monotonic") or 0)
+            <= self.config.audio_comprehension.context_ttl_seconds
+        ):
+            heard = ", ".join(
+                f"{item['label']} ({float(item['confidence']):.0%})"
+                for item in comprehension.get("classifications", [])[:5]
+                if isinstance(item, dict) and item.get("label")
+            )
+            if heard:
+                audio = (
+                    f"; recent grounded environmental audio: {heard} "
+                    "(Omnius YAMNet/AudioSet classifier)"
+                )
         return (
             f"stable scene inventory: {objects}; semantic cues: {', '.join(labels) or 'none'}"
-            f"{directions}{people}"
+            f"{directions}{people}{audio}"
         )
 
     async def _cognitive_context(self, transcript: str) -> str:

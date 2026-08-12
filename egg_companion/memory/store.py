@@ -991,12 +991,11 @@ class MemoryStore:
         return [_row(row) for row in rows]
 
     def conversation_history(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Return the durable audible ledger in chronological order.
+        """Return durable turns plus the evidence that informed or changed them.
 
-        Heard audio and agent action evidence are append-only, so this survives
-        dashboard navigation and daemon restarts. Suppressed candidate responses
-        remain inspectable but are explicitly marked rather than presented as
-        something the person heard.
+        Every async modality writes the originating utterance/context ID. This
+        lets late vision, tool, correction, retrieval, and audio-semantic results
+        enrich an existing turn instead of manufacturing duplicate messages.
         """
         bounded_limit = max(1, min(int(limit), 20000))
         with self._lock:
@@ -1004,48 +1003,184 @@ class MemoryStore:
                 """SELECT * FROM (
                     SELECT evidence_id, modality, captured_at, payload_json
                     FROM evidence
-                    WHERE modality IN ('audio', 'speech', 'action')
+                    WHERE modality IN ('audio', 'speech', 'action', 'audio_semantics')
                     AND (
                         payload_json LIKE '%\"transcript\"%'
                         OR payload_json LIKE '%\"candidate_response\"%'
+                        OR payload_json LIKE '%\"context_id\"%'
                     )
                     ORDER BY captured_at DESC
                     LIMIT ?
                 ) ORDER BY captured_at ASC""",
                 (bounded_limit,),
             ).fetchall()
-        history: list[dict[str, Any]] = []
+            evidence_ids = [str(row["evidence_id"]) for row in rows]
+            associations: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            if evidence_ids:
+                for offset in range(0, len(evidence_ids), 800):
+                    batch = evidence_ids[offset : offset + 800]
+                    placeholders = ",".join("?" for _ in batch)
+                    linked = self._connection.execute(
+                        f"""SELECT entity_evidence.evidence_id, entity_evidence.role,
+                        entities.entity_id, entities.entity_type, entities.display_name
+                        FROM entity_evidence JOIN entities
+                        ON entities.entity_id=entity_evidence.entity_id
+                        WHERE entity_evidence.evidence_id IN ({placeholders})""",
+                        batch,
+                    ).fetchall()
+                    for item in linked:
+                        associations[str(item["evidence_id"])].append(
+                            {
+                                "id": str(item["entity_id"]),
+                                "type": str(item["entity_type"]),
+                                "label": str(
+                                    item["display_name"] or item["entity_id"]
+                                )[:120],
+                                "role": str(item["role"]),
+                            }
+                        )
+
+        parsed_by_id: dict[str, tuple[dict[str, Any], str]] = {}
+        context_metadata: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: {"tags": [], "associations": [], "tool_calls": []}
+        )
+
+        def add_unique(target: list[dict[str, Any]], item: dict[str, Any]) -> None:
+            identity = tuple(sorted((key, json.dumps(value, sort_keys=True)) for key, value in item.items()))
+            if not any(
+                tuple(sorted((key, json.dumps(value, sort_keys=True)) for key, value in current.items()))
+                == identity
+                for current in target
+            ):
+                target.append(item)
+
         for row in rows:
             try:
                 payload = json.loads(str(row["payload_json"] or "{}"))
             except json.JSONDecodeError:
                 continue
+            if not isinstance(payload, dict):
+                continue
+            context_value = payload.get("context_id") or payload.get("utterance_id")
+            context_id = (
+                str(context_value)
+                if isinstance(context_value, str) and context_value
+                else f"evidence:{row['evidence_id']}"
+            )
+            parsed_by_id[str(row["evidence_id"])] = (payload, context_id)
+            metadata = context_metadata[context_id]
+            modality = str(row["modality"])
+            if modality == "audio":
+                add_unique(metadata["tags"], {"kind": "modality", "label": "audio"})
+                if str(payload.get("asr_model") or "").casefold() == "dual":
+                    add_unique(
+                        metadata["tags"],
+                        {"kind": "modality", "label": "dual ASR"},
+                    )
+                doa = payload.get("doa")
+                if isinstance(doa, (int, float)):
+                    add_unique(
+                        metadata["tags"],
+                        {"kind": "association", "label": f"DoA {round(float(doa))}°"},
+                    )
+            if modality == "audio_semantics":
+                add_unique(
+                    metadata["tags"],
+                    {"kind": "tool", "label": "audio comprehension ✓"},
+                )
+                classifications = payload.get("classifications")
+                for item in classifications[:4] if isinstance(classifications, list) else []:
+                    if isinstance(item, dict) and item.get("label"):
+                        add_unique(
+                            metadata["tags"],
+                            {
+                                "kind": "modality",
+                                "label": (
+                                    f"{item['label']} "
+                                    f"{float(item.get('confidence') or 0):.0%}"
+                                )[:120],
+                            },
+                        )
+            memory_label = None
+            if payload.get("preferred_name"):
+                memory_label = f"remembered name: {payload['preferred_name']}"
+            elif payload.get("corrected_label"):
+                memory_label = f"label updated: {payload['corrected_label']}"
+            elif payload.get("predicate"):
+                memory_label = f"claim updated: {payload['predicate']}"
+            if memory_label:
+                add_unique(
+                    metadata["tags"],
+                    {"kind": "memory", "label": memory_label[:120]},
+                )
+            retrieval = payload.get("retrieval_influences")
+            if isinstance(retrieval, list) and retrieval:
+                add_unique(
+                    metadata["tags"],
+                    {"kind": "memory", "label": f"memory recall ×{len(retrieval)}"},
+                )
+            tool_calls = payload.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict) or not call.get("name"):
+                        continue
+                    normalized_call = {
+                        "name": str(call["name"])[:80],
+                        "success": bool(call.get("success")),
+                        "duration_ms": call.get("duration_ms"),
+                    }
+                    add_unique(metadata["tool_calls"], normalized_call)
+                    add_unique(
+                        metadata["tags"],
+                        {
+                            "kind": "tool",
+                            "label": (
+                                str(call["name"]).replace("_", " ")
+                                + (" ✓" if call.get("success") else " failed")
+                            )[:120],
+                        },
+                    )
+            for association in associations.get(str(row["evidence_id"]), []):
+                add_unique(metadata["associations"], association)
+                add_unique(
+                    metadata["tags"],
+                    {
+                        "kind": "association",
+                        "label": f"{association['type']}: {association['label']}"[:120],
+                    },
+                )
+
+        history: list[dict[str, Any]] = []
+        heard_by_context: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            matched = parsed_by_id.get(str(row["evidence_id"]))
+            if matched is None:
+                continue
+            payload, context_id = matched
             transcript = payload.get("transcript")
             response = payload.get("candidate_response")
             if isinstance(transcript, str) and transcript.strip():
                 normalized = " ".join(transcript.split())[:2000]
-                # Correction/name/curiosity evidence may legitimately point to
-                # the same admitted audio evidence. Keep one audible turn while
-                # the underlying duplicate provenance remains in the graph.
-                if not (
-                    history
-                    and history[-1]["role"] == "heard"
-                    and history[-1]["text"] == normalized
-                ):
-                    history.append(
-                        {
-                            "id": str(row["evidence_id"]),
-                            "role": "heard",
-                            "text": normalized,
-                            "status": "final",
-                            "at": str(row["captured_at"]),
-                        }
-                    )
+                existing = heard_by_context.get(context_id)
+                if existing is None and history and history[-1].get("role") == "heard" and history[-1].get("text") == normalized:
+                    existing = history[-1]
+                if existing is None:
+                    existing = {
+                        "id": str(row["evidence_id"]),
+                        "context_id": context_id,
+                        "role": "heard",
+                        "text": normalized,
+                        "status": "final",
+                        "at": str(row["captured_at"]),
+                    }
+                    history.append(existing)
+                heard_by_context[context_id] = existing
             elif isinstance(response, str) and response.strip():
                 spoken = bool(payload.get("spoken"))
                 history.append(
                     {
                         "id": str(row["evidence_id"]),
+                        "context_id": context_id,
                         "role": "agent",
                         "text": " ".join(response.split())[:2000],
                         "status": "spoken" if spoken else "suppressed",
@@ -1053,6 +1188,11 @@ class MemoryStore:
                         "reason": str(payload.get("reason") or "")[:300],
                     }
                 )
+        for turn in history:
+            metadata = context_metadata.get(str(turn.get("context_id")), {})
+            turn["tags"] = list(metadata.get("tags", []))[:16]
+            turn["associations"] = list(metadata.get("associations", []))[:12]
+            turn["tool_calls"] = list(metadata.get("tool_calls", []))[:12]
         return history
 
     def associations_for_evidence(self, evidence_id: str) -> dict[str, list[dict[str, Any]]]:

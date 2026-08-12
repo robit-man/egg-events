@@ -27,7 +27,8 @@ class EntityResolver:
             entity_id = descriptor.get("id")
             entity_type = descriptor.get("type")
             if not isinstance(entity_id, str) or not entity_id or entity_type not in {
-                "person", "face_observation", "appearance_track", "object", "object_category", "content"
+                "person", "face_observation", "appearance_track", "object", "object_category",
+                "content", "sound_event"
             }:
                 continue
             confidence = self._bounded_confidence(descriptor.get("confidence"))

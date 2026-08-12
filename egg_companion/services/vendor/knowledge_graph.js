@@ -6,7 +6,7 @@ function initCanvasFallback(container) {
   canvas.setAttribute('aria-label', 'Interactive compatibility rendering of the multimodal knowledge graph');
   container.replaceChildren(canvas);
   const context = canvas.getContext('2d', { alpha: false });
-  const colors = { person:'#60a5fa', appearance:'#38bdf8', object:'#34d399', object_category:'#2dd4bf', content:'#ffae00', evidence:'#c084fc', claim:'#fb7185', episode:'#94a3b8', entity:'#22d3ee' };
+  const colors = { person:'#60a5fa', appearance:'#38bdf8', object:'#34d399', object_category:'#2dd4bf', sound_event:'#ffae00', content:'#ffae00', evidence:'#c084fc', claim:'#fb7185', episode:'#94a3b8', entity:'#22d3ee' };
   let data = { nodes: [], links: [] }, nodes = [], links = [], selected = null, hovered = null;
   let query = '', kind = '', pixelRatio = 1, width = 1, height = 1;
   let zoom = 1, panX = 0, panY = 0, yaw = 0.22, pitch = -0.12;
@@ -27,6 +27,7 @@ function initCanvasFallback(container) {
     const subtype = String(node.subtype || '').toLowerCase();
     if (subtype.includes('person') || subtype.includes('face')) return colors.person;
     if (subtype.includes('appearance')) return colors.appearance;
+    if (subtype.includes('sound')) return colors.sound_event;
     if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
     if (subtype.includes('object')) return colors.object;
     return colors[node.kind] || colors.entity;
@@ -327,6 +328,7 @@ if (container) {
       appearance: 0x38bdf8,
       object: 0x34d399,
       object_category: 0x2dd4bf,
+      sound_event: 0xffae00,
       content: 0xfbbf24,
       evidence: 0xc084fc,
       claim: 0xfb7185,
@@ -358,6 +360,7 @@ if (container) {
       const subtype = String(node.subtype || '').toLowerCase();
       if (subtype.includes('person') || subtype.includes('face')) return colors.person;
       if (subtype.includes('appearance')) return colors.appearance;
+      if (subtype.includes('sound')) return colors.sound_event;
       if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
       if (subtype.includes('object')) return colors.object;
       return colors[node.kind] || colors.entity;

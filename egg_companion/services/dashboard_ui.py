@@ -222,6 +222,11 @@ PAGE = r"""<!doctype html>
     .message.agent { justify-self: end; color: #194185; background: var(--accent-soft); border-bottom-right-radius: 4px; }
     .message-role { display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
     .message-meta { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; }
+    .message-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .message-tag { border: 1px solid #39404a; padding: 2px 5px; color: #aeb6c2; background: #0b0e12; font-size: 9px; line-height: 1.25; }
+    .message-tag.tool { border-color: #74520b; color: #ffca63; }
+    .message-tag.memory { border-color: #59406f; color: #d8b4fe; }
+    .message-tag.association { border-color: #28556c; color: #7dd3fc; }
     .message.suppressed { opacity: .55; border: 1px dashed var(--line-strong); }
 
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
@@ -607,7 +612,7 @@ PAGE = r"""<!doctype html>
             </article>
             <aside class="graph-sidebar">
               <article class="card"><div class="card-header"><div><h3 class="card-title">Selection</h3><p class="card-note">Node and immediate relationships</p></div></div><div id="graph-selection"><div class="muted">Select a node in the graph to inspect its nested awareness and provenance.</div></div></article>
-              <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
+              <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
               <article class="card"><div class="card-header"><div><h3 class="card-title">Live firings</h3><p class="card-note">Causal activity propagates across connected memories without moving your view</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#fff"></i>Vision</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Heard voice</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Memory recall</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Agent action</span></div></article>
               <article class="card"><div class="card-header"><div><h3 class="card-title">Relationship encoding</h3></div></div><p class="card-note">Stronger confidence pulls nodes closer. Thicker curved splines indicate stronger or repeatedly confirmed relationships.</p></article>
             </aside>
@@ -834,13 +839,17 @@ PAGE = r"""<!doctype html>
           telemetry.latest_reply ? {role:'agent', text:telemetry.latest_reply, status:'spoken'} : null,
         ].filter(Boolean);
       }
-      const signature = JSON.stringify(turns.map(turn => [turn.id,turn.role,turn.text,turn.status,turn.at]));
+      const signature = JSON.stringify(turns.map(turn => [turn.id,turn.role,turn.text,turn.status,turn.at,turn.tags,turn.tool_calls]));
       if (node.dataset.signature === signature) return;
       const pinnedToBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 36;
       const previousScroll = node.scrollTop;
       node.dataset.signature = signature;
       if (!turns.length) { node.innerHTML = '<div class="empty">No admitted speech yet.</div>'; return; }
-      node.innerHTML = turns.map(turn => `<div class="message ${turn.role === 'agent' ? 'agent' : 'heard'} ${turn.status === 'suppressed' ? 'suppressed' : ''}"><span class="message-role">${turn.role === 'agent' ? 'Egg' : 'Heard'}</span>${esc(turn.text)}<span class="message-meta">${turn.at ? esc(new Date(turn.at).toLocaleString()) + ' · ' : ''}${esc(stateLabel(turn.status || 'final'))}</span></div>`).join('');
+      node.innerHTML = turns.map(turn => {
+        const tags = Array.isArray(turn.tags) ? turn.tags.slice(0, 16) : [];
+        const tagMarkup = tags.length ? `<span class="message-tags">${tags.map(tag => `<span class="message-tag ${esc(String(tag.kind || 'modality'))}" title="${esc(String(tag.kind || 'evidence'))}">${esc(String(tag.label || 'evidence'))}</span>`).join('')}</span>` : '';
+        return `<div class="message ${turn.role === 'agent' ? 'agent' : 'heard'} ${turn.status === 'suppressed' ? 'suppressed' : ''}"><span class="message-role">${turn.role === 'agent' ? 'Egg' : 'Heard'}</span>${esc(turn.text)}${tagMarkup}<span class="message-meta">${turn.at ? esc(new Date(turn.at).toLocaleString()) + ' · ' : ''}${esc(stateLabel(turn.status || 'final'))}</span></div>`;
+      }).join('');
       node.scrollTop = pinnedToBottom ? node.scrollHeight : previousScroll;
     }
     function renderOverview(state) {
@@ -860,10 +869,10 @@ PAGE = r"""<!doctype html>
       $('#overview-checks').innerHTML = checks.slice(0, 12).map(check => `<span class="badge ${check.status === 'pass' ? 'good' : check.status === 'warn' ? 'warn' : 'bad'}">${esc(check.name)}</span>`).join('') || '<span class="muted">Checks pending.</span>';
     }
     function renderVoice(telemetry) {
-      const voice = telemetry.voice || {}, vad = telemetry.vad || {}, asr = telemetry.asr || {}, mic = telemetry.respeaker || {};
+      const voice = telemetry.voice || {}, vad = telemetry.vad || {}, asr = telemetry.asr || {}, mic = telemetry.respeaker || {}, comprehension = telemetry.audio_comprehension || {};
       $('#asr-state').textContent = `${voice.asr_input || 'ASR input'} · ${vad.speech ? 'speech' : 'silence'} · ${Math.round(Number(vad.speech_ratio || 0) * 100)}% / ${Number(vad.speech_ms || 0)} ms · RMS ${Number(telemetry.audio_rms || 0).toFixed(4)}`;
       $('#voice-floor').textContent = stateLabel(voice.floor || 'listening');
-      $('#asr-metrics').innerHTML = `<span class="badge good">${esc(asr.accepted || 0)} accepted</span><span class="badge">${esc(asr.rejected || 0)} rejected</span><span class="badge ${asr.errors ? 'bad' : ''}">${esc(asr.errors || 0)} errors</span><span class="badge ${mic.ready ? 'good' : 'warn'}">XVF3000 ${mic.ready ? 'online' : 'pending'}</span><span class="badge">DoA ${mic.doa_angle == null ? '—' : Math.round(Number(mic.doa_angle)) + '°'}</span><span class="badge ${mic.voice_activity ? 'good' : ''}">DSP VAD ${mic.voice_activity ? 'voice' : 'quiet'}</span>${asr.last_rejection ? `<span class="badge warn">${esc(asr.last_rejection)}</span>` : ''}`;
+      $('#asr-metrics').innerHTML = `<span class="badge good">${esc(asr.accepted || 0)} accepted</span><span class="badge">${esc(asr.rejected || 0)} rejected</span><span class="badge ${asr.errors ? 'bad' : ''}">${esc(asr.errors || 0)} errors</span><span class="badge ${comprehension.state === 'completed' ? 'good' : comprehension.state === 'error' ? 'bad' : ''}">Audio comprehension ${esc(stateLabel(comprehension.state || 'idle'))}</span><span class="badge">${esc(comprehension.completed || 0)} semantic passes</span><span class="badge ${mic.ready ? 'good' : 'warn'}">XVF3000 ${mic.ready ? 'online' : 'pending'}</span><span class="badge">DoA ${mic.doa_angle == null ? '—' : Math.round(Number(mic.doa_angle)) + '°'}</span><span class="badge ${mic.voice_activity ? 'good' : ''}">DSP VAD ${mic.voice_activity ? 'voice' : 'quiet'}</span>${asr.last_rejection ? `<span class="badge warn">${esc(asr.last_rejection)}</span>` : ''}`;
       const rows = [['Floor', stateLabel(voice.floor || '—')], ['Revision', voice.revision ?? '—'], ['Pending ingress', voice.pending_ingress ?? 0], ['Playback', stateLabel(voice.playback_status || 'none')], ['Interruption', voice.active_barge_id ? 'Pending' : 'None'], ['ReSpeaker LEDs', stateLabel(mic.led_state || 'pending')], ['AEC far end', mic.aec_far_end_silence == null ? '—' : mic.aec_far_end_silence ? 'silent' : 'active'], ['AGC gain', mic.agc_gain == null ? '—' : Number(mic.agc_gain).toFixed(2) + '×'], ['Room RT60', mic.rt60_seconds == null ? '—' : Number(mic.rt60_seconds).toFixed(2) + ' s'], ['Last transition', stateLabel(voice.last_transition_reason || '—')]];
       $('#turn-state').innerHTML = table(['State','Value'], rows.map(row => [esc(row[0]), `<span class="mono">${esc(row[1])}</span>`]));
       renderConversation(telemetry, '#conversation', true);
@@ -1169,6 +1178,6 @@ PAGE = r"""<!doctype html>
     connectLiveWaveform();
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
-  <script type="module" src="/assets/knowledge_graph.js?v=20260811f"></script>
+  <script type="module" src="/assets/knowledge_graph.js?v=20260812a"></script>
 </body>
 </html>"""

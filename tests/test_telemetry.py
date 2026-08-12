@@ -68,14 +68,39 @@ def test_tool_and_identity_dialogue_are_observable() -> None:
     config = make_config()
     telemetry = RuntimeTelemetry(config)
 
-    telemetry.record_tool_call("web_search", "latest news", True, "one result", 12.34)
+    telemetry.record_tool_call(
+        "web_search", "latest news", True, "one result", 12.34,
+        context_id="utterance-1",
+    )
+    telemetry.record_audio_comprehension(
+        "completed",
+        context_id="utterance-1",
+        classifications=[{"label": "Speech", "confidence": 0.67}],
+        duration_ms=812.4,
+    )
     telemetry.record_identity_dialogue("awaiting_name", "person-1", "front")
     snapshot = telemetry.snapshot(config)
 
     assert snapshot["tool_calls"][-1]["name"] == "web_search"
     assert snapshot["tool_calls"][-1]["duration_ms"] == 12.3
+    assert snapshot["tool_calls"][-1]["context_id"] == "utterance-1"
+    assert snapshot["audio_comprehension"]["completed"] == 1
+    assert snapshot["audio_comprehension"]["classifications"][0]["label"] == "Speech"
     assert snapshot["identity_dialogue"]["state"] == "awaiting_name"
     assert snapshot["identity_dialogue"]["profile_id"] == "person-1"
+
+    telemetry.record_tool_call(
+        "fresh_vision", "what is this", None, "tool invocation in progress", 0,
+        context_id="utterance-2",
+    )
+    assert telemetry.snapshot(config)["tool_calls"][-1]["status"] == "running"
+    telemetry.record_tool_call(
+        "fresh_vision", "what is this", True, "a mug", 201.2,
+        context_id="utterance-2",
+    )
+    updated = telemetry.snapshot(config)["tool_calls"][-1]
+    assert updated["status"] == "completed"
+    assert updated["success"] is True
 
 
 def test_graph_activations_are_causal_bounded_and_use_real_graph_ids() -> None:

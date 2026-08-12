@@ -12,6 +12,7 @@ Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker di
 - Uses prediction residuals, habituation, communicative action, and deterministic interruption policy rather than frame-count novelty.
 - Captures the ReSpeaker XVF3000's processed AEC/beamformed ASR channel with adaptive WebRTC-VAD turn boundaries, native DSP VAD/DoA/AEC/AGC/RT60 telemetry, listen/think/speak LED states, and revisioned semantic barge-in with tail-only WAV resume.
 - Runs a JetPack-matched CUDA dual-Whisper service: `tiny.en` admits grounded speech, then `base.en` verifies and supplies the transcript; silence and known Whisper outro hallucinations are rejected before conversation ingress.
+- Runs grounded Omnius YAMNet/AudioSet scene classification asynchronously, links sound events to simultaneously visible people/objects, and feeds recent high-confidence audio context into later turns without delaying ASR.
 - Reasons through Omnius `/v1/chat`, publishes only responses owned by the latest finalized heard-audio revision, and emits Supertonic `F4` WAV audio.
 - Audits Jetson GPU power state, V4L2 cameras, ReSpeaker input/output/DOA, model checkpoints, CUDA, memory integrity, Ornith availability, and Omnius voice/cognition contracts.
 
@@ -28,6 +29,45 @@ The single launcher performs the Jetson-specific bootstrap, including the CUDA P
 ```
 
 `config/egg.yaml` discovers every V4L2 camera not already listed, rotates all corrected sources `90°` before inference, uses ReSpeaker USB `2886:0018`, Omnius `1.0.608+` on port `11435`, `omnius-qwen35-9b:latest` for cognition, `robit/ornith-vision:9b` for sparse masked-object teaching, and Supertonic voice `F4`.
+
+## Jetson/ARM64 voice stack: what made realtime ASR work
+
+This installation is `aarch64`, Jetson Linux `R36.3` (JetPack 6 / CUDA 12.2), on an AGX Orin. The decisive constraint is that CUDA libraries on Jetson are not interchangeable with generic x86 or PyPI CUDA wheels. A package can import successfully while still being ABI-incompatible with the JetPack driver, or an innocent dependency resolution can silently replace NVIDIA's working Torch.
+
+The bootstrap therefore follows these rules:
+
+1. It creates the application venv with `--system-site-packages`, because JetPack supplies part of the native CUDA/media stack outside PyPI.
+2. It directly verifies `torch.cuda.is_available()` and the real device name. A version string or package presence is not accepted as proof of GPU execution.
+3. If CUDA Torch is absent, it extracts the matched Python 3.10 packages (`torch`, `torchgen`, `torchvision`, and their dist-info) from `dustynv/l4t-pytorch:r36.2.0`. The tested result here is Torch `2.2.0`, CUDA `12.2`, on Orin.
+4. It installs the Egg and high-level vision packages with `pip --no-deps`. This is intentional: unconstrained installs of OpenCLIP, Ultralytics, NeMo, or Transformers can replace the Jetson Torch build with a generic wheel.
+5. It runs Whisper in a separate NVIDIA-runtime container, `dustynv/whisper:r36.2.0`, with host networking, host IPC, a persistent model cache, and the dedicated REST port `11436`. Omnius remains on `11435` for chat/TTS, so a long language-model generation cannot hold the ASR ingress gate.
+6. `tiny.en` is the low-latency admission pass; `base.en` is the verification/final-text pass. The service compares both outputs and uses no-speech probability, average log probability, compression/repetition checks, real RMS/VAD evidence, and explicit short-outro rejection. In particular, “thanks for watching” and its common Whisper variants cannot be admitted from silence.
+
+The implementation lives in [scripts/bootstrap-jetson.sh](scripts/bootstrap-jetson.sh), [scripts/jetson_whisper_server.py](scripts/jetson_whisper_server.py), and [deploy/egg-whisper.service](deploy/egg-whisper.service). The dedicated service design was informed by the working [EGG dual-Whisper voice pipeline](https://github.com/robit-man/EGG/tree/main/voice) and the deployment lessons in [whisper-stt-jetson](https://github.com/muttleydosomething/whisper-stt-jetson); the local code remains the executable source of truth.
+
+Do not let Omnius auto-install generic `nemo_toolkit[asr]` on this host. An optional NeMo import failure previously caused pip to replace the NVIDIA CUDA Torch build. [scripts/repair_omnius_asr_runtime.py](scripts/repair_omnius_asr_runtime.py) makes the managed runtime use its Transformers fallback, fixes the generated Python 3.10 f-string, repairs managed-script discovery, and preserves the requested ASR language through the HTTP/CLI boundary.
+
+The ReSpeaker USB 4-Mic Array v2.0 exposes six channels. Channel `0` is the XVF3000's processed AEC/beamformed stream and is the correct ASR source; raw microphone channels are useful for diagnostics but materially worse for room speech. Egg applies the hardware DSP route, reads native VAD/DoA/AEC/AGC/RT60 state, amplifies the quiet processed stream before WebRTC VAD, and normalizes admitted WAV audio toward `asr_target_rms` with a bounded maximum gain. Current working values are in `config/egg.yaml`; changing desktop “default input” does not change the explicitly resolved physical array.
+
+Useful ground-truth checks after any dependency or JetPack change are:
+
+```bash
+uname -m
+head -n 1 /etc/nv_tegra_release
+.venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))'
+curl -fsS http://127.0.0.1:11436/health
+./egg audit
+```
+
+If Torch loses CUDA after a package install, stop and restore the JetPack-matched build; do not debug ASR thresholds on a CPU/fallback runtime. If ASR is healthy but quiet, inspect the ReSpeaker processed-channel selection, DSP route, pre-VAD gain, admitted WAV RMS, and target-RMS normalization in that order.
+
+## Audio comprehension and conversation provenance
+
+Transcription and sound understanding are deliberately separate. ASR stays on the fast CUDA Whisper service. A queue of size one coalesces admitted audio windows for Omnius `audio_analyze/classify`, whose YAMNet model emits scores across the 521-class AudioSet taxonomy. Only labels above `audio_comprehension.minimum_confidence` become `sound_event` graph entities. They are explicitly related with `heard_with` edges to visible people and objects, and recent grounded labels become bounded scene context for subsequent replies.
+
+Omnius also exposes an `audio_analyze/comprehend` role pipeline. On this installation its AV sidecar roles currently report `mock semantic scaffold`; those event labels are never persisted or shown as perception. Egg admits only the independent numeric YAMNet classifier and locally measured WAV facts until the sidecar reports live roles. Classification runs behind ASR, so a cold TensorFlow/model load cannot add latency to the current spoken response.
+
+Every admitted utterance now supplies a durable context ID to its audio evidence, visual/web tool invocations, retrieval influences, user corrections, preferred-name bindings, learned-object labels, audio classifications, and agent action evidence. The Voice page renders those as live tags on the same historical turn—for example `fresh vision ✓`, `memory recall ×4`, `remembered name: Troy`, `label updated: amber mug`, or `Speech 67%`. Late asynchronous evidence updates the existing message in place and survives daemon restarts; it does not reset the page or create a second fake heard turn.
 
 Identity dreams use pinned AdaFace IR18/WebFace4M and InsightFace MobileFaceNet
 checkpoints locally and offline. Bootstrap them explicitly on a new installation; the randomized idle

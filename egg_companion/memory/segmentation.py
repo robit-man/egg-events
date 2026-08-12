@@ -34,7 +34,11 @@ class EventSegmenter:
 
     @staticmethod
     def _context(event: PerceptualEvent) -> str:
-        return "conversation" if event.event_type in {"speech", "user_correction"} else event.source_id
+        return (
+            "conversation"
+            if event.event_type in {"speech", "audio_comprehension", "user_correction"}
+            else event.source_id
+        )
 
     @staticmethod
     def _signature(event: PerceptualEvent) -> tuple:
@@ -71,7 +75,9 @@ class EventSegmenter:
             return True, ()
         elapsed = event.occurred_at - active.last_event_at
         duration = event.occurred_at - active.started_at
-        explicit_boundary = event.event_type in {"speech", "user_correction"}
+        explicit_boundary = event.event_type in {
+            "speech", "audio_comprehension", "user_correction"
+        }
         changed = signature != active.signature
         maxed = duration >= timedelta(seconds=self.memory.episode_max_seconds)
         entity_changed = signature[1] != active.signature[1] and bool(

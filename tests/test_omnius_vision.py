@@ -13,6 +13,28 @@ def test_vlm_object_response_requires_bounded_json_label() -> None:
     assert OmniusClient.parse_object_classification('{"label":"mug","confidence":1.2}') is None
 
 
+def test_audio_classification_parser_accepts_only_numeric_yamnet_output() -> None:
+    output = (
+        'Audio scene classification:\n'
+        '{"success":true,"classifications":['
+        '{"class":"Speech","score":0.6703},'
+        '{"class":"Vehicle","score":0.0914}],'
+        '"total_classes":521,"duration_s":6.0}'
+    )
+
+    parsed = OmniusClient._parse_audio_classification(output)
+
+    assert parsed == {
+        "classifications": [
+            {"label": "Speech", "confidence": 0.6703},
+            {"label": "Vehicle", "confidence": 0.0914},
+        ],
+        "total_classes": 521,
+        "duration_s": 6.0,
+    }
+    assert OmniusClient._parse_audio_classification("mock ambient evidence") is None
+
+
 def test_person_name_parser_requires_explicit_bounded_json_name() -> None:
     assert OmniusClient.parse_person_name('{"name":"Ada Lovelace"}') == "Ada Lovelace"
     assert OmniusClient.parse_person_name('{"name":null}') is None

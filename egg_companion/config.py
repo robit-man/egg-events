@@ -126,6 +126,17 @@ class TranscriptionConfig(BaseModel):
     vad_continuation_growth: float = Field(default=1.0, ge=0, le=8)
 
 
+class AudioComprehensionConfig(BaseModel):
+    """Bounded, non-blocking semantic analysis of admitted room audio."""
+
+    enabled: bool = True
+    queue_size: int = Field(default=1, ge=1, le=8)
+    minimum_interval_seconds: float = Field(default=15.0, ge=0, le=3600)
+    minimum_confidence: float = Field(default=0.12, ge=0, le=1)
+    top_k: int = Field(default=5, ge=1, le=20)
+    context_ttl_seconds: float = Field(default=90.0, gt=0, le=3600)
+
+
 class OmniusConfig(BaseModel):
     base_url: HttpUrl = "http://127.0.0.1:11435"
     asr_base_url: HttpUrl | None = None
@@ -342,6 +353,9 @@ class EggConfig(BaseModel):
     vision: VisionConfig = Field(default_factory=VisionConfig)
     audio: AudioConfig
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
+    audio_comprehension: AudioComprehensionConfig = Field(
+        default_factory=AudioComprehensionConfig
+    )
     omnius: OmniusConfig
     system_service: SystemServiceConfig | None = None
     attention: AttentionConfig = Field(default_factory=AttentionConfig)

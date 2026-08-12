@@ -79,3 +79,74 @@ def test_conversation_history_is_chronological_and_marks_suppression(tmp_path) -
     assert history[1]["status"] == "spoken"
     assert history[2]["status"] == "suppressed"
     store.close()
+
+
+def test_conversation_history_coalesces_late_memory_and_tool_metadata(tmp_path) -> None:
+    store = _store(tmp_path)
+    now = datetime.now(timezone.utc)
+    store.upsert_entity("person", "Troy", entity_id="person-1", now=now)
+    store.upsert_entity("object", "amber mug", entity_id="object-1", now=now)
+    store.append_evidence(
+        EvidenceRef(
+            "heard-context", "audio", now, "respeaker", "asr", quality=1.0,
+            metadata={
+                "transcript": "This is my amber mug.",
+                "context_id": "utterance-1",
+                "asr_model": "dual",
+                "doa": 91.2,
+            },
+        )
+    )
+    store.link_entity_evidence("person-1", "heard-context")
+    store.append_evidence(
+        EvidenceRef(
+            "late-correction", "speech", now + timedelta(milliseconds=200),
+            "user-correction", "asr", quality=1.0,
+            metadata={
+                "transcript": "This is my amber mug.",
+                "context_id": "utterance-1",
+                "corrected_label": "amber mug",
+                "object_id": "object-1",
+            },
+        )
+    )
+    store.link_entity_evidence("object-1", "late-correction")
+    store.append_evidence(
+        EvidenceRef(
+            "semantic-context", "audio_semantics", now + timedelta(milliseconds=400),
+            "omnius-audio-analyze", "respeaker", quality=0.67,
+            metadata={
+                "context_id": "utterance-1",
+                "classifications": [{"label": "Speech", "confidence": 0.67}],
+            },
+        )
+    )
+    store.append_evidence(
+        EvidenceRef(
+            "reply-context", "action", now + timedelta(seconds=1), "policy", "speech",
+            quality=1.0,
+            metadata={
+                "candidate_response": "I'll remember your amber mug.",
+                "spoken": True,
+                "reason": "human label learned",
+                "context_id": "utterance-1",
+                "retrieval_influences": [{"owner_type": "entity", "owner_id": "object-1"}],
+                "tool_calls": [
+                    {"name": "fresh_vision", "success": True, "duration_ms": 220.0}
+                ],
+            },
+        )
+    )
+
+    history = store.conversation_history()
+
+    assert [item["role"] for item in history] == ["heard", "agent"]
+    assert all(item["context_id"] == "utterance-1" for item in history)
+    labels = {tag["label"] for tag in history[0]["tags"]}
+    assert {
+        "audio", "dual ASR", "label updated: amber mug", "audio comprehension ✓",
+        "Speech 67%", "memory recall ×1", "fresh vision ✓", "person: Troy",
+        "object: amber mug",
+    } <= labels
+    assert history[0]["tool_calls"][0]["name"] == "fresh_vision"
+    store.close()

@@ -65,6 +65,19 @@ class RuntimeTelemetry:
             "last_rejected_at": None,
             "last_metadata": {},
         }
+        self._audio_comprehension: dict[str, object] = {
+            "state": "idle",
+            "queued": 0,
+            "completed": 0,
+            "errors": 0,
+            "coalesced": 0,
+            "rate_limited": 0,
+            "context_id": None,
+            "classifications": [],
+            "last_detail": None,
+            "duration_ms": None,
+            "updated_at": None,
+        }
         self._latest_reply: str | None = None
         self._voice_runtime: dict[str, object] = {
             "floor": "listening",
@@ -140,6 +153,37 @@ class RuntimeTelemetry:
             self._vad_speech = speech
             self._vad_speech_ratio = round(speech_ratio, 3)
             self._vad_speech_ms = speech_ms
+
+    def record_audio_comprehension(
+        self,
+        stage: str,
+        *,
+        context_id: str | None = None,
+        classifications: list[dict[str, object]] | None = None,
+        detail: str | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        with self._lock:
+            counter = "errors" if stage == "error" else stage
+            if counter in {
+                "queued", "completed", "errors", "coalesced", "rate_limited"
+            }:
+                self._audio_comprehension[counter] = int(
+                    self._audio_comprehension.get(counter) or 0
+                ) + 1
+            self._audio_comprehension["state"] = stage
+            self._audio_comprehension["context_id"] = context_id
+            if classifications is not None:
+                self._audio_comprehension["classifications"] = [
+                    dict(item) for item in classifications[:10]
+                ]
+            if detail is not None:
+                self._audio_comprehension["last_detail"] = detail[:500]
+            if duration_ms is not None:
+                self._audio_comprehension["duration_ms"] = round(duration_ms, 1)
+            self._audio_comprehension["updated_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
 
     def record_respeaker(self, status: dict[str, object]) -> None:
         with self._lock:
@@ -335,19 +379,42 @@ class RuntimeTelemetry:
             self._interaction_decisions = self._interaction_decisions[-20:]
 
     def record_tool_call(
-        self, name: str, query: str, success: bool, detail: str, duration_ms: float
+        self,
+        name: str,
+        query: str,
+        success: bool | None,
+        detail: str,
+        duration_ms: float,
+        *,
+        context_id: str | None = None,
     ) -> None:
         with self._lock:
-            self._tool_calls.append(
-                {
-                    "name": name,
-                    "query": query[:300],
-                    "success": success,
-                    "detail": detail[:500],
-                    "duration_ms": round(duration_ms, 1),
-                    "at": datetime.now(timezone.utc).isoformat(),
-                }
+            entry = {
+                "name": name,
+                "query": query[:300],
+                "success": success,
+                "status": (
+                    "running" if success is None else "completed" if success else "failed"
+                ),
+                "detail": detail[:500],
+                "duration_ms": round(duration_ms, 1),
+                "context_id": context_id,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            pending_index = next(
+                (
+                    index
+                    for index in range(len(self._tool_calls) - 1, -1, -1)
+                    if self._tool_calls[index].get("name") == name
+                    and self._tool_calls[index].get("context_id") == context_id
+                    and self._tool_calls[index].get("status") == "running"
+                ),
+                None,
             )
+            if success is not None and pending_index is not None:
+                self._tool_calls[pending_index] = entry
+            else:
+                self._tool_calls.append(entry)
             self._tool_calls = self._tool_calls[-20:]
 
     def record_graph_activation(
@@ -658,6 +725,13 @@ class RuntimeTelemetry:
                 "transcript_count": self._transcript_count,
                 "transcript_history": list(self._transcript_history),
                 "asr": dict(self._asr),
+                "audio_comprehension": {
+                    **self._audio_comprehension,
+                    "classifications": [
+                        dict(item)
+                        for item in self._audio_comprehension["classifications"]
+                    ],
+                },
                 "latest_reply": self._latest_reply,
                 "runtime_errors": list(self._runtime_errors),
                 "object_learning": dict(self._object_learning),
