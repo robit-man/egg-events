@@ -144,6 +144,15 @@ identity:
   track_ttl_seconds: 8
   track_iou_threshold: 0.18
   track_center_distance: 0.65
+  # Adjacent instance masks are stronger temporal evidence than detector IDs.
+  # A substantially overlapping mask reuses the existing entity even when the
+  # bounding box jumps; Ornith then records a visual/displacement audit.
+  track_mask_iou_threshold: 0.30
+  track_mask_containment_threshold: 0.70
+  track_mask_max_gap_seconds: 8
+  temporal_vlm_comparison_enabled: true
+  temporal_vlm_queue_size: 2
+  temporal_vlm_cooldown_seconds: 15
   sample_interval_seconds: 15
   # Retain a compact, pose-diverse gallery instead of destroying all historical
   # angles when the live centroid and latest thumbnail are refreshed.

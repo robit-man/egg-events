@@ -68,6 +68,19 @@ class _AudioComprehensionJob:
 
 
 @dataclass(frozen=True)
+class _PersonComparisonJob:
+    candidate_id: str
+    track_id: str
+    entity_id: str
+    prior_entity_id: str
+    camera_id: str
+    captured_at: datetime
+    prior_png: bytes
+    current_png: bytes
+    geometry: dict[str, object]
+
+
+@dataclass(frozen=True)
 class _OcrCandidate:
     camera_id: str
     image_png: bytes
@@ -218,6 +231,10 @@ class CompanionRuntime:
         self._latest_audio_comprehension: dict[str, object] | None = None
         self._turn_tool_calls: dict[str, list[dict[str, object]]] = {}
         self._active_turn_context_id: str | None = None
+        self._person_comparison_lock = threading.Lock()
+        self._person_comparison_candidates: deque[_PersonComparisonJob] = deque(
+            maxlen=config.identity.temporal_vlm_queue_size
+        )
         self._record_voice_transition("runtime_initialized")
 
     async def update_voice_config(
@@ -591,6 +608,10 @@ class CompanionRuntime:
             component_specs.append(
                 ("audio-comprehension", self._process_audio_comprehension)
             )
+        if self.config.identity.temporal_vlm_comparison_enabled:
+            component_specs.append(
+                ("temporal-person-vlm", self._process_person_comparisons)
+            )
         tasks = camera_tasks + [
             asyncio.create_task(self._run_component(name, component), name=name)
             for name, component in component_specs
@@ -844,6 +865,10 @@ class CompanionRuntime:
         detections, semantic_labels = vision.analyze(frame, include_pose, include_semantics)
         detections = self._apply_object_recalls(camera_id, detections)
         matches = self.identities.observe(camera_id, frame, detections, vision)
+        for match in matches.values():
+            comparison = match.pop("_temporal_comparison", None)
+            if isinstance(comparison, dict):
+                self._stage_person_comparison(comparison)
         detections = tuple(
             replace(
                 detection,
@@ -860,6 +885,9 @@ class CompanionRuntime:
                     "identity_outcome": matches[index]["resolver_outcome"],
                     "identity_confidence_components": matches[index]["confidence_components"],
                     "identity_persistent": matches[index].get("persistent", True),
+                    "identity_temporal_association": matches[index].get(
+                        "temporal_association", {}
+                    ),
                 },
             )
             if index in matches
@@ -873,6 +901,247 @@ class CompanionRuntime:
             semantic_labels=semantic_labels,
             microphone_direction=self._direction.latest_angle(),
         )
+
+    def _stage_person_comparison(self, candidate: dict[str, object]) -> None:
+        try:
+            prior_png = candidate["prior_png"]
+            current_png = candidate["current_png"]
+            captured_at = datetime.fromisoformat(str(candidate["captured_at"]))
+            if not isinstance(prior_png, bytes) or not isinstance(current_png, bytes):
+                return
+            job = _PersonComparisonJob(
+                candidate_id=str(candidate["candidate_id"]),
+                track_id=str(candidate["track_id"]),
+                entity_id=str(candidate["entity_id"]),
+                prior_entity_id=str(candidate["prior_entity_id"]),
+                camera_id=str(candidate["camera_id"]),
+                captured_at=captured_at,
+                prior_png=prior_png,
+                current_png=current_png,
+                geometry=dict(candidate.get("geometry") or {}),
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        coalesced = False
+        with self._person_comparison_lock:
+            if len(self._person_comparison_candidates) == self._person_comparison_candidates.maxlen:
+                self._person_comparison_candidates.popleft()
+                coalesced = True
+            self._person_comparison_candidates.append(job)
+        if coalesced:
+            self.telemetry.record_identity_continuity(
+                "coalesced", candidate_id=job.candidate_id,
+                entity_id=job.entity_id, camera_id=job.camera_id,
+            )
+        self.telemetry.record_identity_continuity(
+            "queued", candidate_id=job.candidate_id,
+            entity_id=job.entity_id, camera_id=job.camera_id,
+            geometry=job.geometry,
+        )
+
+    async def _process_person_comparisons(self) -> None:
+        while True:
+            job = None
+            with self._person_comparison_lock:
+                if self._person_comparison_candidates:
+                    job = self._person_comparison_candidates.popleft()
+            if job is None:
+                await asyncio.sleep(0.2)
+                continue
+            started = time.monotonic()
+            self.telemetry.record_identity_continuity(
+                "running", candidate_id=job.candidate_id,
+                entity_id=job.entity_id, camera_id=job.camera_id,
+                geometry=job.geometry,
+            )
+            try:
+                analysis = await self._omnius.compare_temporal_person_detections(
+                    job.prior_png, job.current_png, job.geometry
+                )
+                event = await asyncio.to_thread(
+                    self._person_comparison_memory_event, job, analysis
+                )
+                if event is not None:
+                    # asyncio.Queue mutation stays on its owning event loop.
+                    self._queue_memory_event(event)
+                self.telemetry.record_identity_continuity(
+                    "completed",
+                    candidate_id=job.candidate_id,
+                    entity_id=job.entity_id,
+                    camera_id=job.camera_id,
+                    geometry=job.geometry,
+                    analysis=analysis,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "temporal person VLM comparison unavailable for %s: %s",
+                    job.candidate_id,
+                    error,
+                )
+                self.telemetry.record_identity_continuity(
+                    "error",
+                    candidate_id=job.candidate_id,
+                    entity_id=job.entity_id,
+                    camera_id=job.camera_id,
+                    geometry=job.geometry,
+                    detail=f"{type(error).__name__}: {error}",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+
+    def _person_comparison_memory_event(
+        self, job: _PersonComparisonJob, analysis: dict[str, object]
+    ) -> PerceptualEvent | None:
+        if self._memory is None:
+            return None
+        media_key = None
+        media_checksum = None
+        if self.config.memory.retain_raw_media:
+            try:
+                comparison_png = self._person_comparison_contact_sheet(
+                    job.prior_png, job.current_png
+                )
+                media_key, media_checksum = self._memory.persist_media(
+                    f"identity-continuity/{job.captured_at:%Y/%m/%d}/"
+                    f"{job.candidate_id}.png",
+                    comparison_png,
+                )
+            except Exception as error:
+                logger.warning(
+                    "temporal identity comparison artifact could not be retained: %s",
+                    error,
+                )
+        geometry_confidence = max(
+            float(job.geometry.get("mask_iou") or 0),
+            float(job.geometry.get("mask_containment") or 0),
+        )
+        evidence = EvidenceRef(
+            str(uuid4()),
+            "vision",
+            job.captured_at,
+            "ornith-temporal-person",
+            job.camera_id,
+            media_key=media_key,
+            quality=max(geometry_confidence, float(analysis.get("confidence") or 0)),
+            metadata={
+                "candidate_id": job.candidate_id,
+                "track_id": job.track_id,
+                "identity_id": job.entity_id,
+                "prior_identity_id": job.prior_entity_id,
+                "decision": "single_temporal_entity",
+                "geometry_authority": True,
+                "geometry": job.geometry,
+                "vlm_model": self.config.omnius.vision_model,
+                "vlm_same_person": bool(analysis.get("same_person")),
+                "vlm_confidence": analysis.get("confidence"),
+                "analysis": analysis.get("analysis"),
+                "displacement_analysis": analysis.get("displacement_analysis"),
+                "visible_correspondences": analysis.get("visible_correspondences", []),
+                **({"_media_checksum": media_checksum} if media_checksum else {}),
+            },
+        )
+        entity_ids = tuple(
+            dict.fromkeys((job.prior_entity_id, job.entity_id))
+        )
+        entities = [
+            {
+                "id": entity_id,
+                "type": "person" if entity_id.startswith("person-") else "appearance_track",
+                "confidence": geometry_confidence,
+                "source": "temporal-mask-continuity",
+            }
+            for entity_id in entity_ids
+        ]
+        relations = (
+            [
+                {
+                    "source_id": job.prior_entity_id,
+                    "relation": "temporally_continues_as",
+                    "target_id": job.entity_id,
+                    "confidence": geometry_confidence,
+                    "metadata": {
+                        "candidate_id": job.candidate_id,
+                        "vlm_same_person": bool(analysis.get("same_person")),
+                    },
+                }
+            ]
+            if job.prior_entity_id != job.entity_id else []
+        )
+        alias = (
+            {
+                "alias_id": job.prior_entity_id,
+                "canonical_id": job.entity_id,
+                "similarity": geometry_confidence,
+                "reason": (
+                    "adjacent_mask_overlap_vlm_confirmed"
+                    if analysis.get("same_person")
+                    else "adjacent_mask_overlap_geometry_with_vlm_disagreement"
+                ),
+            }
+            if job.prior_entity_id != job.entity_id else None
+        )
+        return PerceptualEvent(
+            str(uuid4()),
+            "identity",
+            job.captured_at,
+            "temporal-person-continuity",
+            (evidence,),
+            entity_ids,
+            payload={
+                "labels": ["temporal person continuity"],
+                "entities": entities,
+                "relations": relations,
+                "identity_alias": alias,
+                "skip_pairwise_co_observation": True,
+            },
+        )
+
+    @staticmethod
+    def _person_comparison_contact_sheet(
+        prior_png: bytes, current_png: bytes
+    ) -> bytes:
+        import cv2
+
+        def decode(payload: bytes, label: str) -> np.ndarray:
+            image = cv2.imdecode(
+                np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+            )
+            if image is None:
+                raise ValueError("invalid person comparison PNG")
+            if image.ndim == 3 and image.shape[2] == 4:
+                alpha = image[:, :, 3:4].astype(np.float32) / 255
+                image = (
+                    image[:, :, :3].astype(np.float32) * alpha
+                    + np.full_like(image[:, :, :3], 12, dtype=np.float32) * (1 - alpha)
+                ).astype(np.uint8)
+            elif image.ndim == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            image = cv2.copyMakeBorder(
+                image, 30, 4, 4, 4, cv2.BORDER_CONSTANT, value=(7, 9, 12)
+            )
+            cv2.putText(
+                image, label, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (0, 174, 255), 1, cv2.LINE_AA,
+            )
+            return image
+
+        prior = decode(prior_png, "PRIOR MASK")
+        current = decode(current_png, "CURRENT MASK")
+        target_height = max(prior.shape[0], current.shape[0])
+
+        def pad(image: np.ndarray) -> np.ndarray:
+            bottom = target_height - image.shape[0]
+            return cv2.copyMakeBorder(
+                image, 0, bottom, 0, 0, cv2.BORDER_CONSTANT, value=(7, 9, 12)
+            )
+
+        sheet = np.hstack((pad(prior), pad(current)))
+        success, encoded = cv2.imencode(".png", sheet)
+        if not success:
+            raise RuntimeError("failed to encode person comparison contact sheet")
+        return encoded.tobytes()
 
     async def _attend(self) -> None:
         while True:

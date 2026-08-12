@@ -8,6 +8,7 @@ Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker di
 - Runs open-vocabulary YOLOE instance segmentation, pose estimation, and coarse actions (`standing`, `seated`, `waving`).
 - Keeps raw MJPEG camera streams independent from asynchronous SVG mask/label overlays.
 - Runs CLIP scene classification, anonymous person recall, masked-object recall, and sparse Ornith Vision correction.
+- Reuses one person entity when adjacent same-camera instance masks strongly overlap, then records a local Ornith visual-continuity and displacement audit from the two masked crops.
 - Persists source-grounded entities, episodes, evidence, claims, revisions, graph edges, and embeddings in local SQLite WAL storage.
 - Uses prediction residuals, habituation, communicative action, and deterministic interruption policy rather than frame-count novelty.
 - Captures the ReSpeaker XVF3000's processed AEC/beamformed ASR channel with adaptive WebRTC-VAD turn boundaries, native DSP VAD/DoA/AEC/AGC/RT60 telemetry, listen/think/speak LED states, and revisioned semantic barge-in with tail-only WAV resume.
@@ -68,6 +69,14 @@ Transcription and sound understanding are deliberately separate. ASR stays on th
 Omnius also exposes an `audio_analyze/comprehend` role pipeline. On this installation its AV sidecar roles currently report `mock semantic scaffold`; those event labels are never persisted or shown as perception. Egg admits only the independent numeric YAMNet classifier and locally measured WAV facts until the sidecar reports live roles. Classification runs behind ASR, so a cold TensorFlow/model load cannot add latency to the current spoken response.
 
 Every admitted utterance now supplies a durable context ID to its audio evidence, visual/web tool invocations, retrieval influences, user corrections, preferred-name bindings, learned-object labels, audio classifications, and agent action evidence. The Voice page renders those as live tags on the same historical turn—for example `fresh vision ✓`, `memory recall ×4`, `remembered name: Troy`, `label updated: amber mug`, or `Speech 67%`. Late asynchronous evidence updates the existing message in place and survives daemon restarts; it does not reset the page or create a second fake heard turn.
+
+## Temporal person continuity
+
+Short-term identity follows same-camera instance-mask geometry before detector numbering. When a person mask in a later frame exceeds either `track_mask_iou_threshold` or `track_mask_containment_threshold` within `track_mask_max_gap_seconds`, the observation reuses the existing track and, if enrolled, its canonical person profile—even when its bounding box has jumped far enough to receive a new detector label. A track can be assigned only once per frame, so two simultaneous people cannot be collapsed through the same prior mask.
+
+Strong mask continuity queues two transparent masked crops for local `robit/ornith-vision:9b` comparison. Ornith reports bounded JSON containing the visible continuity cues, confidence, and a displacement narrative; geometry remains the realtime authority so a slow or unavailable VLM cannot fragment tracking. The comparison contact sheet and analysis become evidence on the single canonical entity, transient-to-canonical aliases are projected automatically into memory, and the People page exposes the recent merge ledger. The queue and per-track cooldown are bounded so identity auditing cannot block camera inference or build an unbounded VLM backlog.
+
+## Offline identity dreams
 
 Identity dreams use pinned AdaFace IR18/WebFace4M and InsightFace MobileFaceNet
 checkpoints locally and offline. Bootstrap them explicitly on a new installation; the randomized idle

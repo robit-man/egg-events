@@ -128,6 +128,16 @@ class RuntimeTelemetry:
         self._graph_activation_sequence = 0
         self._graph_activations: list[dict[str, object]] = []
         self._identity_dialogue: dict[str, object] = {"state": "idle"}
+        self._identity_continuity: dict[str, object] = {
+            "state": "idle",
+            "queued": 0,
+            "completed": 0,
+            "coalesced": 0,
+            "disagreements": 0,
+            "errors": 0,
+            "last": None,
+            "recent": [],
+        }
         self._consolidation: dict[str, object] = {}
         self._retrieval_hits: list[dict[str, object]] = []
         self._microphone_direction: float | None = None
@@ -489,6 +499,50 @@ class RuntimeTelemetry:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
+    def record_identity_continuity(
+        self,
+        stage: str,
+        *,
+        candidate_id: str,
+        entity_id: str,
+        camera_id: str,
+        geometry: dict[str, object] | None = None,
+        analysis: dict[str, object] | None = None,
+        detail: str | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        with self._lock:
+            counter = "errors" if stage == "error" else stage
+            if counter in {"queued", "completed", "coalesced", "errors"}:
+                self._identity_continuity[counter] = int(
+                    self._identity_continuity.get(counter) or 0
+                ) + 1
+            if (
+                stage == "completed"
+                and isinstance(analysis, dict)
+                and analysis.get("same_person") is False
+            ):
+                self._identity_continuity["disagreements"] = int(
+                    self._identity_continuity.get("disagreements") or 0
+                ) + 1
+            record = {
+                "state": stage,
+                "candidate_id": candidate_id,
+                "entity_id": entity_id,
+                "camera_id": camera_id,
+                "geometry": dict(geometry or {}),
+                "analysis": dict(analysis or {}),
+                "detail": str(detail)[:500] if detail else None,
+                "duration_ms": round(duration_ms, 1) if duration_ms is not None else None,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._identity_continuity["state"] = stage
+            self._identity_continuity["last"] = record
+            if stage in {"completed", "error"}:
+                recent = list(self._identity_continuity["recent"])
+                recent.append(record)
+                self._identity_continuity["recent"] = recent[-20:]
+
     def record_brain_tick(self, tick) -> None:
         """Sensing/cognition regions of the composed CognitiveArchitecture perceive
         pass (egg_companion/cognition/architecture.py). The memory region is not
@@ -583,6 +637,9 @@ class RuntimeTelemetry:
                 "identity_sightings": detection.attributes.get("identity_sightings"),
                 "identity_outcome": detection.attributes.get("identity_outcome"),
                 "identity_confidence_components": detection.attributes.get("identity_confidence_components"),
+                "identity_temporal_association": detection.attributes.get(
+                    "identity_temporal_association"
+                ),
                 "base_label": detection.attributes.get("base_label"),
                 "object_id": detection.attributes.get("object_id"),
                 "object_recall_confidence": detection.attributes.get("object_recall_confidence"),
@@ -748,6 +805,17 @@ class RuntimeTelemetry:
                     "events": [dict(event) for event in self._graph_activations],
                 },
                 "identity_dialogue": dict(self._identity_dialogue),
+                "identity_continuity": {
+                    **self._identity_continuity,
+                    "last": (
+                        dict(self._identity_continuity["last"])
+                        if isinstance(self._identity_continuity["last"], dict)
+                        else None
+                    ),
+                    "recent": [
+                        dict(item) for item in self._identity_continuity["recent"]
+                    ],
+                },
                 "consolidation": dict(self._consolidation),
                 "retrieval_hits": list(self._retrieval_hits),
                 "seen": seen,

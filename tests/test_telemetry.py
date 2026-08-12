@@ -103,6 +103,48 @@ def test_tool_and_identity_dialogue_are_observable() -> None:
     assert updated["success"] is True
 
 
+def test_temporal_identity_continuity_exposes_geometry_and_vlm_analysis() -> None:
+    config = make_config()
+    telemetry = RuntimeTelemetry(config)
+    geometry = {
+        "mask_iou": 0.72,
+        "mask_containment": 0.91,
+        "centroid_dx_pixels": 18.0,
+        "centroid_dy_pixels": -3.0,
+    }
+    analysis = {
+        "same_person": True,
+        "confidence": 0.94,
+        "analysis": "Visible clothing and carried object remain consistent.",
+        "displacement_analysis": "The instance moves right and slightly upward.",
+    }
+
+    telemetry.record_identity_continuity(
+        "queued",
+        candidate_id="candidate-1",
+        entity_id="person-001",
+        camera_id="front",
+        geometry=geometry,
+    )
+    telemetry.record_identity_continuity(
+        "completed",
+        candidate_id="candidate-1",
+        entity_id="person-001",
+        camera_id="front",
+        geometry=geometry,
+        analysis=analysis,
+        duration_ms=44.44,
+    )
+    snapshot = telemetry.snapshot(config)["identity_continuity"]
+
+    assert snapshot["queued"] == 1
+    assert snapshot["completed"] == 1
+    assert snapshot["disagreements"] == 0
+    assert snapshot["recent"][-1]["geometry"] == geometry
+    assert snapshot["recent"][-1]["analysis"] == analysis
+    assert snapshot["recent"][-1]["duration_ms"] == 44.4
+
+
 def test_graph_activations_are_causal_bounded_and_use_real_graph_ids() -> None:
     config = make_config()
     telemetry = RuntimeTelemetry(config)
@@ -144,7 +186,13 @@ def test_inference_updates_never_rewrite_raw_camera_stream() -> None:
                 "mug",
                 0.8,
                 BoundingBox(10, 20, 100, 200),
-                {"mask_polygon": [[10, 20], [100, 20], [100, 200], [10, 200]]},
+                {
+                    "mask_polygon": [[10, 20], [100, 20], [100, 200], [10, 200]],
+                    "identity_temporal_association": {
+                        "basis": "mask_overlap",
+                        "mask_iou": 0.88,
+                    },
+                },
             ),
         ),
     )
@@ -156,3 +204,7 @@ def test_inference_updates_never_rewrite_raw_camera_stream() -> None:
     assert camera["frame_sequence"] == 1
     assert camera["detection_sequence"] == 1
     assert camera["detections"][0]["mask_polygon"]
+    assert camera["detections"][0]["identity_temporal_association"] == {
+        "basis": "mask_overlap",
+        "mask_iou": 0.88,
+    }

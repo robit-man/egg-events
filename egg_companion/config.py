@@ -195,6 +195,12 @@ class IdentityConfig(BaseModel):
     track_ttl_seconds: float = Field(default=8.0, gt=0, le=120)
     track_iou_threshold: float = Field(default=0.18, ge=0, le=1)
     track_center_distance: float = Field(default=0.65, gt=0, le=3)
+    track_mask_iou_threshold: float = Field(default=0.30, ge=0, le=1)
+    track_mask_containment_threshold: float = Field(default=0.70, ge=0, le=1)
+    track_mask_max_gap_seconds: float = Field(default=8.0, gt=0, le=30)
+    temporal_vlm_comparison_enabled: bool = True
+    temporal_vlm_queue_size: int = Field(default=2, ge=1, le=16)
+    temporal_vlm_cooldown_seconds: float = Field(default=15.0, ge=0, le=3600)
     sample_interval_seconds: float = Field(default=15, gt=0)
     gallery_max_samples: int = Field(default=8, ge=2, le=32)
     gallery_diversity_similarity: float = Field(default=0.985, ge=0, le=1)

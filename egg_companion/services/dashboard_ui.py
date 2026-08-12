@@ -556,6 +556,7 @@ PAGE = r"""<!doctype html>
           <div class="page-heading"><div><h2>People and objects</h2><p>Identity evidence, segmented-object learning, and review status.</p></div></div>
           <div class="grid">
             <article class="card span-12"><div class="identity-toolbar"><div><h3 class="card-title">People <span id="people-count" class="muted"></span></h3><p class="card-note">Select a person to inspect every encounter and retained artifact</p></div><input id="people-search" class="input search" type="search" placeholder="Filter people"></div><div id="identities" class="identity-grid"><div class="empty">No validated face crops yet.</div></div><section id="person-inspector" class="person-inspector" aria-live="polite" hidden></section></article>
+            <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Temporal person continuity</h3><p class="card-note">Adjacent mask overlap, spatial displacement, and Ornith visual comparison behind automatic single-entity tracking</p></div><div id="identity-continuity-state" class="badge-row"></div></div><div id="identity-continuity-ledger" class="table-wrap"><div class="empty">No dislocated mask merges yet.</div></div></article>
             <article class="card span-12"><div class="identity-toolbar"><div><h3 class="card-title">Segmented objects <span id="objects-count" class="muted"></span></h3><p class="card-note">Labels, confidence, provenance, and review state</p></div><input id="objects-search" class="input search" type="search" placeholder="Filter objects"></div><div id="object-learning-state" class="badge-row" style="margin-bottom:12px"></div><div id="objects" class="identity-grid"><div class="empty">No learned objects yet.</div></div></article>
           </div>
         </section>
@@ -654,6 +655,7 @@ PAGE = r"""<!doctype html>
     let lastWave = [];
     let lastPeopleSignature = '';
     let lastObjectSignature = '';
+    let lastContinuitySignature = '';
     let selectedPersonId = new URLSearchParams(location.search).get('person') || '';
     let personTimelineLoading = false;
     let personTimelineRevision = 0;
@@ -881,7 +883,7 @@ PAGE = r"""<!doctype html>
     }
     function renderEntities(state) {
       const people = state.identities || [], objects = state.objects || [], learning = state.telemetry?.object_learning || {};
-      const identity = state.identity_summary || {};
+      const identity = state.identity_summary || {}, continuity = state.telemetry?.identity_continuity || {};
       $('#people-count').textContent = `(${identity.named_people || 0} named · ${identity.recurrent_face_profiles || 0} recurrent · ${identity.provisional_face_profiles || 0} provisional)`; $('#objects-count').textContent = `(${objects.length})`;
       const peopleQuery = $('#people-search').value.trim().toLowerCase();
       const visiblePeople = people.filter(item => `${item.label || ''} ${item.id || ''}`.toLowerCase().includes(peopleQuery)).slice(0, 48);
@@ -890,6 +892,22 @@ PAGE = r"""<!doctype html>
       const objectQuery = $('#objects-search').value.trim().toLowerCase(); const visibleObjects = objects.filter(item => `${item.label || ''} ${item.id || ''}`.toLowerCase().includes(objectQuery)).slice(0, 48);
       const objectSignature = JSON.stringify(visibleObjects.map(item => [item.id,item.label,item.confidence,item.samples,item.last_seen,item.review_state]));
       if (objectSignature !== lastObjectSignature) { lastObjectSignature = objectSignature; $('#objects').innerHTML = visibleObjects.map(object => `<article class="identity-card"><img src="${esc(object.thumbnail_url)}?t=${encodeURIComponent(object.last_seen || '')}" alt="${esc(object.label || 'Object')} crop"><div class="identity-body"><div class="identity-title">${esc(object.label || object.id)}</div><div class="identity-detail">${Math.round(Number(object.label_confidence || object.confidence || 0) * 100)}% · ${esc(object.samples || 0)} samples<br>${esc(object.last_match_state || object.review_state || 'pending')} · ${esc(object.label_source || 'unknown')}</div></div></article>`).join('') || '<div class="empty">No matching objects.</div>'; }
+      const continuitySignature = JSON.stringify(continuity);
+      if (continuitySignature !== lastContinuitySignature) {
+        lastContinuitySignature = continuitySignature;
+        $('#identity-continuity-state').innerHTML = `<span class="badge ${continuity.state === 'error' ? 'bad' : continuity.completed ? 'good' : ''}">${esc(stateLabel(continuity.state || 'idle'))}</span><span class="badge">${esc(continuity.completed || 0)} analyzed</span><span class="badge">${esc(continuity.queued || 0)} queued</span><span class="badge ${continuity.disagreements ? 'warn' : ''}">${esc(continuity.disagreements || 0)} VLM disagreements</span><span class="badge ${continuity.errors ? 'bad' : ''}">${esc(continuity.errors || 0)} errors</span>`;
+        const continuityRows = (continuity.recent || []).slice().reverse().map(item => {
+          const geometry = item.geometry || {}, analysis = item.analysis || {};
+          return [
+            `<strong>${esc(item.entity_id || 'person')}</strong><div class="muted mono">${esc(item.camera_id || 'camera')}</div>`,
+            `mask IoU ${Number(geometry.mask_iou || 0).toFixed(3)} · containment ${Number(geometry.mask_containment || 0).toFixed(3)}<br><span class="muted">Δ ${Number(geometry.centroid_dx_pixels || 0).toFixed(1)}, ${Number(geometry.centroid_dy_pixels || 0).toFixed(1)} px · ${Number(geometry.elapsed_seconds || 0).toFixed(2)} s</span>`,
+            `${statusBadge(analysis.same_person === false ? 'review' : 'consolidated')} ${esc(analysis.analysis || item.detail || 'analysis pending')}`,
+            esc(analysis.displacement_analysis || 'No VLM displacement narrative'),
+            esc(formatTime(item.at)),
+          ];
+        });
+        $('#identity-continuity-ledger').innerHTML = table(['Entity','Mask / displacement','VLM comparison','Displacement analysis','Time'], continuityRows, 'No dislocated mask merges yet');
+      }
       $('#object-learning-state').innerHTML = `<span class="badge">${esc(learning.stable_candidates || 0)} stable</span><span class="badge">${esc(learning.clip_recalls || 0)}/${esc(learning.clip_queries || 0)} CLIP</span><span class="badge">${esc(learning.vlm_successes || 0)}/${esc(learning.vlm_requests || 0)} VLM</span><span class="badge">${esc(learning.ocr_hits || 0)}/${esc(learning.ocr_requests || 0)} OCR</span><span class="badge ${learning.vlm_errors ? 'bad' : ''}">${esc(learning.vlm_errors || 0)} errors</span>`;
       if (selectedPersonId && $('#person-inspector').hidden && !personTimelineLoading) loadPersonTimeline(selectedPersonId);
     }
@@ -1121,7 +1139,7 @@ PAGE = r"""<!doctype html>
       if (!evidence.length) { $('#graph-evidence').innerHTML = '<div class="empty">This node has no retained evidence artifact yet.</div>'; return; }
       $('#graph-evidence').innerHTML = `<div class="graph-evidence-grid">${evidence.map(item => {
         const payload = item.payload || {}, modality = String(item.modality || 'evidence'), artifact = item.artifact_url || (item.media_key ? `/api/memory/evidence/${encodeURIComponent(item.evidence_id)}/media` : '');
-        const text = payload.transcript || payload.text || payload.summary || (payload.detections ? JSON.stringify(payload.detections, null, 2) : '');
+        const text = payload.transcript || payload.text || payload.summary || (payload.analysis ? `${payload.analysis}${payload.displacement_analysis ? `\n${payload.displacement_analysis}` : ''}` : '') || (payload.detections ? JSON.stringify(payload.detections, null, 2) : '');
         const media = artifact && ['speech','audio'].includes(modality) ? `<audio controls preload="metadata" src="${esc(artifact)}"></audio>` : artifact && ['vision','image','ocr'].includes(modality) ? `<img loading="lazy" src="${esc(artifact)}" alt="Retained ${esc(modality)} evidence">` : '';
         return `<article class="graph-evidence-item"><div class="badge-row"><span class="badge">${esc(modality)}</span><span class="badge">${esc(item.role || item.source_type || 'evidence')}</span></div><div class="card-note" style="margin-top:8px">${esc(new Date(item.captured_at).toLocaleString())} · ${Math.round(Number(item.quality || 0) * 100)}%</div>${media}${text ? `<div class="graph-evidence-text">${esc(text)}</div>` : ''}<div class="muted mono" style="margin-top:8px">${esc(item.evidence_id)}</div></article>`;
       }).join('')}</div>`;

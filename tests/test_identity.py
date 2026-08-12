@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from egg_companion.adapters.vision import FaceCrop
+from egg_companion.adapters.vision import FaceCrop, VisionEngine
 from egg_companion.config import IdentityConfig
 from egg_companion.models import BoundingBox, Detection
 from egg_companion.services.identity import IdentityLibrary
@@ -31,6 +31,13 @@ class _AppearanceVision:
     @staticmethod
     def embed_image(frame: np.ndarray) -> np.ndarray:
         raise AssertionError("CLIP must not be used to create a person identity")
+
+    def segment_detection(
+        self, frame: np.ndarray, detection: Detection
+    ):
+        return VisionEngine.segment_detection(self, frame, detection)  # type: ignore[arg-type]
+
+    encode_segmented_object = staticmethod(VisionEngine.encode_segmented_object)
 
 
 class IdentityLibraryTests(unittest.TestCase):
@@ -62,6 +69,84 @@ class IdentityLibraryTests(unittest.TestCase):
             self.assertFalse(first["persistent"])
             self.assertEqual(library.migration_profiles(), [])
             self.assertEqual(library.summary()["legacy_appearance_fragments"], 0)
+
+    def test_overlapping_instance_masks_bridge_dislocated_person_boxes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(
+                IdentityConfig(
+                    storage_dir=directory,
+                    temporal_vlm_cooldown_seconds=0,
+                )
+            )
+            vision = _AppearanceVision()
+            frame = np.full((100, 100, 3), 96, dtype=np.uint8)
+            first_detection = Detection(
+                "person",
+                0.95,
+                BoundingBox(0, 0, 30, 95),
+                {
+                    "mask_polygon": [[10, 4], [70, 4], [70, 94], [10, 94]],
+                    "frame_shape": [100, 100, 3],
+                },
+            )
+            dislocated_detection = Detection(
+                "person",
+                0.95,
+                BoundingBox(60, 0, 90, 95),
+                {
+                    "mask_polygon": [[15, 4], [75, 4], [75, 94], [15, 94]],
+                    "frame_shape": [100, 100, 3],
+                },
+            )
+
+            first = library.observe("front", frame, (first_detection,), vision)[0]
+            continued = library.observe(
+                "front", frame, (dislocated_detection,), vision
+            )[0]
+
+            self.assertEqual(continued["id"], first["id"])
+            self.assertEqual(continued["temporal_association"]["basis"], "mask_overlap")
+            self.assertEqual(continued["temporal_association"]["bbox_iou"], 0)
+            self.assertGreater(continued["temporal_association"]["mask_iou"], 0.8)
+            comparison = continued["_temporal_comparison"]
+            self.assertEqual(comparison["entity_id"], first["id"])
+            self.assertEqual(comparison["prior_entity_id"], first["id"])
+            self.assertEqual(
+                comparison["geometry"]["centroid_dx_pixels"], 60.0
+            )
+            self.assertFalse(
+                comparison["geometry"]["simultaneous_distinct_mask_conflict"]
+            )
+
+    def test_simultaneous_person_masks_never_reuse_one_track_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            vision = _AppearanceVision()
+            frame = np.full((100, 100, 3), 96, dtype=np.uint8)
+
+            def person(left: int, right: int) -> Detection:
+                return Detection(
+                    "person",
+                    0.95,
+                    BoundingBox(left, 0, right, 95),
+                    {
+                        "mask_polygon": [
+                            [left, 4], [right, 4], [right, 94], [left, 94]
+                        ],
+                        "frame_shape": [100, 100, 3],
+                    },
+                )
+
+            prior = library.observe("front", frame, (person(5, 85),), vision)[0]
+            current = library.observe(
+                "front", frame, (person(8, 82), person(12, 88)), vision
+            )
+
+            self.assertEqual(current[0]["id"], prior["id"])
+            self.assertNotEqual(current[1]["id"], prior["id"])
+            self.assertEqual(
+                current[1]["temporal_association"]["basis"], "new_track"
+            )
 
     def test_face_profile_is_recalled_after_database_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

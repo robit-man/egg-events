@@ -13,6 +13,32 @@ def test_vlm_object_response_requires_bounded_json_label() -> None:
     assert OmniusClient.parse_object_classification('{"label":"mug","confidence":1.2}') is None
 
 
+def test_temporal_person_comparison_requires_bounded_explainable_json() -> None:
+    response = (
+        '{"same_person":true,"confidence":0.93,'
+        '"analysis":"The dark jacket and carried cup persist across both masks.",'
+        '"displacement_analysis":"The mask centroid moves 18 px right and 3 px down.",'
+        '"visible_correspondences":["dark jacket","same carried cup"]}'
+    )
+
+    assert OmniusClient.parse_temporal_person_comparison(response) == {
+        "same_person": True,
+        "confidence": 0.93,
+        "analysis": "The dark jacket and carried cup persist across both masks.",
+        "displacement_analysis": "The mask centroid moves 18 px right and 3 px down.",
+        "visible_correspondences": ["dark jacket", "same carried cup"],
+    }
+    assert OmniusClient.parse_temporal_person_comparison("same person") is None
+    assert OmniusClient.parse_temporal_person_comparison(
+        '{"same_person":true,"confidence":1.2,"analysis":"same",'
+        '"displacement_analysis":"right"}'
+    ) is None
+    assert OmniusClient.parse_temporal_person_comparison(
+        '{"same_person":"yes","confidence":0.8,"analysis":"same",'
+        '"displacement_analysis":"right"}'
+    ) is None
+
+
 def test_audio_classification_parser_accepts_only_numeric_yamnet_output() -> None:
     output = (
         'Audio scene classification:\n'

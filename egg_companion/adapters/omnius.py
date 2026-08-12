@@ -976,6 +976,115 @@ class OmniusClient:
             raise RuntimeError("Omnius VLM returned an invalid completion") from error
         return self.parse_object_classification(content)
 
+    async def compare_temporal_person_detections(
+        self,
+        prior_png: bytes,
+        current_png: bytes,
+        geometry: dict[str, object],
+    ) -> dict[str, object]:
+        """Audit adjacent same-camera person-mask continuity with local Ornith.
+
+        Geometry owns short-term tracking; this comparison produces inspectable
+        visual and displacement reasoning. It is not face recognition and must
+        not infer identity, demographics, or other sensitive attributes.
+        """
+        payload = {
+            "model": self.config.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "These are two transparent-background instance-mask crops from "
+                        "the same camera a few frames apart. Determine whether they show "
+                        "one continuous physical person detection. Compare only visible, "
+                        "non-sensitive continuity cues such as silhouette, clothing colors, "
+                        "carried items, pose transition, and the supplied mask geometry. "
+                        "Do not name the person or infer demographics, emotion, health, or "
+                        "other sensitive traits. Keep analysis at most 45 words and "
+                        "displacement_analysis at most 30 words. Return exactly these four "
+                        "JSON fields and no prose: "
+                        '{"same_person":boolean,"confidence":number,'
+                        '"analysis":string,"displacement_analysis":string}. '
+                        "Image 1 is prior; image 2 is current. Geometry: "
+                        f"{json.dumps(geometry, sort_keys=True)[:1800]}"
+                    ),
+                    "images": [
+                        base64.b64encode(prior_png).decode("ascii"),
+                        base64.b64encode(current_png).decode("ascii"),
+                    ],
+                }
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 260},
+            "keep_alive": "5m",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with self._model_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
+                    json=payload,
+                ) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(
+                            f"Ornith temporal-person comparison HTTP {response.status}: {detail}"
+                        )
+                    result = await response.json()
+        try:
+            content = result["message"]["content"]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(
+                "Ornith temporal-person comparison returned an invalid completion"
+            ) from error
+        parsed = self.parse_temporal_person_comparison(content)
+        if parsed is None:
+            raise RuntimeError(
+                "Ornith temporal-person comparison returned invalid analysis JSON"
+            )
+        return parsed
+
+    @staticmethod
+    def parse_temporal_person_comparison(
+        content: object,
+    ) -> dict[str, object] | None:
+        if not isinstance(content, str):
+            return None
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        same_person = parsed.get("same_person")
+        confidence = parsed.get("confidence")
+        analysis = parsed.get("analysis")
+        displacement = parsed.get("displacement_analysis")
+        if (
+            not isinstance(same_person, bool)
+            or not isinstance(confidence, (int, float))
+            or not isinstance(analysis, str)
+            or not isinstance(displacement, str)
+            or not 0 <= float(confidence) <= 1
+        ):
+            return None
+        normalized_analysis = " ".join(analysis.split())[:600]
+        normalized_displacement = " ".join(displacement.split())[:400]
+        if not normalized_analysis or not normalized_displacement:
+            return None
+        correspondences = parsed.get("visible_correspondences")
+        return {
+            "same_person": same_person,
+            "confidence": float(confidence),
+            "analysis": normalized_analysis,
+            "displacement_analysis": normalized_displacement,
+            "visible_correspondences": [
+                " ".join(str(item).split())[:160]
+                for item in correspondences[:8]
+                if isinstance(item, str) and item.strip()
+            ] if isinstance(correspondences, list) else [],
+        }
+
     async def answer_visual_question(
         self, image_jpeg: bytes, utterance: str, scene: str
     ) -> str | None:

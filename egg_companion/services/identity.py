@@ -45,6 +45,10 @@ class _PersonTrack:
     profile_id: str | None = None
     kind: str = "appearance-track"
     face_embeddings: list[np.ndarray] = field(default_factory=list)
+    mask_polygon: tuple[tuple[float, float], ...] = ()
+    frame_shape: tuple[int, int] | None = None
+    last_crop_png: bytes | None = None
+    last_vlm_comparison_at: datetime | None = None
 
 
 class IdentityLibrary:
@@ -86,11 +90,39 @@ class IdentityLibrary:
         for index, detection in enumerate(detections):
             if detection.label != "person":
                 continue
-            track, new_track = self._associate_track(camera_id, detection.bbox, now, used_tracks)
+            track, new_track, association = self._associate_track(
+                camera_id, detection, now, used_tracks
+            )
             used_tracks.add(track.track_id)
+            prior_crop = track.last_crop_png
+            current_crop = self._segmented_person_png(frame, detection, vision)
+            comparison = self._temporal_comparison_candidate(
+                track,
+                detection,
+                association,
+                prior_crop,
+                current_crop,
+                now,
+                new_track,
+            )
+            self._advance_track(track, detection, current_crop, now, new_track)
+
+            def attach(match: dict[str, object]) -> dict[str, object]:
+                match["temporal_association"] = {
+                    key: value
+                    for key, value in association.items()
+                    if key != "score"
+                }
+                if comparison is not None:
+                    comparison["entity_id"] = str(match["id"])
+                    match["_temporal_comparison"] = comparison
+                return match
+
             faces = vision.face_crops(frame, detection)
             if not faces:
-                matches[index] = self._track_match(track, detection.confidence, new_track)
+                matches[index] = attach(
+                    self._track_match(track, detection.confidence, new_track)
+                )
                 continue
             face = max(faces, key=lambda item: item.image.shape[0] * item.image.shape[1])
             face_embedding = (
@@ -104,12 +136,18 @@ class IdentityLibrary:
                     profile = self._profiles.get(track.profile_id)
                 if profile is not None:
                     self._update_profile(profile, camera_id, vision, face, now, similarity=1.0)
-                    matches[index] = self._profile_match(profile, False, 1.0, "track_continuity")
+                    matches[index] = attach(
+                        self._profile_match(
+                            profile, False, 1.0, "track_continuity"
+                        )
+                    )
                     continue
                 track.profile_id = None
             if face_embedding is None:
                 track.kind = face.kind if face.kind != "face" else "low-quality-face-track"
-                matches[index] = self._track_match(track, face.confidence, new_track)
+                matches[index] = attach(
+                    self._track_match(track, face.confidence, new_track)
+                )
                 continue
 
             # CLIP is retained as descriptive metadata for memory search, but it
@@ -123,7 +161,9 @@ class IdentityLibrary:
                 self._accumulate_face_candidate(track, face_embedding)
                 track.kind = "face-candidate-track"
                 if len(track.face_embeddings) < self.config.enrollment_min_face_observations:
-                    matches[index] = self._track_match(track, face.confidence, new_track)
+                    matches[index] = attach(
+                        self._track_match(track, face.confidence, new_track)
+                    )
                     continue
                 stable_embedding = self._normalized(np.sum(track.face_embeddings, axis=0))
                 profile, created, similarity = self._match_or_create(
@@ -138,8 +178,13 @@ class IdentityLibrary:
                 if not created and new_track:
                     profile.sightings += 1
             self._update_profile(profile, camera_id, vision, face, now, similarity)
-            matches[index] = self._profile_match(
-                profile, created, similarity, "new" if created else self._last_match_outcome
+            matches[index] = attach(
+                self._profile_match(
+                    profile,
+                    created,
+                    similarity,
+                    "new" if created else self._last_match_outcome,
+                )
             )
         return matches
 
@@ -664,10 +709,10 @@ class IdentityLibrary:
     def _associate_track(
         self,
         camera_id: str,
-        bbox: BoundingBox,
+        detection: Detection,
         now: datetime,
         used_tracks: set[str],
-    ) -> tuple[_PersonTrack, bool]:
+    ) -> tuple[_PersonTrack, bool, dict[str, object]]:
         with self._lock:
             tracks = [
                 track for track in self._tracks.get(camera_id, [])
@@ -676,33 +721,48 @@ class IdentityLibrary:
             self._tracks[camera_id] = tracks
             ranked = sorted(
                 (
-                    (self._track_affinity(track.bbox, bbox), track)
+                    (self._track_affinity(track, detection, now), track)
                     for track in tracks if track.track_id not in used_tracks
                 ),
-                key=lambda item: item[0],
+                key=lambda item: float(item[0]["score"]),
                 reverse=True,
             )
-            if ranked and ranked[0][0] > 0:
+            if ranked and float(ranked[0][0]["score"]) > 0:
+                association = ranked[0][0]
                 track = ranked[0][1]
-                track.bbox = bbox
-                track.last_seen = now
-                track.observations += 1
-                return track, False
+                return track, False, association
+            polygon, frame_shape = self._detection_mask_geometry(detection)
             track = _PersonTrack(
-                f"track-{self._next_track_number:06d}", camera_id, bbox, now, now
+                f"track-{self._next_track_number:06d}",
+                camera_id,
+                detection.bbox,
+                now,
+                now,
+                mask_polygon=polygon,
+                frame_shape=frame_shape,
             )
             self._next_track_number += 1
             tracks.append(track)
-            return track, True
+            return track, True, {
+                "basis": "new_track",
+                "elapsed_seconds": 0.0,
+                "bbox_iou": 0.0,
+                "mask_iou": 0.0,
+                "mask_containment": 0.0,
+                "center_displacement": 0.0,
+                "score": 0.0,
+            }
 
-    def _track_affinity(self, prior: BoundingBox, current: BoundingBox) -> float:
+    def _track_affinity(
+        self, track: _PersonTrack, detection: Detection, now: datetime
+    ) -> dict[str, object]:
+        prior = track.bbox
+        current = detection.bbox
         intersection_width = max(0.0, min(prior.x2, current.x2) - max(prior.x1, current.x1))
         intersection_height = max(0.0, min(prior.y2, current.y2) - max(prior.y1, current.y1))
         intersection = intersection_width * intersection_height
         union = prior.area + current.area - intersection
-        iou = intersection / union if union > 0 else 0.0
-        if iou >= self.config.track_iou_threshold:
-            return 1.0 + iou
+        bbox_iou = intersection / union if union > 0 else 0.0
         prior_width = max(1.0, prior.x2 - prior.x1)
         prior_height = max(1.0, prior.y2 - prior.y1)
         prior_x = (prior.x1 + prior.x2) / 2
@@ -713,7 +773,191 @@ class IdentityLibrary:
             ((current_x - prior_x) / prior_width) ** 2
             + ((current_y - prior_y) / prior_height) ** 2
         ) ** 0.5
-        return 1.0 - normalized_distance if normalized_distance <= self.config.track_center_distance else 0.0
+        elapsed = max(0.0, (now - track.last_seen).total_seconds())
+        polygon, frame_shape = self._detection_mask_geometry(detection)
+        mask_iou, mask_containment = (0.0, 0.0)
+        if elapsed <= self.config.track_mask_max_gap_seconds:
+            mask_iou, mask_containment = self._mask_overlap(
+                track.mask_polygon,
+                polygon,
+                track.frame_shape,
+                frame_shape,
+            )
+        if (
+            mask_iou >= self.config.track_mask_iou_threshold
+            or mask_containment >= self.config.track_mask_containment_threshold
+        ):
+            basis = "mask_overlap"
+            score = 3.0 + max(mask_iou, mask_containment)
+        elif bbox_iou >= self.config.track_iou_threshold:
+            basis = "bbox_iou"
+            score = 2.0 + bbox_iou
+        elif normalized_distance <= self.config.track_center_distance:
+            basis = "center_continuity"
+            score = 1.0 - normalized_distance
+        else:
+            basis = "none"
+            score = 0.0
+        return {
+            "basis": basis,
+            "elapsed_seconds": round(elapsed, 4),
+            "bbox_iou": round(bbox_iou, 6),
+            "mask_iou": round(mask_iou, 6),
+            "mask_containment": round(mask_containment, 6),
+            "center_displacement": round(normalized_distance, 6),
+            "prior_bbox": self._bbox_dict(prior),
+            "current_bbox": self._bbox_dict(current),
+            "score": score,
+        }
+
+    def _advance_track(
+        self,
+        track: _PersonTrack,
+        detection: Detection,
+        current_crop: bytes | None,
+        now: datetime,
+        new_track: bool,
+    ) -> None:
+        if not new_track:
+            track.last_seen = now
+            track.observations += 1
+        track.bbox = detection.bbox
+        track.mask_polygon, track.frame_shape = self._detection_mask_geometry(detection)
+        if current_crop is not None:
+            track.last_crop_png = current_crop
+
+    def _temporal_comparison_candidate(
+        self,
+        track: _PersonTrack,
+        detection: Detection,
+        association: dict[str, object],
+        prior_crop: bytes | None,
+        current_crop: bytes | None,
+        now: datetime,
+        new_track: bool,
+    ) -> dict[str, object] | None:
+        if (
+            new_track
+            or not self.config.temporal_vlm_comparison_enabled
+            or association.get("basis") != "mask_overlap"
+            or prior_crop is None
+            or current_crop is None
+        ):
+            return None
+        if (
+            track.last_vlm_comparison_at is not None
+            and (now - track.last_vlm_comparison_at).total_seconds()
+            < self.config.temporal_vlm_cooldown_seconds
+        ):
+            return None
+        track.last_vlm_comparison_at = now
+        prior_center = (
+            (track.bbox.x1 + track.bbox.x2) / 2,
+            (track.bbox.y1 + track.bbox.y2) / 2,
+        )
+        current_center = (
+            (detection.bbox.x1 + detection.bbox.x2) / 2,
+            (detection.bbox.y1 + detection.bbox.y2) / 2,
+        )
+        candidate_id = "temporal-person-" + sha256(
+            prior_crop + current_crop + track.track_id.encode()
+        ).hexdigest()[:20]
+        return {
+            "candidate_id": candidate_id,
+            "track_id": track.track_id,
+            "prior_entity_id": track.profile_id or track.track_id,
+            "camera_id": track.camera_id,
+            "captured_at": now.isoformat(),
+            "prior_png": prior_crop,
+            "current_png": current_crop,
+            "geometry": {
+                **{key: value for key, value in association.items() if key != "score"},
+                "centroid_dx_pixels": round(current_center[0] - prior_center[0], 2),
+                "centroid_dy_pixels": round(current_center[1] - prior_center[1], 2),
+                "simultaneous_distinct_mask_conflict": False,
+            },
+        }
+
+    @staticmethod
+    def _segmented_person_png(
+        frame: np.ndarray, detection: Detection, vision: VisionEngine
+    ) -> bytes | None:
+        try:
+            segmented = vision.segment_detection(frame, detection)
+            return (
+                vision.encode_segmented_object(segmented, 384)
+                if segmented is not None else None
+            )
+        except (AttributeError, RuntimeError, ValueError):
+            return None
+
+    @staticmethod
+    def _detection_mask_geometry(
+        detection: Detection,
+    ) -> tuple[tuple[tuple[float, float], ...], tuple[int, int] | None]:
+        polygon = detection.attributes.get("mask_polygon")
+        shape = detection.attributes.get("frame_shape")
+        points: tuple[tuple[float, float], ...] = ()
+        if isinstance(polygon, list) and len(polygon) >= 3:
+            try:
+                points = tuple((float(point[0]), float(point[1])) for point in polygon)
+            except (IndexError, TypeError, ValueError):
+                points = ()
+        frame_shape = None
+        if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+            try:
+                frame_shape = (int(shape[0]), int(shape[1]))
+            except (TypeError, ValueError):
+                frame_shape = None
+        return points, frame_shape
+
+    @staticmethod
+    def _mask_overlap(
+        prior: tuple[tuple[float, float], ...],
+        current: tuple[tuple[float, float], ...],
+        prior_shape: tuple[int, int] | None,
+        current_shape: tuple[int, int] | None,
+    ) -> tuple[float, float]:
+        if len(prior) < 3 or len(current) < 3 or prior_shape != current_shape:
+            return 0.0, 0.0
+        import cv2
+
+        prior_points = np.asarray(prior, dtype=np.float32)
+        current_points = np.asarray(current, dtype=np.float32)
+        all_points = np.vstack((prior_points, current_points))
+        minimum = np.floor(all_points.min(axis=0))
+        maximum = np.ceil(all_points.max(axis=0))
+        width = max(1, int(maximum[0] - minimum[0] + 3))
+        height = max(1, int(maximum[1] - minimum[1] + 3))
+        scale = min(1.0, 512.0 / max(width, height))
+        canvas_width = max(2, int(np.ceil(width * scale)))
+        canvas_height = max(2, int(np.ceil(height * scale)))
+
+        def shifted(points: np.ndarray) -> np.ndarray:
+            return np.round((points - minimum + 1) * scale).astype(np.int32)
+
+        prior_mask = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+        current_mask = np.zeros_like(prior_mask)
+        cv2.fillPoly(prior_mask, [shifted(prior_points)], 1)
+        cv2.fillPoly(current_mask, [shifted(current_points)], 1)
+        prior_area = int(np.count_nonzero(prior_mask))
+        current_area = int(np.count_nonzero(current_mask))
+        intersection = int(np.count_nonzero(prior_mask & current_mask))
+        union = prior_area + current_area - intersection
+        return (
+            intersection / union if union else 0.0,
+            intersection / min(prior_area, current_area)
+            if min(prior_area, current_area) else 0.0,
+        )
+
+    @staticmethod
+    def _bbox_dict(bbox: BoundingBox) -> dict[str, float]:
+        return {
+            "x1": round(bbox.x1, 2),
+            "y1": round(bbox.y1, 2),
+            "x2": round(bbox.x2, 2),
+            "y2": round(bbox.y2, 2),
+        }
 
     def _track_match(
         self, track: _PersonTrack, confidence: float, new_track: bool

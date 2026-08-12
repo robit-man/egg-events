@@ -242,6 +242,18 @@ class MemoryPipeline:
                         else {}
                     ),
                 )
+        identity_alias = event.payload.get("identity_alias")
+        if isinstance(identity_alias, dict):
+            alias_id = identity_alias.get("alias_id")
+            canonical_id = identity_alias.get("canonical_id")
+            if (
+                isinstance(alias_id, str)
+                and isinstance(canonical_id, str)
+                and alias_id in entity_ids
+                and canonical_id in entity_ids
+                and alias_id != canonical_id
+            ):
+                self.store.coalesce_identity_evidence([identity_alias])
 
     def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
         return self.store.knowledge_graph_snapshot(node_limit)

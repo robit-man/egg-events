@@ -98,6 +98,71 @@ def test_pipeline_persists_only_accepted_event_and_links_entities(tmp_path) -> N
     assert detail["episodes"][0]["episode_id"] == "episode-1"
 
 
+def test_pipeline_projects_temporal_track_alias_into_one_person(tmp_path) -> None:
+    memory = MemoryConfig(storage_dir=str(tmp_path / "memory"))
+    config = SimpleNamespace(
+        memory=memory,
+        event_segmentation=EventSegmentationConfig(),
+        privacy=PrivacyConfig(),
+    )
+    store = MemoryStore(memory)
+    pipeline = MemoryPipeline(config, store)
+    now = datetime.now(timezone.utc)
+    evidence = EvidenceRef(
+        "temporal-comparison-1",
+        "vision",
+        now,
+        "ornith-temporal-person",
+        "front",
+        quality=0.91,
+        metadata={
+            "analysis": "Visible clothing remains consistent.",
+            "displacement_analysis": "The mask moves 18 px right.",
+        },
+    )
+    event = PerceptualEvent(
+        "temporal-event-1",
+        "identity",
+        now,
+        "temporal-person-continuity",
+        (evidence,),
+        ("track-000001", "person-001"),
+        {
+            "labels": ["temporal person continuity"],
+            "entities": [
+                {
+                    "id": "track-000001",
+                    "type": "appearance_track",
+                    "confidence": 0.91,
+                },
+                {
+                    "id": "person-001",
+                    "type": "person",
+                    "confidence": 0.91,
+                },
+            ],
+            "identity_alias": {
+                "alias_id": "track-000001",
+                "canonical_id": "person-001",
+                "similarity": 0.91,
+                "reason": "adjacent_mask_overlap_vlm_confirmed",
+            },
+            "skip_pairwise_co_observation": True,
+        },
+    )
+
+    assert pipeline.ingest(event) == (True, 0)
+    alias = store.entity_detail("track-000001")
+    canonical = store.entity_detail("person-001")
+
+    assert alias is not None
+    assert alias["entity"]["merged_into"] == "person-001"
+    assert canonical is not None
+    assert [item["evidence_id"] for item in canonical["evidence"]] == [
+        "temporal-comparison-1"
+    ]
+
+
 def test_ornith_relabel_persists_crop_and_supersedes_automatic_memory_labels(tmp_path) -> None:
     memory = MemoryConfig(storage_dir=str(tmp_path / "memory"))
     config = SimpleNamespace(
