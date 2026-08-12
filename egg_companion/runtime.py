@@ -1031,6 +1031,7 @@ class CompanionRuntime:
                 "identity_id": job.entity_id,
                 "prior_identity_id": job.prior_entity_id,
                 "decision": "single_temporal_entity",
+                "merge_reason": job.geometry.get("merge_reason"),
                 "geometry_authority": True,
                 "geometry": job.geometry,
                 "vlm_model": self.config.omnius.vision_model,
@@ -1063,6 +1064,7 @@ class CompanionRuntime:
                     "confidence": geometry_confidence,
                     "metadata": {
                         "candidate_id": job.candidate_id,
+                        "merge_reason": job.geometry.get("merge_reason"),
                         "vlm_same_person": bool(analysis.get("same_person")),
                     },
                 }

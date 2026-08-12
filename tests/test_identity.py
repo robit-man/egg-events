@@ -22,6 +22,13 @@ class _Vision:
     def embed_image(frame: np.ndarray) -> np.ndarray:
         return np.array((0.25, 0.5, 0.75), dtype=np.float32)
 
+    def segment_detection(
+        self, frame: np.ndarray, detection: Detection
+    ):
+        return VisionEngine.segment_detection(self, frame, detection)  # type: ignore[arg-type]
+
+    encode_segmented_object = staticmethod(VisionEngine.encode_segmented_object)
+
 
 class _AppearanceVision:
     @staticmethod
@@ -117,6 +124,56 @@ class IdentityLibraryTests(unittest.TestCase):
             self.assertFalse(
                 comparison["geometry"]["simultaneous_distinct_mask_conflict"]
             )
+            self.assertEqual(comparison["merge_reason"], "dislocated_mask_rescue")
+
+    def test_steady_overlapping_mask_does_not_schedule_redundant_vlm_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            vision = _AppearanceVision()
+            frame = np.full((100, 100, 3), 96, dtype=np.uint8)
+            detection = Detection(
+                "person",
+                0.95,
+                BoundingBox(5, 4, 85, 95),
+                {
+                    "mask_polygon": [[5, 4], [85, 4], [85, 95], [5, 95]],
+                    "frame_shape": [100, 100, 3],
+                },
+            )
+
+            first = library.observe("front", frame, (detection,), vision)[0]
+            steady = library.observe("front", frame, (detection,), vision)[0]
+
+            self.assertEqual(steady["id"], first["id"])
+            self.assertEqual(steady["temporal_association"]["basis"], "mask_overlap")
+            self.assertNotIn("_temporal_comparison", steady)
+
+    def test_face_enrollment_transition_schedules_track_to_person_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            vision = _Vision(np.array((1.0, 0.0, 0.0), dtype=np.float32))
+            frame = np.full((96, 96, 3), 96, dtype=np.uint8)
+            detection = Detection(
+                "person",
+                0.95,
+                BoundingBox(0, 0, 96, 96),
+                {
+                    "mask_polygon": [[0, 0], [95, 0], [95, 95], [0, 95]],
+                    "frame_shape": [96, 96, 3],
+                },
+            )
+
+            first = library.observe("front", frame, (detection,), vision)[0]
+            second = library.observe("front", frame, (detection,), vision)[0]
+            enrolled = library.observe("front", frame, (detection,), vision)[0]
+
+            self.assertNotIn("_temporal_comparison", first)
+            self.assertNotIn("_temporal_comparison", second)
+            self.assertTrue(enrolled["persistent"])
+            comparison = enrolled["_temporal_comparison"]
+            self.assertEqual(comparison["prior_entity_id"], first["id"])
+            self.assertEqual(comparison["entity_id"], enrolled["id"])
+            self.assertEqual(comparison["merge_reason"], "identity_transition")
 
     def test_simultaneous_person_masks_never_reuse_one_track_twice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

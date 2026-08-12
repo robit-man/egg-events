@@ -114,8 +114,34 @@ class IdentityLibrary:
                     if key != "score"
                 }
                 if comparison is not None:
-                    comparison["entity_id"] = str(match["id"])
-                    match["_temporal_comparison"] = comparison
+                    entity_id = str(match["id"])
+                    geometry = comparison["geometry"]
+                    identity_transition = (
+                        comparison["prior_entity_id"] != entity_id
+                    )
+                    dislocated_rescue = (
+                        float(geometry.get("bbox_iou") or 0)
+                        < self.config.track_iou_threshold
+                        and float(geometry.get("center_displacement") or 0)
+                        > self.config.track_center_distance
+                    )
+                    cooldown_ready = (
+                        track.last_vlm_comparison_at is None
+                        or (now - track.last_vlm_comparison_at).total_seconds()
+                        >= self.config.temporal_vlm_cooldown_seconds
+                    )
+                    if (identity_transition or dislocated_rescue) and (
+                        identity_transition or cooldown_ready
+                    ):
+                        track.last_vlm_comparison_at = now
+                        comparison["entity_id"] = entity_id
+                        comparison["merge_reason"] = (
+                            "identity_transition"
+                            if identity_transition
+                            else "dislocated_mask_rescue"
+                        )
+                        geometry["merge_reason"] = comparison["merge_reason"]
+                        match["_temporal_comparison"] = comparison
                 return match
 
             faces = vision.face_crops(frame, detection)
@@ -843,13 +869,6 @@ class IdentityLibrary:
             or current_crop is None
         ):
             return None
-        if (
-            track.last_vlm_comparison_at is not None
-            and (now - track.last_vlm_comparison_at).total_seconds()
-            < self.config.temporal_vlm_cooldown_seconds
-        ):
-            return None
-        track.last_vlm_comparison_at = now
         prior_center = (
             (track.bbox.x1 + track.bbox.x2) / 2,
             (track.bbox.y1 + track.bbox.y2) / 2,
