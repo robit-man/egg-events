@@ -61,6 +61,47 @@ def test_audio_classification_parser_accepts_only_numeric_yamnet_output() -> Non
     assert OmniusClient._parse_audio_classification("mock ambient evidence") is None
 
 
+def test_direct_tool_timeout_is_forwarded_to_omnius_executor(monkeypatch) -> None:
+    requests = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {"result": {"success": True, "output": "ready"}}
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs, self.timeout.total))
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    result = asyncio.run(
+        client._call_tool("audio_analyze", {"action": "classify"}, timeout_seconds=90)
+    )
+
+    assert result["output"] == "ready"
+    assert requests[0][1]["json"]["timeout_ms"] == 90000
+    assert requests[0][2] == 95
+
+
 def test_person_name_parser_requires_explicit_bounded_json_name() -> None:
     assert OmniusClient.parse_person_name('{"name":"Ada Lovelace"}') == "Ada Lovelace"
     assert OmniusClient.parse_person_name('{"name":null}') is None

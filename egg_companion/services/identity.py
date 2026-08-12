@@ -116,8 +116,10 @@ class IdentityLibrary:
                 if comparison is not None:
                     entity_id = str(match["id"])
                     geometry = comparison["geometry"]
+                    prior_entity_id = str(comparison["prior_entity_id"])
                     identity_transition = (
-                        comparison["prior_entity_id"] != entity_id
+                        prior_entity_id.startswith("track-")
+                        and entity_id.startswith("person-")
                     )
                     dislocated_rescue = (
                         float(geometry.get("bbox_iou") or 0)

@@ -6,6 +6,34 @@ from egg_companion.services import dashboard
 from egg_companion.services.audit import AuditCheck
 
 
+def test_readiness_monitor_replaces_stale_failure_after_recovery() -> None:
+    async def scenario() -> None:
+        responses = [
+            [AuditCheck("omnius-cognition", "fail", "timeout")],
+            [AuditCheck("omnius-cognition", "pass", "READY")],
+        ]
+
+        async def probe(_):
+            return responses.pop(0)
+
+        monitor = dashboard.ReadinessMonitor(
+            SimpleNamespace(),
+            probe=probe,
+            healthy_interval_seconds=300,
+            degraded_interval_seconds=0,
+        )
+        assert await monitor.poll() == []
+        await asyncio.sleep(0)
+        assert (await monitor.poll())[0].status == "fail"
+        await asyncio.sleep(0)
+        recovered = await monitor.poll()
+
+        assert recovered == [AuditCheck("omnius-cognition", "pass", "READY")]
+        assert monitor.snapshot()["updated_at"] is not None
+
+    asyncio.run(scenario())
+
+
 def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypatch) -> None:
     async def scenario() -> None:
         config = EggConfig.model_validate(
@@ -119,6 +147,8 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "telemetry.conversation_history" in dashboard.PAGE
     assert "message-tags" in dashboard.PAGE
     assert "turn.tags" in dashboard.PAGE
+    assert "health recheck running" in dashboard.PAGE
+    assert "Cognition unavailable" in dashboard.PAGE
     assert "border-radius: 0 !important" in dashboard.PAGE
     assert 'data-person-id=' in dashboard.PAGE
     assert 'id="person-inspector"' in dashboard.PAGE

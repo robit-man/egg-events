@@ -175,6 +175,29 @@ class IdentityLibraryTests(unittest.TestCase):
             self.assertEqual(comparison["entity_id"], enrolled["id"])
             self.assertEqual(comparison["merge_reason"], "identity_transition")
 
+    def test_persistent_to_transient_fluctuation_never_schedules_reverse_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            vision = _AppearanceVision()
+            frame = np.full((96, 96, 3), 96, dtype=np.uint8)
+            detection = Detection(
+                "person",
+                0.95,
+                BoundingBox(0, 0, 96, 96),
+                {
+                    "mask_polygon": [[0, 0], [95, 0], [95, 95], [0, 95]],
+                    "frame_shape": [96, 96, 3],
+                },
+            )
+            library.observe("front", frame, (detection,), vision)
+            track = library._tracks["front"][0]
+            track.profile_id = "person-missing-from-library"
+
+            result = library.observe("front", frame, (detection,), vision)[0]
+
+            self.assertTrue(str(result["id"]).startswith("track-"))
+            self.assertNotIn("_temporal_comparison", result)
+
     def test_simultaneous_person_masks_never_reuse_one_track_twice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             library = IdentityLibrary(IdentityConfig(storage_dir=directory))

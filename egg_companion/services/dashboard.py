@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import re
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -50,28 +52,74 @@ async function refresh(){try{render(await fetch('/api/state',{cache:'no-store'})
 PAGE = APPLICATION_PAGE
 
 
+class ReadinessMonitor:
+    """Non-blocking recurring audit which replaces stale failures on recovery."""
+
+    def __init__(
+        self,
+        config: EggConfig,
+        *,
+        probe: Callable[[EggConfig], Awaitable[list[AuditCheck]]] | None = None,
+        healthy_interval_seconds: float = 300.0,
+        degraded_interval_seconds: float = 30.0,
+    ) -> None:
+        self.config = config
+        self.probe = probe or audit_hardware
+        self.healthy_interval_seconds = healthy_interval_seconds
+        self.degraded_interval_seconds = degraded_interval_seconds
+        self.checks: list[AuditCheck] = []
+        self._task: asyncio.Task[list[AuditCheck]] | None = None
+        self._next_probe_at = 0.0
+        self._updated_at: str | None = None
+
+    async def _run_probe(self) -> list[AuditCheck]:
+        try:
+            return await self.probe(self.config)
+        except Exception as error:
+            return [
+                AuditCheck(
+                    "hardware-audit", "warn", f"diagnostic probe failed: {error}"
+                )
+            ]
+
+    async def poll(self) -> list[AuditCheck]:
+        now = asyncio.get_running_loop().time()
+        if self._task is not None and self._task.done():
+            self.checks = self._task.result()
+            self._task = None
+            self._updated_at = datetime.now(timezone.utc).isoformat()
+            degraded = any(check.status != "pass" for check in self.checks)
+            self._next_probe_at = now + (
+                self.degraded_interval_seconds
+                if degraded
+                else self.healthy_interval_seconds
+            )
+        if self._task is None and now >= self._next_probe_at:
+            self._task = asyncio.create_task(
+                self._run_probe(), name="hardware-audit"
+            )
+        return list(self.checks)
+
+    def snapshot(self) -> dict[str, object]:
+        now = asyncio.get_running_loop().time()
+        return {
+            "probing": self._task is not None,
+            "updated_at": self._updated_at,
+            "next_probe_seconds": round(max(0.0, self._next_probe_at - now), 1),
+        }
+
+
 async def serve_dashboard(config: EggConfig, port: int) -> None:
+    readiness = ReadinessMonitor(config)
     state: dict[str, object] = {
         "runtime": "checking",
         "checks": [],
-        "audit_task": None,
         "runtime_task": None,
         "companion": None,
     }
 
-    async def update_checks() -> list[AuditCheck]:
-        try:
-            return await audit_hardware(config)
-        except Exception as error:
-            return [AuditCheck("hardware-audit", "warn", f"diagnostic probe failed: {error}")]
-
     async def refresh() -> None:
-        audit_task = state["audit_task"]
-        if audit_task is None and not state["checks"]:
-            state["audit_task"] = asyncio.create_task(update_checks(), name="hardware-audit")
-        elif isinstance(audit_task, asyncio.Task) and audit_task.done():
-            state["checks"] = audit_task.result()
-            state["audit_task"] = "complete"
+        state["checks"] = await readiness.poll()
         task = state["runtime_task"]
         if isinstance(task, asyncio.Task) and not task.done():
             checks = state["checks"]
@@ -122,6 +170,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         return web.json_response({
             "runtime": state["runtime"],
             "checks": [{"name": check.name, "status": check.status, "detail": check.detail} for check in state["checks"]],
+            "readiness": readiness.snapshot(),
             "omnius": str(config.omnius.base_url),
             "telemetry": telemetry,
             "identities": runtime.identities.snapshot() if isinstance(runtime, CompanionRuntime) else [],

@@ -8,6 +8,7 @@ from egg_companion.services.audit import (
     AuditCheck,
     _degrade_unavailable_cameras,
     _cuda_check,
+    _error_detail,
     _gpu_runtime_pm_check,
     readiness_passes,
 )
@@ -23,6 +24,10 @@ def test_gpu_runtime_pm_accepts_kernel_auto_control() -> None:
         check = _gpu_runtime_pm_check()
 
     assert check == AuditCheck("gpu-runtime-pm", "pass", "status=suspended; control=auto")
+
+
+def test_empty_timeout_error_remains_legible() -> None:
+    assert _error_detail(TimeoutError()) == "TimeoutError"
 
 
 def test_cuda_probe_is_direct_and_not_suppressed_by_runtime_pm() -> None:

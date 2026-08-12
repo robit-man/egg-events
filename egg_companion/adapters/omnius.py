@@ -554,11 +554,17 @@ class OmniusClient:
         *,
         timeout_seconds: float,
     ) -> dict[str, object]:
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        server_timeout_ms = max(
+            1000, min(120000, int(round(timeout_seconds * 1000)))
+        )
+        # Omnius' direct tool executor defaults to 30 seconds independently of
+        # the HTTP client timeout. Send its explicit bounded timeout so a warmup
+        # or cold YAMNet pass is not killed while Egg is still waiting.
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds + 5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 f"{str(self.config.base_url).rstrip('/')}/v1/tools/{name}/call",
-                json={"args": args},
+                json={"args": args, "timeout_ms": server_timeout_ms},
                 headers=self._headers(),
             ) as response:
                 if response.status >= 400:

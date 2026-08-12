@@ -22,6 +22,12 @@ class AuditCheck:
     detail: str
 
 
+def _error_detail(error: Exception) -> str:
+    """Keep timeout and cancellation failures legible in dashboard diagnostics."""
+    message = str(error).strip()
+    return message or type(error).__name__
+
+
 async def _command_check(name: str, command: list[str]) -> AuditCheck:
     if not shutil.which(command[0]):
         return AuditCheck(name, "fail", f"command unavailable: {command[0]}")
@@ -242,34 +248,46 @@ async def audit_hardware(config: EggConfig) -> list[AuditCheck]:
                 config.audio.doa_serial_device,
             )
         )
+    omnius = OmniusClient(config.omnius)
+    omnius_ready = False
     try:
-        omnius = OmniusClient(config.omnius)
         await omnius.health()
+        omnius_ready = True
         checks.append(AuditCheck("omnius", "pass", str(config.omnius.base_url)))
-        catalog = await omnius.voice_catalog()
-        tts_models = catalog.get("tts", {}).get("models", []) if isinstance(catalog.get("tts"), dict) else []
-        asr_models = catalog.get("asr", {}).get("models", []) if isinstance(catalog.get("asr"), dict) else []
-        checks.append(
-            AuditCheck(
-                "omnius-voice-catalog",
-                "pass" if tts_models and asr_models else "fail",
-                f"tts={len(tts_models)}; asr={len(asr_models)}",
-            )
-        )
-        await omnius.ensure_voice_ready()
-        voice_state = await omnius.voice_state()
-        voice_ready = voice_state.get("voiceReady") is True
-        checks.append(
-            AuditCheck(
-                "omnius-voice",
-                "pass" if voice_ready else "fail",
-                f"ready={voice_state.get('voiceReady')}; model={voice_state.get('voiceModelId')}; error={voice_state.get('lastError')}",
-            )
-        )
-        cognition = await omnius.chat_contract_probe()
-        checks.append(AuditCheck("omnius-cognition", "pass", cognition[:120]))
     except Exception as error:
-        checks.append(AuditCheck("omnius", "fail", str(error)))
+        checks.append(AuditCheck("omnius", "fail", _error_detail(error)))
+    if omnius_ready:
+        try:
+            catalog = await omnius.voice_catalog()
+            tts_models = catalog.get("tts", {}).get("models", []) if isinstance(catalog.get("tts"), dict) else []
+            asr_models = catalog.get("asr", {}).get("models", []) if isinstance(catalog.get("asr"), dict) else []
+            checks.append(
+                AuditCheck(
+                    "omnius-voice-catalog",
+                    "pass" if tts_models and asr_models else "fail",
+                    f"tts={len(tts_models)}; asr={len(asr_models)}",
+                )
+            )
+        except Exception as error:
+            checks.append(AuditCheck("omnius-voice-catalog", "fail", _error_detail(error)))
+        try:
+            await omnius.ensure_voice_ready()
+            voice_state = await omnius.voice_state()
+            voice_ready = voice_state.get("voiceReady") is True
+            checks.append(
+                AuditCheck(
+                    "omnius-voice",
+                    "pass" if voice_ready else "fail",
+                    f"ready={voice_state.get('voiceReady')}; model={voice_state.get('voiceModelId')}; error={voice_state.get('lastError')}",
+                )
+            )
+        except Exception as error:
+            checks.append(AuditCheck("omnius-voice", "fail", _error_detail(error)))
+        try:
+            cognition = await omnius.chat_contract_probe()
+            checks.append(AuditCheck("omnius-cognition", "pass", cognition[:120]))
+        except Exception as error:
+            checks.append(AuditCheck("omnius-cognition", "fail", _error_detail(error)))
     if config.system_service:
         try:
             await SystemServiceClient(config.system_service).health()

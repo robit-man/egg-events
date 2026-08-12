@@ -68,6 +68,8 @@ Transcription and sound understanding are deliberately separate. ASR stays on th
 
 Omnius also exposes an `audio_analyze/comprehend` role pipeline. On this installation its AV sidecar roles currently report `mock semantic scaffold`; those event labels are never persisted or shown as perception. Egg admits only the independent numeric YAMNet classifier and locally measured WAV facts until the sidecar reports live roles. Classification runs behind ASR, so a cold TensorFlow/model load cannot add latency to the current spoken response.
 
+The Jetson hardware matrix, current Omnius failure analysis, persistent-worker design, REST schema, and acceptance suite for the Omnius implementer are in [docs/OMNIUS_JETSON_AUDIO_COMPREHENSION_HANDOFF.md](docs/OMNIUS_JETSON_AUDIO_COMPREHENSION_HANDOFF.md).
+
 Every admitted utterance now supplies a durable context ID to its audio evidence, visual/web tool invocations, retrieval influences, user corrections, preferred-name bindings, learned-object labels, audio classifications, and agent action evidence. The Voice page renders those as live tags on the same historical turn—for example `fresh vision ✓`, `memory recall ×4`, `remembered name: Troy`, `label updated: amber mug`, or `Speech 67%`. Late asynchronous evidence updates the existing message in place and survives daemon restarts; it does not reset the page or create a second fake heard turn.
 
 ## Temporal person continuity

@@ -993,7 +993,11 @@ PAGE = r"""<!doctype html>
     }
     function render(state) {
       currentState = state; const telemetry = state.telemetry || {}, runtime = String(state.runtime || 'unknown'), degraded = runtime.includes('degraded');
-      setConnection(degraded ? 'degraded' : 'online', degraded ? 'Needs attention' : 'Connected', `Revision ${telemetry.voice?.revision ?? 0} · ${telemetry.voice?.floor || 'starting'}`);
+      const affected = (state.checks || []).filter(check => check.status !== 'pass');
+      const issue = affected[0], healthNames = {'omnius-cognition':'Cognition unavailable','omnius-voice':'Voice service unavailable','omnius-voice-catalog':'Voice catalog unavailable','omnius':'Omnius unavailable'};
+      const connectionLabel = degraded ? (healthNames[issue?.name] || `Needs attention · ${String(issue?.name || 'health check').replaceAll('-', ' ')}`) : 'Connected';
+      const probe = state.readiness || {}, probeDetail = probe.probing ? 'health recheck running' : probe.updated_at ? `recheck in ${Math.ceil(Number(probe.next_probe_seconds || 0))}s` : 'health check pending';
+      setConnection(degraded ? 'degraded' : 'online', connectionLabel, `Revision ${telemetry.voice?.revision ?? 0} · ${telemetry.voice?.floor || 'starting'} · ${probeDetail}`);
       $('#last-sync').textContent = `Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
       renderActivePage(state);
       const cameras = telemetry.cameras || []; $('#vision-summary').innerHTML = `<span class="badge good">${cameras.length} streams</span><span class="badge">${cameras.reduce((sum,camera) => sum + (camera.detections || []).length, 0)} detections</span>`;
