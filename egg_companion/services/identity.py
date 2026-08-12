@@ -6,6 +6,7 @@ from hashlib import sha256
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
@@ -64,7 +65,6 @@ class IdentityLibrary:
         self._aliases: dict[str, tuple[str, float, str]] = {}
         self._database: sqlite3.Connection | None = None
         self._tracks: dict[str, list[_PersonTrack]] = {}
-        self._next_track_number = 1
         self._last_match_components: dict[str, float] = {}
         self._last_match_outcome = "new"
         if config.enabled:
@@ -733,7 +733,7 @@ class IdentityLibrary:
                 return track, False, association
             polygon, frame_shape = self._detection_mask_geometry(detection)
             track = _PersonTrack(
-                f"track-{self._next_track_number:06d}",
+                f"track-{uuid4().hex}",
                 camera_id,
                 detection.bbox,
                 now,
@@ -741,7 +741,6 @@ class IdentityLibrary:
                 mask_polygon=polygon,
                 frame_shape=frame_shape,
             )
-            self._next_track_number += 1
             tracks.append(track)
             return track, True, {
                 "basis": "new_track",

@@ -148,6 +148,22 @@ class IdentityLibraryTests(unittest.TestCase):
                 current[1]["temporal_association"]["basis"], "new_track"
             )
 
+    def test_transient_track_ids_do_not_collide_across_runtime_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = IdentityConfig(storage_dir=directory)
+            frame = np.zeros((96, 96, 3), dtype=np.uint8)
+            detection = Detection("person", 0.95, BoundingBox(0, 0, 80, 96))
+
+            first = IdentityLibrary(config).observe(
+                "front", frame, (detection,), _AppearanceVision()
+            )[0]
+            restarted = IdentityLibrary(config).observe(
+                "front", frame, (detection,), _AppearanceVision()
+            )[0]
+
+            self.assertTrue(str(first["id"]).startswith("track-"))
+            self.assertNotEqual(first["id"], restarted["id"])
+
     def test_face_profile_is_recalled_after_database_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = IdentityConfig(storage_dir=directory, face_similarity_threshold=0.8, sample_interval_seconds=3600)
