@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Add the newer ``--count`` flag to JetPack releases that lack it.
+
+Omnius 1.0.628 uses ``tegrastats --interval 100 --count 1`` as physical
+placement evidence. JetPack R36.3's binary streams indefinitely and rejects
+``--count``. All ordinary invocations are exec'd unchanged; counted calls read
+the requested number of real samples, terminate the child, and exit cleanly.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+
+REAL_TEGRASTATS = "/usr/bin/tegrastats"
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    if "--count" not in arguments:
+        os.execv(REAL_TEGRASTATS, [REAL_TEGRASTATS, *arguments])
+    index = arguments.index("--count")
+    try:
+        count = max(1, int(arguments[index + 1]))
+    except (IndexError, ValueError):
+        print("tegrastats: --count requires a positive integer", file=sys.stderr)
+        return 2
+    forwarded = arguments[:index] + arguments[index + 2 :]
+    process = subprocess.Popen(
+        [REAL_TEGRASTATS, *forwarded],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    samples: list[str] = []
+    try:
+        if process.stdout is None:
+            return 1
+        for _ in range(count):
+            line = process.stdout.readline()
+            if not line:
+                break
+            samples.append(line.rstrip())
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+    if not samples:
+        if process.stderr is not None:
+            print(process.stderr.read().strip(), file=sys.stderr)
+        return 1
+    print("\n".join(samples))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

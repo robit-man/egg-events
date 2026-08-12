@@ -994,7 +994,7 @@ PAGE = r"""<!doctype html>
     function render(state) {
       currentState = state; const telemetry = state.telemetry || {}, runtime = String(state.runtime || 'unknown'), degraded = runtime.includes('degraded');
       const affected = (state.checks || []).filter(check => check.status !== 'pass');
-      const issue = affected[0], healthNames = {'omnius-cognition':'Cognition unavailable','omnius-voice':'Voice service unavailable','omnius-voice-catalog':'Voice catalog unavailable','omnius':'Omnius unavailable'};
+      const issue = affected[0], healthNames = {'omnius-cognition':'Cognition unavailable','omnius-audio':'Audio comprehension unavailable','omnius-voice':'Voice service unavailable','omnius-voice-catalog':'Voice catalog unavailable','omnius':'Omnius unavailable'};
       const connectionLabel = degraded ? (healthNames[issue?.name] || `Needs attention · ${String(issue?.name || 'health check').replaceAll('-', ' ')}`) : 'Connected';
       const probe = state.readiness || {}, probeDetail = probe.probing ? 'health recheck running' : probe.updated_at ? `recheck in ${Math.ceil(Number(probe.next_probe_seconds || 0))}s` : 'health check pending';
       setConnection(degraded ? 'degraded' : 'online', connectionLabel, `Revision ${telemetry.voice?.revision ?? 0} · ${telemetry.voice?.floor || 'starting'} · ${probeDetail}`);
@@ -1062,7 +1062,8 @@ PAGE = r"""<!doctype html>
         const activationSequence = Number(activations.sequence || 0);
         window.__eggGraphActivations = activations;
         $('#graph-stats').innerHTML = `<span class="badge">${esc((payload.nodes || []).length)} nodes</span><span class="badge">${esc(counts.links || 0)} relationships</span><span class="badge">${esc(counts.entities || 0)} entities</span>${activationSequence ? `<span class="badge good">live firing #${esc(activationSequence)}</span>` : ''}`;
-        $('#graph-ocr-status').innerHTML = `<span class="badge ${ocr.errors ? 'warn' : 'good'}">OCR ${esc(ocr.hits || 0)} hits</span><span class="badge">${esc(ocr.requests || 0)} scans</span><span class="badge">${esc(ocr.queued || 0)} queued</span>`;
+        const recentOcr = Array.isArray(ocr.recent) ? ocr.recent.slice(-2).reverse() : [];
+        $('#graph-ocr-status').innerHTML = `<span class="badge ${ocr.errors ? 'warn' : 'good'}">OCR ${esc(ocr.hits || 0)} hits</span><span class="badge">${esc(ocr.requests || 0)} scans</span><span class="badge">${esc(ocr.queued || 0)} queued</span>${recentOcr.map(item => `<span class="badge good" title="${esc(item.parent_label || item.parent_id || 'OCR evidence')}">${esc(String(item.text || '').replace(/\s+/g,' ').slice(0,72))}</span>`).join('')}`;
         const signature = JSON.stringify({dream:payload.dream?.revision || null,nodes:(payload.nodes || []).map(node => [node.id,node.updated_at,node.confidence]),links:(payload.links || []).map(link => [link.id,link.confidence,link.confirmations])});
         if (signature !== graphDataSignature) {
           graphDataSignature = signature;

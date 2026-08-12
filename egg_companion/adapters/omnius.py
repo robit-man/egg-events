@@ -60,6 +60,57 @@ class OmniusClient:
             async with session.get(f"{str(self.config.base_url).rstrip('/')}/health", headers=self._headers()) as response:
                 response.raise_for_status()
 
+    async def cognition_health(self) -> dict[str, object]:
+        """Read backend readiness without consuming a full model generation.
+
+        Omnius 1.0.629 advertises ``/health/ready`` specifically as its backend
+        reachability probe.  Periodically generating a synthetic chat turn made
+        the monitor contend with live vision and could hold every health result
+        for the complete 120-second inference timeout.
+        """
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{str(self.config.base_url).rstrip('/')}/health/ready",
+                headers=self._headers(),
+            ) as response:
+                if response.status == 404:
+                    return {"supported": False, "status": "unknown"}
+                if response.status not in {200, 503}:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(
+                        f"Omnius cognition health HTTP {response.status}: {detail}"
+                    )
+                payload = await response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Omnius cognition health is not an object")
+        return {**payload, "supported": True}
+
+    async def audio_classifier_health(self) -> dict[str, object]:
+        """Return the dedicated persistent classifier state added in Omnius 1.0.628.
+
+        A 503 response is a valid readiness payload, not a transport failure. A
+        404 identifies an older Omnius release so callers can retain the legacy
+        direct-tool fallback without presenting it as a warm classifier.
+        """
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{str(self.config.base_url).rstrip('/')}/v1/audio/classify/health",
+                headers=self._headers(),
+            ) as response:
+                if response.status == 404:
+                    return {"supported": False, "ready": None}
+                if response.status not in {200, 503}:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(
+                        f"Omnius audio classifier health HTTP {response.status}: {detail}"
+                    )
+                payload = await response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Omnius audio classifier health is not an object")
+        return {**payload, "supported": True}
+
     async def chat_contract_probe(self) -> str:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         payload = {
@@ -515,8 +566,7 @@ class OmniusClient:
             ) as temporary:
                 temporary.write(wav_audio)
                 temporary_path = temporary.name
-            tool_result = await self._call_tool(
-                "audio_analyze",
+            tool_result = await self._call_audio_classifier(
                 {
                     "action": "classify",
                     "file": temporary_path,
@@ -530,10 +580,15 @@ class OmniusClient:
                     os.unlink(temporary_path)
                 except FileNotFoundError:
                     pass
-        output = tool_result.get("output")
-        if not isinstance(output, str):
-            raise RuntimeError("Omnius audio_analyze returned no classifier output")
-        parsed = self._parse_audio_classification(output)
+        data = tool_result.get("data")
+        parsed = self._normalize_audio_classification(data)
+        if parsed is None:
+            output = tool_result.get("output")
+            parsed = (
+                self._parse_audio_classification(output)
+                if isinstance(output, str)
+                else None
+            )
         if parsed is None:
             raise RuntimeError("Omnius audio_analyze returned invalid YAMNet output")
         return {
@@ -541,11 +596,46 @@ class OmniusClient:
             "total_classes": parsed.get("total_classes", 521),
             "duration_seconds": parsed.get("duration_s", acoustic.get("duration")),
             "acoustic": acoustic,
-            "model": "google/yamnet/1",
-            "taxonomy": "AudioSet",
+            "model": parsed.get("model", "google/yamnet/1"),
+            "backend": parsed.get("backend"),
+            "taxonomy": parsed.get("taxonomy", "AudioSet"),
             "semantic_quality": "grounded classifier",
             "mock_evidence_discarded": True,
         }
+
+    async def _call_audio_classifier(
+        self, args: dict[str, object], *, timeout_seconds: float
+    ) -> dict[str, object]:
+        """Prefer Omnius' warm structured audio endpoint with legacy fallback."""
+        server_timeout_ms = max(
+            1000, min(120000, int(round(timeout_seconds * 1000)))
+        )
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds + 5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{str(self.config.base_url).rstrip('/')}/v1/audio/classify",
+                json={"args": args, "timeout_ms": server_timeout_ms},
+                headers=self._headers(),
+            ) as response:
+                if response.status == 404:
+                    return await self._call_tool(
+                        "audio_analyze", args, timeout_seconds=timeout_seconds
+                    )
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(
+                        f"Omnius audio classifier HTTP {response.status}: {detail}"
+                    )
+                result = await response.json()
+        tool_result = result.get("result", result) if isinstance(result, dict) else result
+        if not isinstance(tool_result, dict) or tool_result.get("success") is not True:
+            detail = (
+                tool_result.get("error", "invalid classifier result")
+                if isinstance(tool_result, dict)
+                else "invalid classifier result"
+            )
+            raise RuntimeError(f"Omnius audio classifier failed: {detail}")
+        return tool_result
 
     async def _call_tool(
         self,
@@ -595,25 +685,43 @@ class OmniusClient:
             return None
         if not isinstance(payload, dict) or payload.get("success") is not True:
             return None
+        return OmniusClient._normalize_audio_classification(payload)
+
+    @staticmethod
+    def _normalize_audio_classification(
+        payload: object,
+    ) -> dict[str, object] | None:
+        if not isinstance(payload, dict):
+            return None
         classifications = payload.get("classifications")
         if not isinstance(classifications, list):
             return None
         normalized: list[dict[str, object]] = []
         for item in classifications:
-            if not isinstance(item, dict) or not isinstance(item.get("class"), str):
+            if not isinstance(item, dict):
+                continue
+            raw_label = item.get("label", item.get("class"))
+            raw_score = item.get("confidence", item.get("score"))
+            if not isinstance(raw_label, str):
                 continue
             try:
-                score = max(0.0, min(1.0, float(item.get("score"))))
+                score = max(0.0, min(1.0, float(raw_score)))
             except (TypeError, ValueError):
                 continue
-            label = " ".join(str(item["class"]).split())[:120]
+            label = " ".join(raw_label.split())[:120]
             if label:
                 normalized.append({"label": label, "confidence": score})
-        return {
+        result: dict[str, object] = {
             "classifications": normalized,
             "total_classes": int(payload.get("total_classes") or 521),
-            "duration_s": float(payload.get("duration_s") or 0),
+            "duration_s": float(
+                payload.get("duration_s", payload.get("duration_seconds")) or 0
+            ),
         }
+        for key in ("model", "backend", "taxonomy"):
+            if isinstance(payload.get(key), str):
+                result[key] = payload[key]
+        return result
 
     @staticmethod
     def parse_person_name(content: object) -> str | None:
@@ -910,16 +1018,29 @@ class OmniusClient:
         return non_latin / len(letters)
 
     async def ocr_advanced(self, image_path: str) -> dict[str, object] | None:
-        """Read text from a local image path via Omnius's multi-PSM tesseract + optional
-        vision-refinement OCR pipeline. Returns None when the tool is unavailable (501)
-        or the response is malformed, so call sites can treat it as purely corroborating
-        evidence alongside the Ornith VLM classification rather than a hard dependency."""
-        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        """Read a local image with Omnius' managed multi-variant OCR pipeline.
+
+        Omnius 1.0.629 replaced the old ``{imagePath}`` controller with the
+        canonical direct-tool envelope and structured ``result.data``. Keep the
+        former response parser as a compatibility path for older daemons.
+        """
+        server_timeout_ms = max(
+            30000, min(120000, int(round(self.config.timeout_seconds * 1000)))
+        )
+        timeout = aiohttp.ClientTimeout(total=server_timeout_ms / 1000 + 5)
         async with self._ocr_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/ocr/advanced",
-                    json={"imagePath": image_path},
+                    json={
+                        "args": {
+                            "image": image_path,
+                            "language": "eng",
+                            "regions": True,
+                        },
+                        "timeout_ms": server_timeout_ms,
+                        "max_output_chars": 40000,
+                    },
                     headers=self._headers(),
                 ) as response:
                     if response.status == 501:
@@ -928,7 +1049,53 @@ class OmniusClient:
                         detail = (await response.text())[:500]
                         raise RuntimeError(f"Omnius OCR HTTP {response.status}: {detail}")
                     result = await response.json()
-        if not isinstance(result, dict) or not result.get("success"):
+        if not isinstance(result, dict):
+            return None
+        tool_result = result.get("result")
+        if isinstance(tool_result, dict):
+            if tool_result.get("success") is not True:
+                raise RuntimeError(
+                    f"Omnius advanced OCR failed: "
+                    f"{tool_result.get('error') or 'invalid tool result'}"
+                )
+            data = tool_result.get("data")
+            if not isinstance(data, dict):
+                return None
+            text = data.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return None
+            raw_confidence = data.get("confidence")
+            try:
+                confidence = float(raw_confidence)
+                if confidence > 1:
+                    confidence /= 100
+                confidence = max(0.0, min(1.0, confidence))
+            except (TypeError, ValueError):
+                confidence = None
+            regions = data.get("regions")
+            normalized_regions: list[dict[str, object]] = []
+            if isinstance(regions, dict):
+                normalized_regions = [
+                    {"name": str(name), "text": value.strip()}
+                    for name, value in regions.items()
+                    if isinstance(value, str) and value.strip()
+                ]
+            elif isinstance(regions, list):
+                normalized_regions = [
+                    dict(region) for region in regions if isinstance(region, dict)
+                ]
+            return {
+                "text": text.strip()[:2000],
+                "vision_used": False,
+                "engine": "omnius-ocr-image-advanced",
+                "confidence": confidence,
+                "regions": normalized_regions[:32],
+                "variant": data.get("variant"),
+                "variants_tested": data.get("variants_tested"),
+            }
+
+        # Omnius <=1.0.628 compatibility response.
+        if result.get("success") is not True:
             return None
         text = result.get("ocrText")
         if not isinstance(text, str) or not text.strip():
@@ -936,6 +1103,7 @@ class OmniusClient:
         return {
             "text": text.strip()[:500],
             "vision_used": bool(result.get("visionUsed")),
+            "engine": "omnius-legacy-advanced-ocr",
         }
 
     async def classify_masked_object(self, image_png: bytes, detector_label: str, detector_confidence: float) -> tuple[str, float] | None:

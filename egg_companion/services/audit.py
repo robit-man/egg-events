@@ -197,6 +197,11 @@ async def audit_hardware(config: EggConfig) -> list[AuditCheck]:
         await _command_check("capture-devices", ["arecord", "-l"]),
         await _command_check("playback-devices", ["aplay", "-l"]),
         await _command_check("audio-playback", ["aplay", "--version"]),
+        *(
+            [await _command_check("advanced-ocr", ["tesseract", "--version"])]
+            if config.ocr.enabled and config.ocr.local_multipass_enabled
+            else []
+        ),
         await _command_check("gpu-pm-guard", ["systemctl", "is-active", "egg-gpu-pm-guard.service"]),
         await _command_check("ornith-model", ["ollama", "show", config.omnius.vision_model]),
         *[
@@ -284,8 +289,71 @@ async def audit_hardware(config: EggConfig) -> list[AuditCheck]:
         except Exception as error:
             checks.append(AuditCheck("omnius-voice", "fail", _error_detail(error)))
         try:
-            cognition = await omnius.chat_contract_probe()
-            checks.append(AuditCheck("omnius-cognition", "pass", cognition[:120]))
+            audio = await omnius.audio_classifier_health()
+            if audio.get("supported") is False:
+                checks.append(
+                    AuditCheck(
+                        "omnius-audio",
+                        "warn",
+                        "dedicated classifier readiness is unavailable; using legacy tool API",
+                    )
+                )
+            else:
+                audio_ready = audio.get("ready") is True
+                audio_detail = "; ".join(
+                    part
+                    for part in (
+                        f"backend={audio.get('backend') or 'unknown'}",
+                        f"device={audio.get('device') or 'unknown'}",
+                        f"warmed={audio.get('warmed')}",
+                        f"queue={audio.get('queue_depth', 0)}",
+                        (
+                            f"error={str(audio.get('last_error'))[:500]}"
+                            if audio.get("last_error")
+                            else ""
+                        ),
+                    )
+                    if part
+                )
+                checks.append(
+                    AuditCheck(
+                        "omnius-audio",
+                        "pass" if audio_ready else "fail",
+                        audio_detail,
+                    )
+                )
+        except Exception as error:
+            checks.append(
+                AuditCheck("omnius-audio", "fail", _error_detail(error))
+            )
+        try:
+            cognition = await omnius.cognition_health()
+            if cognition.get("supported") is False:
+                checks.append(
+                    AuditCheck(
+                        "omnius-cognition",
+                        "warn",
+                        "backend readiness route is unavailable on this Omnius release",
+                    )
+                )
+            else:
+                cognition_ready = (
+                    cognition.get("status") == "ready"
+                    and cognition.get("backend") == "reachable"
+                )
+                checks.append(
+                    AuditCheck(
+                        "omnius-cognition",
+                        "pass" if cognition_ready else "fail",
+                        "; ".join(
+                            (
+                                f"status={cognition.get('status') or 'unknown'}",
+                                f"backend={cognition.get('backend') or 'unknown'}",
+                                f"type={cognition.get('type') or 'unknown'}",
+                            )
+                        ),
+                    )
+                )
         except Exception as error:
             checks.append(AuditCheck("omnius-cognition", "fail", _error_detail(error)))
     if config.system_service:

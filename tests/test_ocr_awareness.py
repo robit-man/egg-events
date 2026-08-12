@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from egg_companion.config import EggConfig
 from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.store import MemoryStore
-from egg_companion.models import EvidenceRef, PerceptualEvent
+from egg_companion.models import BoundingBox, Detection, EvidenceRef, PerceptualEvent
 from egg_companion.runtime import CompanionRuntime
 
 
@@ -27,12 +27,65 @@ def test_ocr_configuration_recognizes_text_bearing_objects(tmp_path) -> None:
     assert runtime._label_implies_text("flat screen television")
     assert runtime._label_implies_text("hard-cover book")
     assert runtime._label_implies_text("store sign")
+    assert runtime._label_implies_text("aluminum can")
+    assert runtime._label_implies_text("water bottle")
     assert not runtime._label_implies_text("wooden chair")
     assert runtime._ocr_fragments("First heading\nSecond nested line. Final line.", 8) == [
         "First heading",
         "Second nested line.",
         "Final line.",
     ]
+
+
+def test_ocr_mask_parent_tracks_one_text_object_without_grouping_all_screens(tmp_path) -> None:
+    runtime = object.__new__(CompanionRuntime)
+    runtime.config = _config(tmp_path)
+    runtime._ocr_mask_tracks = {}
+    first = Detection("monitor", 0.9, BoundingBox(10, 10, 210, 110))
+    same = Detection("monitor", 0.9, BoundingBox(15, 12, 215, 112))
+    other = Detection("monitor", 0.9, BoundingBox(300, 10, 500, 110))
+
+    first_id = runtime._ocr_parent_for_detection("camera-0", first, 10.0)
+    same_id = runtime._ocr_parent_for_detection("camera-0", same, 11.0)
+    other_id = runtime._ocr_parent_for_detection("camera-0", other, 11.0)
+
+    assert same_id == first_id
+    assert other_id != first_id
+    assert first_id.startswith("visual-mask:camera-0:")
+
+
+def test_tesseract_tsv_parser_keeps_confident_nested_lines_and_rejects_noise() -> None:
+    header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+    rows = [
+        "5\t1\t1\t1\t1\t1\t10\t10\t90\t20\t92\tWELCOME",
+        "5\t1\t1\t1\t2\t1\t10\t40\t40\t20\t88\tGate",
+        "5\t1\t1\t1\t2\t2\t55\t40\t15\t20\t91\t3",
+        "5\t1\t1\t1\t3\t1\t10\t70\t10\t20\t12\tx",
+    ]
+
+    parsed = CompanionRuntime._parse_tesseract_tsv("\n".join([header, *rows]))
+
+    assert parsed is not None
+    assert parsed["text"] == "WELCOME\nGate 3"
+    assert len(parsed["regions"]) == 2
+    noisy = "\n".join(
+        [header, "5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t70\tMG"]
+    )
+    assert CompanionRuntime._parse_tesseract_tsv(noisy) is None
+
+    weak_short_fragments = "\n".join(
+        [
+            header,
+            "5\t1\t1\t1\t1\t1\t0\t0\t30\t12\t62\tdad",
+            "5\t1\t1\t1\t2\t1\t0\t20\t40\t12\t66\tvier",
+        ]
+    )
+    assert CompanionRuntime._parse_tesseract_tsv(weak_short_fragments) is None
+
+    confident_single_label = "\n".join(
+        [header, "5\t1\t1\t1\t1\t1\t0\t0\t100\t20\t93\tOCULUS"]
+    )
+    assert CompanionRuntime._parse_tesseract_tsv(confident_single_label) is not None
 
 
 def test_ocr_event_persists_parent_content_fragments_and_explicit_relations(tmp_path) -> None:

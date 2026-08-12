@@ -221,6 +221,11 @@ object_learning:
 
 ocr:
   enabled: true
+  # Local multi-pass Tesseract remains available when Omnius OCR/VLM services
+  # are cold or unhealthy. Omnius refinement is opt-in because it shares the
+  # live Ornith model and must never stall the bounded OCR queue.
+  local_multipass_enabled: true
+  omnius_refinement_enabled: false
   # Full-frame scans catch signs and loose text; text-bearing object crops are
   # prioritized between those scans.
   full_frame_interval_seconds: 20

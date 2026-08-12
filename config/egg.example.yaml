@@ -162,6 +162,8 @@ object_learning:
 
 ocr:
   enabled: true
+  local_multipass_enabled: true
+  omnius_refinement_enabled: false
   full_frame_interval_seconds: 20
   text_object_interval_seconds: 8
   queue_size: 8

@@ -61,6 +61,241 @@ def test_audio_classification_parser_accepts_only_numeric_yamnet_output() -> Non
     assert OmniusClient._parse_audio_classification("mock ambient evidence") is None
 
 
+def test_audio_classification_parser_accepts_structured_omnius_10628_data() -> None:
+    parsed = OmniusClient._normalize_audio_classification(
+        {
+            "classifications": [
+                {"label": "Speech", "confidence": 0.81},
+                {"class": "Music", "score": 0.19},
+            ],
+            "total_classes": 521,
+            "duration_seconds": 4.5,
+            "model": "yamnet",
+            "backend": "tensorrt-fp16",
+            "taxonomy": "AudioSet-521",
+        }
+    )
+
+    assert parsed == {
+        "classifications": [
+            {"label": "Speech", "confidence": 0.81},
+            {"label": "Music", "confidence": 0.19},
+        ],
+        "total_classes": 521,
+        "duration_s": 4.5,
+        "model": "yamnet",
+        "backend": "tensorrt-fp16",
+        "taxonomy": "AudioSet-521",
+    }
+
+
+def test_audio_classifier_health_accepts_structured_503_readiness(monkeypatch) -> None:
+    class Response:
+        status = 503
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {
+                "ready": False,
+                "backend": "tensorrt-fp16",
+                "last_error": "CUDA unavailable",
+            }
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def get(self, url, **kwargs):
+            assert url.endswith("/v1/audio/classify/health")
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    result = asyncio.run(client.audio_classifier_health())
+
+    assert result == {
+        "supported": True,
+        "ready": False,
+        "backend": "tensorrt-fp16",
+        "last_error": "CUDA unavailable",
+    }
+
+
+def test_cognition_health_uses_lightweight_backend_readiness(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {"status": "ready", "backend": "reachable", "type": "ollama"}
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def get(self, url, **kwargs):
+            assert url.endswith("/health/ready")
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    result = asyncio.run(client.cognition_health())
+
+    assert result == {
+        "supported": True,
+        "status": "ready",
+        "backend": "reachable",
+        "type": "ollama",
+    }
+
+
+def test_audio_classifier_prefers_new_structured_endpoint(monkeypatch) -> None:
+    requests = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {
+                "result": {
+                    "success": True,
+                    "data": {
+                        "classifications": [
+                            {"label": "Speech", "confidence": 0.9}
+                        ]
+                    },
+                }
+            }
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs, self.timeout.total))
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    result = asyncio.run(
+        client._call_audio_classifier(
+            {"action": "classify", "file": "/tmp/input.wav"},
+            timeout_seconds=90,
+        )
+    )
+
+    assert result["data"]["classifications"][0]["label"] == "Speech"
+    assert requests[0][0].endswith("/v1/audio/classify")
+    assert requests[0][1]["json"]["timeout_ms"] == 90000
+    assert requests[0][2] == 95
+
+
+def test_advanced_ocr_uses_omnius_10629_structured_contract(monkeypatch) -> None:
+    requests = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {
+                "result": {
+                    "success": True,
+                    "data": {
+                        "text": "WELCOME\nGate 3",
+                        "confidence": 91.5,
+                        "regions": {"header": "WELCOME", "body": "Gate 3"},
+                        "variant": "adaptive_31_psm11",
+                        "variants_tested": 24,
+                    },
+                }
+            }
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs, self.timeout.total))
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(
+        OmniusConfig(model="test", voice_model="test", timeout_seconds=90)
+    )
+
+    result = asyncio.run(client.ocr_advanced("/tmp/screen.png"))
+
+    assert result == {
+        "text": "WELCOME\nGate 3",
+        "vision_used": False,
+        "engine": "omnius-ocr-image-advanced",
+        "confidence": 0.915,
+        "regions": [
+            {"name": "header", "text": "WELCOME"},
+            {"name": "body", "text": "Gate 3"},
+        ],
+        "variant": "adaptive_31_psm11",
+        "variants_tested": 24,
+    }
+    assert requests[0][0].endswith("/v1/ocr/advanced")
+    assert requests[0][1]["json"]["args"] == {
+        "image": "/tmp/screen.png",
+        "language": "eng",
+        "regions": True,
+    }
+    assert requests[0][1]["json"]["timeout_ms"] == 90000
+    assert requests[0][2] == 95
+
+
 def test_direct_tool_timeout_is_forwarded_to_omnius_executor(monkeypatch) -> None:
     requests = []
 

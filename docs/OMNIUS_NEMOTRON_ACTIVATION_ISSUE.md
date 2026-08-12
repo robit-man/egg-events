@@ -1,6 +1,6 @@
 # Omnius defect report: nemotron-streaming activation refused despite ready catalog state
 
-Filed from the `egg_companion` client after live-probing the Omnius daemon (v1.0.616, latest published) running on this device at `http://127.0.0.1:11435`.
+Filed from the `egg_companion` client after live-probing the Omnius daemon running on this device at `http://127.0.0.1:11435`. Originally reproduced on v1.0.616 and reproduced again after upgrading the live daemon to v1.0.628 on 2026-08-12.
 
 ## 1. `nemotron-streaming` cannot be activated, and the catalog gives no way to detect this in advance
 
@@ -54,8 +54,28 @@ POST /v1/ocr/advanced {"imagePath":"<valid, existing path>"}
 
 **Ask:** fix the internal argument binding so `ocrError` reflects the actual OCR failure mode (or is `null` on a genuine "no text found" result), and make `success` reflect whether OCR itself succeeded.
 
+The v1.0.628 retest used both a full camera frame and a perspective-rectified crop of a detected monitor. The full-frame call took 122.84 seconds and returned the same contradictory response. Supplying all three compatibility keys (`imagePath`, `path`, and `file`) still timed out after 35 seconds, so this was not repairable by changing the Egg request field.
+
+### Omnius 1.0.629 status
+
+The argument-binding defect is resolved by a new canonical contract:
+
+```json
+{"args":{"image":"/absolute/image.png","language":"eng","regions":true},"timeout_ms":120000}
+```
+
+Egg now consumes structured `result.data`. The endpoint is not operational on
+this JetPack R36.3 host yet because its bootstrap performs `sudo -n apt-get` and
+the service has no passwordless sudo. More importantly, Ubuntu Jammy arm64 has a
+`python3-opencv` package but no `python3-pytesseract` candidate, so granting sudo
+would not make the current all-APT command succeed. Omnius should install only
+native/system packages through APT and install the pure-Python `pytesseract`
+package in its isolated `~/.omnius/runtimes/vision/ocr-advanced` venv, or expose
+an explicit pre-provisioned OCR Python override. Egg retains bounded local OCR
+while this managed runtime is unavailable.
+
 ## Environment
 
-- `omnius@1.0.616` (npm global, confirmed latest on registry at time of writing)
+- `omnius@1.0.629` (current retest; originally filed against 1.0.616)
 - Daemon started via `~/.config/systemd/user/omnius-daemon.service`
 - Jetson AGX Orin, JetPack R36.3

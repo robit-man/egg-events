@@ -263,6 +263,8 @@ class ObjectLearningConfig(BaseModel):
 
 class OcrConfig(BaseModel):
     enabled: bool = True
+    local_multipass_enabled: bool = True
+    omnius_refinement_enabled: bool = False
     full_frame_interval_seconds: float = Field(default=20, ge=2, le=3600)
     text_object_interval_seconds: float = Field(default=8, ge=1, le=3600)
     queue_size: int = Field(default=8, ge=1, le=64)
@@ -271,10 +273,12 @@ class OcrConfig(BaseModel):
     max_fragments: int = Field(default=8, ge=1, le=32)
     text_bearing_labels: list[str] = Field(
         default_factory=lambda: [
-            "book", "card", "document", "label", "laptop", "license plate",
-            "magazine", "menu", "monitor", "newspaper", "package", "packaging",
-            "paper", "phone", "poster", "receipt", "screen", "sign", "tablet",
-            "television", "text", "tv", "whiteboard",
+            "appliance", "book", "bottle", "box", "can", "card", "carton",
+            "computer", "container", "device", "document", "jar", "keyboard",
+            "label", "laptop", "license plate", "magazine", "menu", "monitor",
+            "newspaper", "package", "packaging", "paper", "phone", "poster",
+            "receipt", "remote", "screen", "sign", "tablet", "television",
+            "text", "tv", "whiteboard",
         ]
     )
 

@@ -6,7 +6,7 @@ Goal: make `audio_analyze/classify` a reliable, warm, offline, hardware-compatib
 
 ## Executive summary
 
-Egg's realtime ASR is healthy because it was separated into a persistent, JetPack-matched CUDA service with pinned models and a stable REST boundary. Omnius audio comprehension currently has the opposite shape: every `audio_analyze/classify` call starts Python, imports a generic CPU-only TensorFlow wheel, loads YAMNet from a TF-Hub URL/cache, performs inference, prints JSON through a text wrapper, and exits. Omnius' direct-tool executor also defaults to 30 seconds unless the caller supplies `timeout_ms`.
+Egg's realtime ASR is healthy because it was separated into a persistent, JetPack-matched CUDA service with pinned models and a stable REST boundary. Omnius 1.0.627 had the opposite shape: every `audio_analyze/classify` call started Python, imported a generic CPU-only TensorFlow wheel, loaded YAMNet from a TF-Hub URL/cache, performed inference, printed JSON through a text wrapper, and exited. Omnius' direct-tool executor also defaulted to 30 seconds unless the caller supplied `timeout_ms`.
 
 The live symptom is:
 
@@ -15,7 +15,72 @@ RuntimeError: Omnius audio_analyze failed:
 Tool 'audio_analyze' timed out after 30000ms
 ```
 
-Egg now explicitly sends the executor timeout, which removes the accidental 30-second cutoff. That is only an integration correction. The required Omnius fix is a persistent, pre-warmed, offline audio-classification runtime with bounded serialization, structured results, readiness reporting, and real cancellation.
+Egg explicitly sends the executor timeout, which removes the accidental 30-second cutoff. Omnius 1.0.629 now provides the requested persistent, pre-warmed, offline TensorRT runtime. The deployment details below explain the JetPack compatibility settings required to make that runtime actually warm on this device.
+
+## Omnius 1.0.628 verification update
+
+Omnius 1.0.628 adds the requested daemon-owned interfaces:
+
+- `GET /v1/audio/classify/health`
+- `POST /v1/audio/classify`
+- `POST /v1/audio/classify/setup`
+
+Egg now prefers the structured `/v1/audio/classify` result and retains the old
+`audio_analyze` tool call only as a compatibility fallback. The dashboard also
+reports `omnius-audio` independently from base daemon, voice, and cognition
+health.
+
+The first live check on this device returned HTTP 503 with:
+
+```text
+ready=false
+backend=tensorrt-fp16
+device=jetson-cuda:0
+weights_ready=false
+warmed=false
+last_error=JetPack CUDA Torch preflight failed: CUDA unavailable
+           (torch=2.10.0+cpu, torch_cuda=None)
+```
+
+This confirms that the REST/lifecycle contract is present, but the managed audio
+runtime is still resolving a CPU-only Torch build. Setup must use a JetPack
+R36.3-compatible CUDA runtime without replacing Egg's working CUDA Torch or the
+isolated Whisper service. The acceptance tests below remain the definition of
+done; route availability alone is not readiness.
+
+## Omnius 1.0.629 working deployment
+
+The 1.0.629 runtime is now live and passes the intended contract after three
+JetPack-specific corrections:
+
+1. Set `OMNIUS_AUDIO_PYTHON` to Egg's verified JetPack interpreter
+   (`.venv/bin/python`: Torch 2.2.0, CUDA 12.2, Orin SM 8.7). Omnius then creates
+   its own isolated `~/.omnius/runtimes/audio/venv` with system-site access; it
+   does not modify Egg's environment.
+2. Put Egg's `scripts/compat-bin` before `/usr/bin` in the Omnius service `PATH`.
+   JetPack R36.3's `/usr/bin/tegrastats` does not support the `--count` option
+   used by Omnius 1.0.629; the wrapper reads the requested number of genuine
+   samples and terminates the real process.
+3. Pin `cuda-python==12.2.0` inside the isolated Omnius audio venv. The inherited
+   `cuda-python==13.2.0` namespace does not expose `from cuda import cudart`,
+   while the TensorRT worker requires that API and the host runtime is CUDA 12.2.
+
+The active systemd drop-in is reproducible from
+`config/systemd/omnius-daemon-audio-cuda.conf`; the pre-start repair and
+`tegrastats` compatibility implementation live under `scripts/` and survive
+future Omnius npm updates.
+
+Observed readiness after setup:
+
+```text
+ready=true; backend=tensorrt-fp16; device=Orin; compute_capability=8.7
+weights_ready=true; warmed=true; model_load_ms=528.602; errors=0
+```
+
+A retained six-second ReSpeaker WAV completed through Egg's structured adapter
+in 125 ms and returned five grounded AudioSet classifications. This meets the
+persistent-worker and latency goals; the legacy TensorFlow/TF-Hub path is now
+only a compatibility fallback for older Omnius releases.
 
 ## Exact hardware and working voice stack
 
@@ -32,7 +97,7 @@ Egg now explicitly sends the executor timeout, which removes the accidental 30-s
 | Egg audio sent to Omnius | RIFF/WAV, mono PCM, 16 kHz, normally six seconds or shorter |
 | Conditioning | 160 Hz speech-band high-pass, voiced-RMS AGC, target RMS `0.16`, bounded gain `48x` |
 | ASR | Persistent CUDA dual Whisper service on `127.0.0.1:11436` |
-| Omnius | 1.0.627 on `127.0.0.1:11435` |
+| Omnius | 1.0.629 on `127.0.0.1:11435` |
 | Ollama/Ornith | `127.0.0.1:11434`; shared unified memory, so audio must not depend on an LLM |
 
 The working ASR deployment details are in [the Egg README](../README.md#jetsonarm64-voice-stack-what-made-realtime-asr-work). Preserve its CUDA Torch installation. Do not let audio-comprehension dependency resolution replace the JetPack-matched Torch packages.

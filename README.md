@@ -1,6 +1,6 @@
 # Egg Companion
 
-Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker direction-of-arrival microphone, speaker, and Omnius REST services. It intentionally has no simulation path. Audit failures remain visible, while the runtime gracefully degrades and independently retries failed camera, vision, audio, memory, and Omnius components so healthy capabilities stay live. This Egg currently reports an **AGX Orin / JetPack R36.3**, rather than Xavier.
+Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker direction-of-arrival microphone, speaker, and Omnius REST services. It intentionally has no simulation path. Audit failures remain visible, while the runtime gracefully degrades and independently retries failed camera, vision, audio, memory, and Omnius components so healthy capabilities stay live. Omnius daemon, cognition, voice, catalog, and audio readiness are tracked independently and stale failures clear automatically after recovery; the cognition monitor uses Omnius' lightweight `/health/ready` probe rather than consuming a synthetic chat inference. This Egg currently reports an **AGX Orin / JetPack R36.3**, rather than Xavier.
 
 ## What it does
 
@@ -64,13 +64,19 @@ If Torch loses CUDA after a package install, stop and restore the JetPack-matche
 
 ## Audio comprehension and conversation provenance
 
-Transcription and sound understanding are deliberately separate. ASR stays on the fast CUDA Whisper service. A queue of size one coalesces admitted audio windows for Omnius `audio_analyze/classify`, whose YAMNet model emits scores across the 521-class AudioSet taxonomy. Only labels above `audio_comprehension.minimum_confidence` become `sound_event` graph entities. They are explicitly related with `heard_with` edges to visible people and objects, and recent grounded labels become bounded scene context for subsequent replies.
+Transcription and sound understanding are deliberately separate. ASR stays on the fast CUDA Whisper service. A queue of size one coalesces admitted audio windows for Omnius' persistent `/v1/audio/classify` service, whose YAMNet model emits scores across the 521-class AudioSet taxonomy. Older Omnius releases fall back to `audio_analyze/classify`. Only labels above `audio_comprehension.minimum_confidence` become `sound_event` graph entities. They are explicitly related with `heard_with` edges to visible people and objects, and recent grounded labels become bounded scene context for subsequent replies. Dedicated classifier readiness is exposed as the `omnius-audio` dashboard check rather than being conflated with daemon, voice, or cognition health.
 
 Omnius also exposes an `audio_analyze/comprehend` role pipeline. On this installation its AV sidecar roles currently report `mock semantic scaffold`; those event labels are never persisted or shown as perception. Egg admits only the independent numeric YAMNet classifier and locally measured WAV facts until the sidecar reports live roles. Classification runs behind ASR, so a cold TensorFlow/model load cannot add latency to the current spoken response.
 
 The Jetson hardware matrix, current Omnius failure analysis, persistent-worker design, REST schema, and acceptance suite for the Omnius implementer are in [docs/OMNIUS_JETSON_AUDIO_COMPREHENSION_HANDOFF.md](docs/OMNIUS_JETSON_AUDIO_COMPREHENSION_HANDOFF.md).
 
 Every admitted utterance now supplies a durable context ID to its audio evidence, visual/web tool invocations, retrieval influences, user corrections, preferred-name bindings, learned-object labels, audio classifications, and agent action evidence. The Voice page renders those as live tags on the same historical turn—for example `fresh vision ✓`, `memory recall ×4`, `remembered name: Troy`, `label updated: amber mug`, or `Speech 67%`. Late asynchronous evidence updates the existing message in place and survives daemon restarts; it does not reset the page or create a second fake heard turn.
+
+## Mask-aware OCR and nested visual content
+
+OCR runs on both periodic full frames and detections whose categories imply text, including screens, books, signs, packaging, bottles, cans, devices, and documents. Segmentation polygons are used to perspective-rectify oblique object crops before a local multi-pass Tesseract pipeline evaluates original, contrast-normalized, and adaptive-threshold variants. Low-confidence fragments are discarded rather than promoted as memory. This local path is intentionally independent of the vision LLM and remains available while Omnius or Ollama is cold.
+
+Each unrecognized text-bearing mask receives a stable camera-local observation ID based on temporal mask overlap; all monitors with the same detector label are no longer grouped into one category node. Accepted OCR creates `object → contains_text → content → contains_fragment` relationships, retains the rectified crop as clickable evidence, and stores OCR regions, confidence, engine, source mask polygon, and bounding box in provenance. Egg understands Omnius 1.0.629's canonical `{args:{image}} → result.data` advanced-OCR contract, but remote refinement remains opt-in until its managed Jetson OCR dependencies are ready; see [the live defect report](docs/OMNIUS_NEMOTRON_ACTIVATION_ISSUE.md).
 
 ## Temporal person continuity
 
