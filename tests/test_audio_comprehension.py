@@ -40,6 +40,9 @@ def test_audio_comprehension_queue_coalesces_without_backpressuring_asr() -> Non
 
 def test_grounded_sound_event_is_linked_to_visible_context(tmp_path) -> None:
     runtime = CompanionRuntime(_config(tmp_path, memory=True))
+    media_key, media_checksum = runtime._memory.persist_media(
+        "audio/test/utterance-1.wav", b"retained-audio-evidence"
+    )
     job = _AudioComprehensionJob(
         context_id="utterance-1",
         audio=b"unused",
@@ -54,6 +57,8 @@ def test_grounded_sound_event_is_linked_to_visible_context(tmp_path) -> None:
                 "source": "visible-during-audio",
             },
         ),
+        media_key=media_key,
+        media_checksum=media_checksum,
     )
 
     runtime._queue_audio_comprehension_memory(
@@ -70,6 +75,7 @@ def test_grounded_sound_event_is_linked_to_visible_context(tmp_path) -> None:
     assert event.event_type == "audio_comprehension"
     assert event.evidence[0].modality == "audio_semantics"
     assert event.evidence[0].metadata["mock_evidence_discarded"] is True
+    assert event.evidence[0].media_key == media_key
     assert event.payload["relations"][0]["relation"] == "heard_with"
 
     accepted, _ = runtime._memory.ingest(event)

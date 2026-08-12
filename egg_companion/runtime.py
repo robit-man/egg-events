@@ -63,6 +63,8 @@ class _AudioComprehensionJob:
     transcript: str
     captured_at: datetime
     entities: tuple[dict[str, object], ...]
+    media_key: str | None = None
+    media_checksum: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1153,8 +1155,13 @@ class CompanionRuntime:
                     },
                 )
             )
-            self._queue_speech_memory(transcript, segment)
-            self._queue_audio_comprehension(transcript, segment)
+            media_key, media_checksum = self._queue_speech_memory(transcript, segment)
+            self._queue_audio_comprehension(
+                transcript,
+                segment,
+                media_key=media_key,
+                media_checksum=media_checksum,
+            )
             turn = self._conversation_turns.finalize_audio_turn(
                 transcript,
                 utterance_id=segment.utterance_id,
@@ -1180,7 +1187,12 @@ class CompanionRuntime:
             self._utterances.put_nowait(turn)
 
     def _queue_audio_comprehension(
-        self, transcript: str, segment: _SpeechSegment
+        self,
+        transcript: str,
+        segment: _SpeechSegment,
+        *,
+        media_key: str | None = None,
+        media_checksum: str | None = None,
     ) -> None:
         settings = self.config.audio_comprehension
         if not settings.enabled:
@@ -1201,6 +1213,8 @@ class CompanionRuntime:
             transcript=transcript,
             captured_at=datetime.now(timezone.utc),
             entities=self._current_audio_associations(),
+            media_key=media_key,
+            media_checksum=media_checksum,
         )
         if self._audio_comprehension_jobs.full():
             # Semantic scene analysis is contextual and lossy by design. Keep
@@ -1344,6 +1358,7 @@ class CompanionRuntime:
             job.captured_at,
             "omnius-audio-analyze",
             "respeaker-asr",
+            media_key=job.media_key,
             quality=max(
                 (float(item.get("confidence") or 0) for item in classifications),
                 default=0.5,
@@ -1359,6 +1374,10 @@ class CompanionRuntime:
                 "acoustic": result.get("acoustic"),
                 "mock_evidence_discarded": True,
                 "associated_entity_ids": [str(item["id"]) for item in job.entities],
+                **(
+                    {"_media_checksum": job.media_checksum}
+                    if job.media_checksum else {}
+                ),
             },
         )
         self._queue_memory_event(
@@ -1504,9 +1523,11 @@ class CompanionRuntime:
             )
         )
 
-    def _queue_speech_memory(self, transcript: str, segment: _SpeechSegment) -> None:
+    def _queue_speech_memory(
+        self, transcript: str, segment: _SpeechSegment
+    ) -> tuple[str | None, str | None]:
         if self._memory is None:
-            return
+            return None, None
         now = datetime.now(timezone.utc)
         visible_faces: list[dict[str, object]] = []
         latest = self._latest_observation
@@ -1581,6 +1602,7 @@ class CompanionRuntime:
                 payload={"transcript": transcript, "entities": visible_faces},
             )
         )
+        return media_key, media_checksum
 
     def _queue_memory_event(self, event: PerceptualEvent) -> None:
         if self._memory_events.full():
