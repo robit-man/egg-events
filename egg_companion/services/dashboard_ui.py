@@ -377,8 +377,15 @@ PAGE = r"""<!doctype html>
     .camera, .camera-head, .camera-meta { border-color: var(--line); }
     .graph-toolbar .input:focus, .graph-toolbar .select:focus { border-color: #ffae00; }
 
-    .graph-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; }
-    .graph-panel { overflow: hidden; padding: 0; background: #070d19; border-color: #1d2939; }
+    .graph-page {
+      --graph-page-width: calc(100vw - 252px);
+      width: var(--graph-page-width);
+      margin-left: calc((100% - var(--graph-page-width)) / 2);
+    }
+    .graph-page .page-heading, .graph-detail-grid, .graph-evidence-panel {
+      margin-inline: clamp(18px, 3vw, 40px);
+    }
+    .graph-panel { width: 100%; overflow: hidden; padding: 0; background: #070d19; border-color: #1d2939; border-inline: 0; }
     .graph-toolbar {
       display: flex;
       min-height: 58px;
@@ -391,18 +398,26 @@ PAGE = r"""<!doctype html>
       border-bottom: 1px solid #344054;
     }
     .graph-toolbar-controls { display: flex; min-width: 0; align-items: center; gap: 8px; }
+    .graph-toolbar-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
     .graph-toolbar .input, .graph-toolbar .select { height: 36px; color: #eaecf0; background: #182230; border-color: #344054; }
     .graph-toolbar .input::placeholder { color: #667085; }
     .graph-toolbar .button { min-height: 36px; color: #d0d5dd; background: #182230; border-color: #344054; }
     .graph-toolbar .button:hover { color: #fff; background: #253755; }
-    .graph-stage { position: relative; width: 100%; height: clamp(510px, 68vh, 820px); min-height: 420px; }
+    .graph-stage { position: relative; width: 100%; height: clamp(620px, calc(100dvh - 238px), 980px); min-height: 520px; }
     .graph-canvas { position: absolute; inset: 0; overflow: hidden; cursor: grab; touch-action: none; }
     .graph-canvas:active { cursor: grabbing; }
     .graph-canvas canvas { display: block; width: 100%; height: 100%; }
     .graph-overlay { position: absolute; z-index: 2; inset: 14px auto auto 14px; pointer-events: none; }
     .graph-overlay .badge { color: #d0d5dd; background: rgb(16 24 40 / .82); border-color: #344054; backdrop-filter: blur(8px); }
     .graph-hint { position: absolute; z-index: 2; right: 14px; bottom: 12px; color: #667085; font-size: 11px; pointer-events: none; }
-    .graph-sidebar { display: grid; gap: 16px; align-content: start; }
+    .graph-detail-grid {
+      display: grid;
+      grid-template-columns: minmax(320px, 1.6fr) repeat(3, minmax(180px, 1fr));
+      gap: 16px;
+      align-items: stretch;
+      margin-top: 16px;
+    }
+    .graph-detail-grid > .card { height: 100%; }
     .graph-selection-title { margin-bottom: 5px; font-size: 16px; font-weight: 680; overflow-wrap: anywhere; }
     .graph-selection-meta { display: grid; gap: 8px; margin-top: 14px; }
     .graph-property { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 11px; }
@@ -415,6 +430,19 @@ PAGE = r"""<!doctype html>
     .graph-evidence-item img { display: block; width: 100%; max-height: 320px; margin-top: 10px; object-fit: contain; background: #05070a; border: 1px solid var(--line); }
     .graph-evidence-item audio { display: block; width: 100%; margin-top: 10px; border-radius: 0; }
     .graph-evidence-text { max-height: 180px; overflow: auto; margin-top: 10px; padding: 9px; color: #c8cdd5; background: #090d12; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .graph-evidence-panel { margin-top: 16px; }
+    .graph-encoding { display: grid; gap: 10px; margin: 0; }
+    .graph-encoding div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 9px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
+    .graph-encoding div:last-child { padding-bottom: 0; border-bottom: 0; }
+    .graph-encoding dt { color: var(--accent); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+    .graph-encoding dd { margin: 0; color: var(--muted); font-size: 11px; }
+    .graph-page.graph-theater { margin-top: -28px; }
+    .graph-page.graph-theater .page-heading { display: none; }
+    .graph-page.graph-theater .graph-stage { height: calc(100dvh - 130px); min-height: 600px; }
+    .graph-page.graph-theater #graph-theater { color: #07090c; background: var(--accent); border-color: var(--accent); }
+    .graph-panel:fullscreen { width: 100vw; height: 100vh; border: 0; background: #070d19; }
+    .graph-panel:fullscreen .graph-stage { height: calc(100dvh - 58px); min-height: 0; }
+    .graph-panel:fullscreen #graph-fullscreen { color: #07090c; background: var(--accent); border-color: var(--accent); }
     .legend-item { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
     .legend-dot { width: 9px; height: 9px; flex: 0 0 auto; background: var(--legend); border-radius: 50%; box-shadow: 0 0 0 3px color-mix(in srgb, var(--legend) 18%, transparent); }
 
@@ -426,7 +454,7 @@ PAGE = r"""<!doctype html>
       .config-values { grid-template-columns: 1fr; }
       .config-row:nth-last-child(-n+2) { border-bottom-color: var(--line); }
       .config-row:last-child { border-bottom-color: transparent; }
-      .graph-layout { grid-template-columns: minmax(0, 1fr) 260px; }
+      .graph-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 860px) {
       .sidebar { transform: translateX(-102%); transition: transform .2s ease; box-shadow: 16px 0 32px rgb(16 24 40 / .2); }
@@ -438,8 +466,7 @@ PAGE = r"""<!doctype html>
       .topbar { min-height: 64px; }
       .topbar-title { display: flex; align-items: center; gap: 11px; }
       .sync-label { display: none; }
-      .graph-layout { grid-template-columns: 1fr; }
-      .graph-sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .graph-page { --graph-page-width: 100vw; }
     }
     @media (max-width: 680px) {
       .content { padding-top: 20px; }
@@ -456,9 +483,14 @@ PAGE = r"""<!doctype html>
       .graph-panel { padding: 0; }
       .graph-toolbar { align-items: stretch; flex-direction: column; }
       .graph-toolbar-controls { width: 100%; }
+      .graph-toolbar-actions { width: 100%; flex-wrap: wrap; }
+      .graph-toolbar-actions .button { flex: 1 1 auto; }
       .graph-toolbar .input { flex: 1; }
-      .graph-stage { height: 62vh; min-height: 420px; }
-      .graph-sidebar { grid-template-columns: 1fr; }
+      .graph-stage { height: 68dvh; min-height: 460px; }
+      .graph-detail-grid { grid-template-columns: 1fr; }
+      .graph-page.graph-theater { margin-top: -20px; }
+      .graph-page.graph-theater .graph-stage { height: calc(100dvh - 168px); min-height: 460px; }
+      .graph-panel:fullscreen .graph-stage { height: calc(100dvh - 104px); min-height: 0; }
       .dream-pair { grid-template-columns: 1fr; }
       .dream-link { transform: rotate(90deg); text-align: center; }
     }
@@ -597,28 +629,26 @@ PAGE = r"""<!doctype html>
           </div>
         </section>
 
-        <section class="page" data-page="/graph">
+        <section class="page graph-page" data-page="/graph">
           <div class="page-heading"><div><h2>Multimodal knowledge graph</h2><p>Objects, faces, recognized content, evidence, claims, and episodes arranged by relationship strength and provenance.</p></div><div id="graph-ocr-status" class="badge-row"><span class="badge">OCR awaiting data</span></div></div>
-          <div class="graph-layout">
-            <article class="card graph-panel">
-              <div class="graph-toolbar">
-                <div class="graph-toolbar-controls"><input id="graph-search" class="input" type="search" placeholder="Find an object, person, or text"><select id="graph-kind" class="select" aria-label="Filter node type"><option value="">All modalities</option><option value="entity">Entities</option><option value="evidence">Evidence</option><option value="claim">Claims</option><option value="episode">Episodes</option></select></div>
-                <button id="graph-reset" class="button" type="button">Reset view</button>
-              </div>
-              <div class="graph-stage">
-                <div id="knowledge-graph" class="graph-canvas" role="img" aria-label="Interactive three-dimensional graph of observed people, objects, content, and multimodal evidence"></div>
-                <div id="graph-stats" class="graph-overlay badge-row"><span class="badge">Loading graph</span></div>
-                <div class="graph-hint">Drag to orbit · scroll to zoom · select a node</div>
-              </div>
-            </article>
-            <aside class="graph-sidebar">
-              <article class="card"><div class="card-header"><div><h3 class="card-title">Selection</h3><p class="card-note">Node and immediate relationships</p></div></div><div id="graph-selection"><div class="muted">Select a node in the graph to inspect its nested awareness and provenance.</div></div></article>
-              <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
-              <article class="card"><div class="card-header"><div><h3 class="card-title">Live firings</h3><p class="card-note">Causal activity propagates across connected memories without moving your view</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#fff"></i>Vision</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Heard voice</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Memory recall</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Agent action</span></div></article>
-              <article class="card"><div class="card-header"><div><h3 class="card-title">Relationship encoding</h3></div></div><p class="card-note">Stronger confidence pulls nodes closer. Thicker curved splines indicate stronger or repeatedly confirmed relationships.</p></article>
-            </aside>
+          <article id="graph-panel" class="card graph-panel">
+            <div class="graph-toolbar">
+              <div class="graph-toolbar-controls"><input id="graph-search" class="input" type="search" placeholder="Find an object, person, or text"><select id="graph-kind" class="select" aria-label="Filter node type"><option value="">All modalities</option><option value="entity">Entities</option><option value="evidence">Evidence</option><option value="claim">Claims</option><option value="episode">Episodes</option></select></div>
+              <div class="graph-toolbar-actions"><button id="graph-theater" class="button" type="button" aria-pressed="false">Theater mode</button><button id="graph-fullscreen" class="button" type="button">Full screen</button><button id="graph-reset" class="button" type="button">Reset view</button></div>
+            </div>
+            <div class="graph-stage">
+              <div id="knowledge-graph" class="graph-canvas" role="img" aria-label="Interactive three-dimensional graph of observed people, objects, content, and multimodal evidence"></div>
+              <div id="graph-stats" class="graph-overlay badge-row"><span class="badge">Loading graph</span></div>
+              <div class="graph-hint">Drag to orbit · scroll to zoom · select a node</div>
+            </div>
+          </article>
+          <div class="graph-detail-grid">
+            <article class="card graph-selection-card"><div class="card-header"><div><h3 class="card-title">Selection</h3><p class="card-note">Node and immediate relationships</p></div></div><div id="graph-selection"><div class="muted">Select a node in the graph to inspect its nested awareness and provenance.</div></div></article>
+            <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
+            <article class="card"><div class="card-header"><div><h3 class="card-title">Live firings</h3><p class="card-note">Causal activity propagates across connected memories without moving your view</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#fff"></i>Vision</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Heard voice</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Memory recall</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Agent action</span></div></article>
+            <article class="card"><div class="card-header"><div><h3 class="card-title">Relationship encoding</h3><p class="card-note">Spline form is evidence, not decoration</p></div></div><dl class="graph-encoding"><div><dt>Thickness</dt><dd>Association strength, confidence, and repeated confirmation.</dd></div><div><dt>Arch</dt><dd>Recurrence and associative separation; repeated links rise into stronger bridges.</dd></div><div><dt>Angle</dt><dd>Relationship family: identity, observation, co-presence, audio, temporal, or reflective.</dd></div><div><dt>Distance</dt><dd>Semantic affinity and confidence pull related memories into tighter neighborhoods.</dd></div></dl></article>
           </div>
-          <article class="card" style="margin-top:16px"><div class="card-header"><div><h3 class="card-title">Connected evidence and artifacts</h3><p class="card-note">Retained visual, audio, textual, and episodic provenance for the selected node</p></div></div><div id="graph-evidence"><div class="empty">Select a node to load its connected evidence.</div></div></article>
+          <article class="card graph-evidence-panel"><div class="card-header"><div><h3 class="card-title">Connected evidence and artifacts</h3><p class="card-note">Retained visual, audio, textual, and episodic provenance for the selected node</p></div></div><div id="graph-evidence"><div class="empty">Select a node to load its connected evidence.</div></div></article>
         </section>
 
         <section class="page" data-page="/system">
@@ -1129,6 +1159,34 @@ PAGE = r"""<!doctype html>
     $('#graph-search').addEventListener('input', emitGraphFilter);
     $('#graph-kind').addEventListener('change', emitGraphFilter);
     $('#graph-reset').addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:graph-reset')));
+    const graphPage = document.querySelector('[data-page="/graph"]'), graphPanel = $('#graph-panel'), graphTheaterButton = $('#graph-theater'), graphFullscreenButton = $('#graph-fullscreen');
+    function setGraphTheater(active) {
+      graphPage.classList.toggle('graph-theater', active);
+      graphTheaterButton.setAttribute('aria-pressed', String(active));
+      graphTheaterButton.textContent = active ? 'Exit theater' : 'Theater mode';
+      try { localStorage.setItem('egg.graph.theater', active ? '1' : '0'); } catch (_) {}
+      requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+    }
+    let savedGraphTheater = false;
+    try { savedGraphTheater = localStorage.getItem('egg.graph.theater') === '1'; } catch (_) {}
+    setGraphTheater(savedGraphTheater);
+    graphTheaterButton.addEventListener('click', () => setGraphTheater(!graphPage.classList.contains('graph-theater')));
+    graphFullscreenButton.hidden = !document.fullscreenEnabled;
+    graphFullscreenButton.addEventListener('click', async () => {
+      try {
+        if (document.fullscreenElement === graphPanel) await document.exitFullscreen();
+        else await graphPanel.requestFullscreen();
+      } catch (error) { console.warn('Graph full screen unavailable', error); }
+    });
+    document.addEventListener('fullscreenchange', () => {
+      const active = document.fullscreenElement === graphPanel;
+      graphFullscreenButton.textContent = active ? 'Exit full screen' : 'Full screen';
+      graphFullscreenButton.setAttribute('aria-pressed', String(active));
+      requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !document.fullscreenElement && graphPage.classList.contains('graph-theater')) setGraphTheater(false);
+    });
     function relatedEvidence(detail) {
       const found = new Map();
       const add = item => { if (item?.evidence_id) found.set(String(item.evidence_id), item); };
@@ -1151,7 +1209,11 @@ PAGE = r"""<!doctype html>
     }
     window.addEventListener('egg:graph-selection', async event => {
       const detail = event.detail || {}, node = detail.node || {}, neighbors = detail.neighbors || [];
-      $('#graph-selection').innerHTML = `<div class="graph-selection-title">${esc(node.label || node.id || 'Unknown node')}</div><div class="badge-row"><span class="badge">${esc(node.kind || 'node')}</span><span class="badge">${esc(node.subtype || 'untyped')}</span><span class="badge">${esc(neighbors.length)} links</span></div><dl class="graph-selection-meta"><div class="graph-property"><dt>Source ID</dt><dd class="mono">${esc(node.source_id || node.id || '—')}</dd></div><div class="graph-property"><dt>Confidence</dt><dd>${node.confidence == null ? '—' : Math.round(Number(node.confidence) * 100) + '%'}</dd></div><div class="graph-property"><dt>Observed</dt><dd>${esc(node.updated_at ? new Date(node.updated_at).toLocaleString() : '—')}</dd></div><div class="graph-property"><dt>Relations</dt><dd>${esc(neighbors.slice(0, 12).map(item => `${item.relation} → ${item.label}`).join(' · ') || 'No immediate relationships')}</dd></div></dl>`;
+      const strongestRelations = [...neighbors].sort((left, right) => Number(right.associative?.associationStrength || 0) - Number(left.associative?.associationStrength || 0)).slice(0, 12).map(item => {
+        const strength = Math.round(Number(item.associative?.associationStrength ?? item.confidence ?? 0) * 100), confirmations = Math.max(1, Number(item.associative?.confirmations ?? item.confirmations ?? 1));
+        return `${item.relation} → ${item.label} · ${strength}% · ${confirmations}×`;
+      });
+      $('#graph-selection').innerHTML = `<div class="graph-selection-title">${esc(node.label || node.id || 'Unknown node')}</div><div class="badge-row"><span class="badge">${esc(node.kind || 'node')}</span><span class="badge">${esc(node.subtype || 'untyped')}</span><span class="badge">${esc(neighbors.length)} links</span></div><dl class="graph-selection-meta"><div class="graph-property"><dt>Source ID</dt><dd class="mono">${esc(node.source_id || node.id || '—')}</dd></div><div class="graph-property"><dt>Confidence</dt><dd>${node.confidence == null ? '—' : Math.round(Number(node.confidence) * 100) + '%'}</dd></div><div class="graph-property"><dt>Observed</dt><dd>${esc(node.updated_at ? new Date(node.updated_at).toLocaleString() : '—')}</dd></div><div class="graph-property"><dt>Relations</dt><dd>${esc(strongestRelations.join(' · ') || 'No immediate relationships')}</dd></div></dl>`;
       $('#graph-evidence').innerHTML = '<div class="empty">Loading connected evidence…</div>';
       const revision = ++graphSelectionRevision;
       try {
@@ -1201,6 +1263,6 @@ PAGE = r"""<!doctype html>
     connectLiveWaveform();
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
-  <script type="module" src="/assets/knowledge_graph.js?v=20260812a"></script>
+  <script type="module" src="/assets/knowledge_graph.js?v=20260814a"></script>
 </body>
 </html>"""

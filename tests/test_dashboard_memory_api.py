@@ -130,7 +130,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'href="/dreams" data-route="/dreams"' in dashboard.PAGE
     assert 'data-page="/dreams"' in dashboard.PAGE
     assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
-    assert 'src="/assets/knowledge_graph.js?v=20260812a"' in dashboard.PAGE
+    assert 'src="/assets/knowledge_graph.js?v=20260814a"' in dashboard.PAGE
     assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE
     assert "window.open(" not in dashboard.PAGE
     assert "graphDataSignature" in dashboard.PAGE
@@ -140,6 +140,12 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "Memory recall" in dashboard.PAGE
     assert "loadGraph(true), 2000" in dashboard.PAGE
     assert "Connected evidence and artifacts" in dashboard.PAGE
+    assert 'id="graph-theater"' in dashboard.PAGE
+    assert 'id="graph-fullscreen"' in dashboard.PAGE
+    assert 'class="graph-detail-grid"' in dashboard.PAGE
+    assert ".graph-panel:fullscreen" in dashboard.PAGE
+    assert "egg.graph.theater" in dashboard.PAGE
+    assert "Spline form is evidence, not decoration" in dashboard.PAGE
     assert "Applied in-page; an Egg restart is not required" in dashboard.PAGE
     assert "voice-service-state" in dashboard.PAGE
     assert "voiceFormDirty" in dashboard.PAGE
@@ -171,3 +177,19 @@ def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> No
     assert "egg:graph-activations" in graph_source
     assert "activationHopMs" in graph_source
     assert "activePulseObjects" in graph_source
+    assert "associativeLayout3D" in graph_source
+    assert "ASSOCIATIVE_RELATIONS" in graph_source
+    assert "Math.hypot(dx, dy, dz)" in graph_source
+    assert "global depth plane" in graph_source
+    assert "structuralAgreement" in graph_source
+    assert "communityLabels" in graph_source
+    assert "volumePoint" in graph_source
+    assert "radialSeed" not in graph_source
+    assert "RELATION_GEOMETRY" in graph_source
+    assert "associativeSplinePoints" in graph_source
+    assert "associationStrength" in graph_source
+    assert "confirmations" in graph_source
+    assert "thickness" in graph_source
+    assert "arch" in graph_source
+    assert "angle" in graph_source
+    assert "new THREE.CatmullRomCurve3" in graph_source

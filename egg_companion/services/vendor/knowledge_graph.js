@@ -1,6 +1,369 @@
 import * as THREE from 'three';
 import { OrbitControls } from '/assets/OrbitControls.js?v=20260811a';
 
+const ASSOCIATIVE_RELATIONS = {
+  has_alias: 1,
+  has_label: 0.94,
+  'object-label-evidence': 0.91,
+  sighting: 0.88,
+  observation: 0.84,
+  used_for: 0.8,
+  evokes_reflection: 0.74,
+  participant: 0.7,
+  heard_with: 0.67,
+  co_observed_with: 0.62,
+};
+const RELATION_GEOMETRY = {
+  identity: { angle:0.04, arch:0.14 },
+  observation: { angle:0.58, arch:0.34 },
+  co_presence: { angle:-0.72, arch:0.64 },
+  audio: { angle:-1.18, arch:0.48 },
+  temporal: { angle:1.2, arch:0.56 },
+  reflective: { angle:2.18, arch:0.42 },
+  associative: { angle:0.3, arch:0.3 },
+};
+let associativeLayoutCache = { signature:'', result:null };
+
+function stableHash(value) {
+  let result = 2166136261;
+  for (const character of String(value)) {
+    result ^= character.charCodeAt(0);
+    result = Math.imul(result, 16777619);
+  }
+  return result >>> 0;
+}
+
+function seededUnit(seed) {
+  let value = seed || 1;
+  return () => {
+    value += 0x6d2b79f5;
+    let next = value;
+    next = Math.imul(next ^ (next >>> 15), next | 1);
+    next ^= next + Math.imul(next ^ (next >>> 7), next | 61);
+    return ((next ^ (next >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function unitVector(seed) {
+  const random = seededUnit(seed);
+  const z = random() * 2 - 1;
+  const angle = random() * Math.PI * 2;
+  const radius = Math.sqrt(Math.max(0, 1 - z * z));
+  return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius, z };
+}
+
+function relationFamily(relation) {
+  if (/alias|label|identity|named|same_as/.test(relation)) return 'identity';
+  if (/heard|audio|speech|voice|sound/.test(relation)) return 'audio';
+  if (/co[_-]?(observed|present|occur)|shared_context/.test(relation)) return 'co_presence';
+  if (/episode|participant|temporal|before|after|during/.test(relation)) return 'temporal';
+  if (/reflection|claim|used_for|caused|supports|contradicts/.test(relation)) return 'reflective';
+  if (/sighting|observation|evidence|appearance|ocr|content|detected/.test(relation)) return 'observation';
+  return 'associative';
+}
+
+function relationRule(link) {
+  const relation = String(link.relation || '').toLowerCase();
+  const semanticAffinity = ASSOCIATIVE_RELATIONS[relation] || 0.58;
+  const confidence = Math.max(0.04, Math.min(1, Number(link.confidence ?? 0.5)));
+  const confirmations = Math.max(1, Number(link.confirmations ?? link.recurrence ?? link.count ?? 1));
+  const recurrence = Math.min(1, Math.log2(confirmations + 1) / 10);
+  const tightness = Math.max(0.08, Math.min(1, semanticAffinity * 0.34 + confidence * 0.5 + recurrence * 0.16));
+  const associationStrength = Math.max(0.05, Math.min(1, tightness * 0.5 + confidence * 0.22 + recurrence * 0.28));
+  const thickness = Math.max(0.06, Math.min(1, associationStrength * 0.62 + recurrence * 0.38));
+  const family = relationFamily(relation), geometry = RELATION_GEOMETRY[family];
+  const angleJitter = ((stableHash(`${relation}:${link.source}:${link.target}`) % 1001) / 1000 - 0.5) * 0.16;
+  const arch = Math.max(0.08, Math.min(1, geometry.arch * 0.32 + recurrence * 0.5 + (1 - tightness) * 0.18));
+  return {
+    tightness,
+    distance: 2.35 + Math.pow(1 - tightness, 1.3) * 9.2,
+    strength: 0.25 + tightness * 1.55,
+    associationStrength,
+    confidence,
+    confirmations,
+    recurrence,
+    thickness,
+    arch,
+    angle: geometry.angle + angleJitter,
+    family,
+  };
+}
+
+/*
+ * Spline channels stay independent: the arch rises with recurrence, its plane
+ * rotates by relationship family, and its rendered radius follows evidence
+ * strength. Keeping this in plain objects makes WebGL and canvas agree.
+ */
+function associativeSplinePoints(source, target, link, associative = relationRule(link)) {
+  const dx = target.x - source.x, dy = target.y - source.y, dz = (target.z || 0) - (source.z || 0);
+  const chordLength = Math.max(0.001, Math.hypot(dx, dy, dz));
+  const axis = { x:dx / chordLength, y:dy / chordLength, z:dz / chordLength };
+  const reference = Math.abs(axis.y) < 0.92 ? { x:0, y:1, z:0 } : { x:1, y:0, z:0 };
+  const projection = reference.x * axis.x + reference.y * axis.y + reference.z * axis.z;
+  let normalA = { x:reference.x - axis.x * projection, y:reference.y - axis.y * projection, z:reference.z - axis.z * projection };
+  const normalLength = Math.max(0.001, Math.hypot(normalA.x, normalA.y, normalA.z));
+  normalA = { x:normalA.x / normalLength, y:normalA.y / normalLength, z:normalA.z / normalLength };
+  const normalB = {
+    x:axis.y * normalA.z - axis.z * normalA.y,
+    y:axis.z * normalA.x - axis.x * normalA.z,
+    z:axis.x * normalA.y - axis.y * normalA.x,
+  };
+  const angle = Number(associative.angle || 0), cosine = Math.cos(angle), sine = Math.sin(angle);
+  const archDirection = { x:normalA.x * cosine + normalB.x * sine, y:normalA.y * cosine + normalB.y * sine, z:normalA.z * cosine + normalB.z * sine };
+  const archHeight = Math.max(0.22, Math.min(7, chordLength * (0.035 + Number(associative.arch || 0.2) * 0.2)));
+  const pointAt = (fraction, lift) => ({
+    x:source.x + dx * fraction + archDirection.x * archHeight * lift,
+    y:source.y + dy * fraction + archDirection.y * archHeight * lift,
+    z:(source.z || 0) + dz * fraction + archDirection.z * archHeight * lift,
+  });
+  return [
+    { x:source.x, y:source.y, z:source.z || 0 },
+    pointAt(0.26, 0.72),
+    pointAt(0.5, 1),
+    pointAt(0.74, 0.72),
+    { x:target.x, y:target.y, z:target.z || 0 },
+  ];
+}
+
+function associativeLinkKey(link) {
+  return String(link.id || `${link.source}:${link.relation || ''}:${link.target}`);
+}
+
+/*
+ * Deterministic 3-D associative layout shared by WebGL and the canvas fallback.
+ * Connected memory neighborhoods occupy separate volumes; edge semantics decide
+ * proximity inside each volume. Time is a gentle component-local direction, not
+ * a global depth plane, and high-degree concepts settle nearer a neighborhood's
+ * core while evidence and episodes remain readable satellites.
+ */
+function associativeLayout3D(rawNodes, rawLinks, layoutRevision = '') {
+  const orderedNodes = [...rawNodes].sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  const nodeIds = new Set(orderedNodes.map(node => node.id));
+  const usableLinks = rawLinks
+    .filter(link => nodeIds.has(link.source) && nodeIds.has(link.target) && link.source !== link.target)
+    .map(link => ({ ...link, layout: relationRule(link) }))
+    .sort((left, right) => String(left.id || `${left.source}:${left.target}`).localeCompare(String(right.id || `${right.source}:${right.target}`)));
+  let signatureHash = 2166136261;
+  const includeSignature = value => {
+    for (const character of String(value)) { signatureHash ^= character.charCodeAt(0); signatureHash = Math.imul(signatureHash, 16777619); }
+  };
+  for (const node of orderedNodes) includeSignature(`${node.id}:${node.kind || ''}:${node.subtype || ''};`);
+  for (const link of usableLinks) {
+    const confidenceBand = Math.round(link.layout.confidence * 20);
+    const recurrenceBand = Math.round(link.layout.recurrence * 20);
+    includeSignature(`${link.id || ''}:${link.source}:${link.relation || ''}:${link.target}:${confidenceBand}:${recurrenceBand}:${link.layout.family};`);
+  }
+  const signature = `${orderedNodes.length}:${usableLinks.length}:${signatureHash >>> 0}:${stableHash(layoutRevision)}`;
+  if (associativeLayoutCache.signature === signature && associativeLayoutCache.result) return associativeLayoutCache.result;
+  const neighborIds = new Map(orderedNodes.map(node => [node.id, new Set()]));
+  for (const link of usableLinks) {
+    neighborIds.get(link.source).add(link.target);
+    neighborIds.get(link.target).add(link.source);
+  }
+  for (const link of usableLinks) {
+    const sourceNeighbors = neighborIds.get(link.source), targetNeighbors = neighborIds.get(link.target);
+    const smaller = sourceNeighbors.size < targetNeighbors.size ? sourceNeighbors : targetNeighbors;
+    const larger = smaller === sourceNeighbors ? targetNeighbors : sourceNeighbors;
+    let shared = 0;
+    for (const id of smaller) if (larger.has(id)) shared += 1;
+    const structuralAgreement = shared / Math.max(1, Math.min(sourceNeighbors.size, targetNeighbors.size));
+    link.layout.tightness = Math.min(1, link.layout.tightness * 0.84 + structuralAgreement * 0.16);
+    link.layout.distance = 2.35 + Math.pow(1 - link.layout.tightness, 1.3) * 9.2;
+    link.layout.strength = 0.25 + link.layout.tightness * 1.55;
+  }
+  const adjacency = new Map(orderedNodes.map(node => [node.id, []]));
+  const weightedDegree = new Map(orderedNodes.map(node => [node.id, 0]));
+  for (const link of usableLinks) {
+    adjacency.get(link.source).push({ id:link.target, weight:link.layout.strength, tightness:link.layout.tightness, link });
+    adjacency.get(link.target).push({ id:link.source, weight:link.layout.strength, tightness:link.layout.tightness, link });
+    weightedDegree.set(link.source, weightedDegree.get(link.source) + link.layout.strength);
+    weightedDegree.set(link.target, weightedDegree.get(link.target) + link.layout.strength);
+  }
+
+  const components = [];
+  const visited = new Set();
+  for (const node of orderedNodes) {
+    if (visited.has(node.id)) continue;
+    const ids = [], queue = [node.id];
+    visited.add(node.id);
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const id = queue[cursor];
+      ids.push(id);
+      for (const neighbor of adjacency.get(id)) if (!visited.has(neighbor.id)) { visited.add(neighbor.id); queue.push(neighbor.id); }
+    }
+    ids.sort();
+    components.push({ ids, key: ids[0], weight: ids.reduce((sum, id) => sum + weightedDegree.get(id), 0) });
+  }
+  components.sort((left, right) => right.weight - left.weight || right.ids.length - left.ids.length || left.key.localeCompare(right.key));
+
+  const componentByNode = new Map(), componentOrigins = new Map(), temporalAxes = new Map();
+  const volumePoint = (key, span) => {
+    const random = seededUnit(stableHash(key));
+    const a = random() * 2 - 1, b = random() * 2 - 1, c = random() * 2 - 1;
+    return {
+      x: (a + Math.sin((b + c) * Math.PI) * 0.16) * span,
+      y: (b + Math.sin((c + a) * Math.PI) * 0.16) * span,
+      z: (c + Math.sin((a + b) * Math.PI) * 0.16) * span,
+    };
+  };
+  components.forEach((component, index) => {
+    component.ids.forEach(id => componentByNode.set(id, component));
+    componentOrigins.set(component.key, index === 0 && component.ids.length > 1 ? { x:0, y:0, z:0 } : volumePoint(`component:${component.key}`, component.ids.length > 1 ? 34 : 50));
+    temporalAxes.set(component.key, unitVector(stableHash(`time:${component.key}`)));
+  });
+
+  // A few deterministic weighted-label passes identify local associative
+  // neighborhoods without imposing categories or geometric lobes.
+  let communityLabels = new Map();
+  for (const node of orderedNodes) {
+    const neighbors = adjacency.get(node.id);
+    if (!neighbors.length) { communityLabels.set(node.id, node.id); continue; }
+    const strongest = [...neighbors].sort((left, right) =>
+      right.tightness * (1 + Math.log2(weightedDegree.get(right.id) + 1)) - left.tightness * (1 + Math.log2(weightedDegree.get(left.id) + 1)) || left.id.localeCompare(right.id)
+    )[0];
+    communityLabels.set(node.id, strongest.tightness >= 0.52 ? strongest.id : node.id);
+  }
+  for (let pass = 0; pass < 3; pass += 1) {
+    const nextLabels = new Map(communityLabels);
+    for (const node of orderedNodes) {
+      const neighbors = adjacency.get(node.id);
+      if (!neighbors.length) continue;
+      const scores = new Map([[communityLabels.get(node.id), weightedDegree.get(node.id) * 0.18]]);
+      for (const neighbor of neighbors) {
+        const label = communityLabels.get(neighbor.id);
+        scores.set(label, (scores.get(label) || 0) + neighbor.tightness * neighbor.tightness);
+      }
+      const winner = [...scores].sort((left, right) => right[1] - left[1] || String(left[0]).localeCompare(String(right[0])))[0];
+      nextLabels.set(node.id, winner[0]);
+    }
+    communityLabels = nextLabels;
+  }
+  const communityAffinity = new Map();
+  for (const node of orderedNodes) {
+    const neighbors = adjacency.get(node.id), ownLabel = communityLabels.get(node.id);
+    const total = neighbors.reduce((sum, neighbor) => sum + neighbor.tightness, 0);
+    const internal = neighbors.reduce((sum, neighbor) => sum + (communityLabels.get(neighbor.id) === ownLabel ? neighbor.tightness : 0), 0);
+    communityAffinity.set(node.id, total ? internal / total : 0);
+  }
+
+  const nodeById = new Map(orderedNodes.map(node => [node.id, node]));
+  const timestamps = orderedNodes.map(node => Date.parse(node.updated_at || '')).filter(Number.isFinite);
+  const oldest = timestamps.length ? Math.min(...timestamps) : 0, newest = timestamps.length ? Math.max(...timestamps) : 0;
+  const positions = new Map(), masses = new Map();
+  for (const node of orderedNodes) masses.set(node.id, 1 + Math.sqrt(weightedDegree.get(node.id)));
+  for (const component of components) {
+    const origin = componentOrigins.get(component.key), temporalAxis = temporalAxes.get(component.key);
+    if (component.ids.length === 1) {
+      positions.set(component.ids[0], volumePoint(`unassociated:${component.ids[0]}`, 52));
+      continue;
+    }
+    const root = [...component.ids].sort((left, right) => weightedDegree.get(right) - weightedDegree.get(left) || left.localeCompare(right))[0];
+    positions.set(root, { ...origin });
+    const discovered = new Set([root]), queue = [root];
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const sourceId = queue[cursor], source = positions.get(sourceId);
+      const neighbors = [...adjacency.get(sourceId)].sort((left, right) => right.tightness - left.tightness || left.id.localeCompare(right.id));
+      for (const neighbor of neighbors) {
+        if (discovered.has(neighbor.id)) continue;
+        discovered.add(neighbor.id); queue.push(neighbor.id);
+        const branch = unitVector(stableHash(`branch:${sourceId}:${neighbor.id}:${associativeLinkKey(neighbor.link)}`));
+        const random = seededUnit(stableHash(`length:${sourceId}:${neighbor.id}`));
+        const length = neighbor.link.layout.distance * (0.88 + random() * 0.24);
+        const timestamp = Date.parse(nodeById.get(neighbor.id)?.updated_at || '');
+        const temporal = newest > oldest && Number.isFinite(timestamp) ? ((timestamp - oldest) / (newest - oldest) - 0.5) * 1.8 : 0;
+        positions.set(neighbor.id, {
+          x: source.x + branch.x * length + temporalAxis.x * temporal,
+          y: source.y + branch.y * length + temporalAxis.y * temporal,
+          z: source.z + branch.z * length + temporalAxis.z * temporal,
+        });
+      }
+    }
+  }
+
+  const forceNodes = orderedNodes.filter(node => weightedDegree.get(node.id) > 0);
+  const forceCount = forceNodes.length;
+  const iterationCount = forceCount > 1200 ? 28 : forceCount > 500 ? 36 : 52;
+  const repulsionSamples = Math.max(0, Math.min(forceCount - 1, forceCount > 1200 ? 4 : forceCount > 500 ? 6 : 10));
+  const repulsionSeeds = forceNodes.map(node => Array.from({ length:repulsionSamples }, (_, sample) => stableHash(`${node.id}:${sample}`) + sample * 97));
+  for (let iteration = 0; iteration < iterationCount; iteration += 1) {
+    const temperature = 0.24 * Math.pow(1 - iteration / (iterationCount + 8), 1.35);
+    for (const link of usableLinks) {
+      const source = positions.get(link.source), target = positions.get(link.target);
+      let dx = target.x - source.x, dy = target.y - source.y, dz = target.z - source.z;
+      let distance = Math.hypot(dx, dy, dz);
+      if (distance < 0.001) {
+        const nudge = unitVector(stableHash(`link:${link.id || `${link.source}:${link.target}`}`));
+        dx = nudge.x * 0.01; dy = nudge.y * 0.01; dz = nudge.z * 0.01; distance = 0.01;
+      }
+      const adjustment = Math.max(-2.5, Math.min(2.5, (distance - link.layout.distance) * temperature * (0.1 + link.layout.strength * 0.16)));
+      const sourceMass = masses.get(link.source), targetMass = masses.get(link.target), totalMass = sourceMass + targetMass;
+      const sx = dx / distance * adjustment, sy = dy / distance * adjustment, sz = dz / distance * adjustment;
+      source.x += sx * targetMass / totalMass; source.y += sy * targetMass / totalMass; source.z += sz * targetMass / totalMass;
+      target.x -= sx * sourceMass / totalMass; target.y -= sy * sourceMass / totalMass; target.z -= sz * sourceMass / totalMass;
+    }
+    const communityCenters = new Map();
+    for (const node of forceNodes) {
+      const label = communityLabels.get(node.id), position = positions.get(node.id), center = communityCenters.get(label) || { x:0, y:0, z:0, weight:0 };
+      const weight = Math.max(0.2, communityAffinity.get(node.id));
+      center.x += position.x * weight; center.y += position.y * weight; center.z += position.z * weight; center.weight += weight;
+      communityCenters.set(label, center);
+    }
+    for (let index = 0; index < forceCount; index += 1) {
+      const node = forceNodes[index], position = positions.get(node.id), mass = masses.get(node.id);
+      for (let sample = 0; sample < repulsionSamples; sample += 1) {
+        const offset = 1 + ((repulsionSeeds[index][sample] + iteration * 37) % Math.max(1, forceCount - 1));
+        const otherNode = forceNodes[(index + offset) % forceCount], other = positions.get(otherNode.id);
+        let dx = position.x - other.x, dy = position.y - other.y, dz = position.z - other.z;
+        let distance = Math.hypot(dx, dy, dz);
+        if (distance < 0.001) {
+          const nudge = unitVector(stableHash(`apart:${node.id}:${otherNode.id}`));
+          dx = nudge.x * 0.01; dy = nudge.y * 0.01; dz = nudge.z * 0.01; distance = 0.01;
+        }
+        const clearance = 2.15 + Math.min(1.4, Math.log2(mass + masses.get(otherNode.id)) * 0.28);
+        if (distance >= clearance * 2.35) continue;
+        const push = Math.min(0.7, temperature * (0.34 / Math.max(0.18, distance) + Math.max(0, clearance - distance) * 0.24));
+        position.x += dx / distance * push; position.y += dy / distance * push; position.z += dz / distance * push;
+        other.x -= dx / distance * push; other.y -= dy / distance * push; other.z -= dz / distance * push;
+      }
+      const center = communityCenters.get(communityLabels.get(node.id)), affinity = communityAffinity.get(node.id);
+      if (center?.weight && affinity > 0) {
+        const cohesion = temperature * 0.026 * affinity;
+        position.x += (center.x / center.weight - position.x) * cohesion;
+        position.y += (center.y / center.weight - position.y) * cohesion;
+        position.z += (center.z / center.weight - position.z) * cohesion;
+      }
+      const componentOrigin = componentOrigins.get(componentByNode.get(node.id).key);
+      const gravity = temperature * 0.0015;
+      position.x += (componentOrigin.x - position.x) * gravity;
+      position.y += (componentOrigin.y - position.y) * gravity;
+      position.z += (componentOrigin.z - position.z) * gravity;
+    }
+  }
+
+  // Keep the aggregate cloud volumetric even when one dense relationship family
+  // would otherwise collapse depth. The cap avoids turning sparse chains into walls.
+  if (positions.size > 3) {
+    const values = [...positions.values()];
+    const mean = values.reduce((sum, position) => ({ x: sum.x + position.x, y: sum.y + position.y, z: sum.z + position.z }), { x: 0, y: 0, z: 0 });
+    mean.x /= values.length; mean.y /= values.length; mean.z /= values.length;
+    const variance = values.reduce((sum, position) => ({ x: sum.x + (position.x - mean.x) ** 2, y: sum.y + (position.y - mean.y) ** 2, z: sum.z + (position.z - mean.z) ** 2 }), { x: 0, y: 0, z: 0 });
+    const maximum = Math.max(variance.x, variance.y, variance.z, 0.001);
+    const gains = {
+      x: Math.min(2.25, Math.sqrt(maximum * 0.24 / Math.max(variance.x, 0.001))),
+      y: Math.min(2.25, Math.sqrt(maximum * 0.24 / Math.max(variance.y, 0.001))),
+      z: Math.min(2.25, Math.sqrt(maximum * 0.24 / Math.max(variance.z, 0.001))),
+    };
+    for (const position of values) {
+      position.x = mean.x + (position.x - mean.x) * Math.max(1, gains.x);
+      position.y = mean.y + (position.y - mean.y) * Math.max(1, gains.y);
+      position.z = mean.z + (position.z - mean.z) * Math.max(1, gains.z);
+    }
+  }
+  const result = { positions, degree:weightedDegree, links:new Map(usableLinks.map(link => [associativeLinkKey(link), link.layout])) };
+  associativeLayoutCache = { signature, result };
+  return result;
+}
+
 function initCanvasFallback(container) {
   const canvas = document.createElement('canvas');
   canvas.setAttribute('aria-label', 'Interactive compatibility rendering of the multimodal knowledge graph');
@@ -55,45 +418,13 @@ function initCanvasFallback(container) {
     lastDreamRevision = dreamRevision;
     const dreamTouched = new Set(data.dream?.touched_node_ids || []);
     if (dreamChanged) for (const link of data.links || []) if (dreamTouched.has(link.source) || dreamTouched.has(link.target)) { dreamTouched.add(link.source); dreamTouched.add(link.target); }
-    const timestamps = (data.nodes || []).map(node => Date.parse(node.updated_at || '')).filter(Number.isFinite);
-    const oldest = timestamps.length ? Math.min(...timestamps) : 0, newest = timestamps.length ? Math.max(...timestamps) : 0;
-    const degree = new Map();
-    for (const link of data.links || []) {
-      degree.set(link.source, (degree.get(link.source) || 0) + 1);
-      degree.set(link.target, (degree.get(link.target) || 0) + 1);
-    }
+    const association = associativeLayout3D(data.nodes || [], data.links || [], dreamRevision);
     nodes = (data.nodes || []).map((node, index) => {
-      const seed = hash(node.id), angle = ((seed % 10000) / 10000) * Math.PI * 2;
-      const subtype = String(node.subtype || '').toLowerCase();
-      const person = subtype.includes('person') || subtype.includes('face') || subtype.includes('appearance');
-      const content = subtype.includes('content') || subtype.includes('ocr');
-      const lobe = person ? -1 : content ? 1 : (seed & 1 ? 1 : -1);
-      const radius = 7 + ((seed >>> 8) % 1300) / 100;
-      const shell = node.kind === 'evidence' ? 1.24 : node.kind === 'episode' ? 0.7 : 1;
-      const timestamp = Date.parse(node.updated_at || ''), chronology = newest > oldest && Number.isFinite(timestamp) ? ((timestamp-oldest)/(newest-oldest)-.5)*30 : 0;
-      return { ...node, x:lobe * (7 + radius * .42) + Math.cos(angle) * radius * .7 * shell, y:Math.sin(angle) * radius * .64 * shell, z:chronology + ((((seed >>> 16) % 1000) / 1000) - .5) * 4 * shell, degree:degree.get(node.id) || 0, index, appendedAt:hadGraph && (!previousNodeIds.has(node.id) || (dreamChanged && dreamTouched.has(node.id))) ? appendedAt : 0 };
+      const position = association.positions.get(node.id) || { x:0, y:0, z:0 };
+      return { ...node, ...position, degree:association.degree.get(node.id) || 0, index, appendedAt:hadGraph && (!previousNodeIds.has(node.id) || (dreamChanged && dreamTouched.has(node.id))) ? appendedAt : 0 };
     });
     const byId = new Map(nodes.map(node => [node.id, node]));
-    links = (data.links || []).filter(link => byId.has(link.source) && byId.has(link.target)).map(link => ({ ...link, sourceNode:byId.get(link.source), targetNode:byId.get(link.target), appendedAt:hadGraph && !previousLinkIds.has(linkIdentity(link)) ? appendedAt : 0 }));
-    for (let iteration = 0; iteration < 34; iteration += 1) {
-      const temperature = .16 * (1 - iteration / 40);
-      for (const link of links) {
-        const dx = link.targetNode.x - link.sourceNode.x, dy = link.targetNode.y - link.sourceNode.y;
-        const distance = Math.max(.05, Math.hypot(dx, dy)), confidence = Math.max(.04, Math.min(1, Number(link.confidence ?? .5)));
-        const desired = 4.8 + (1 - confidence) * 14, force = (distance - desired) * temperature * (.25 + confidence * .55) / distance;
-        link.sourceNode.x += dx * force * .5; link.sourceNode.y += dy * force * .5;
-        link.targetNode.x -= dx * force * .5; link.targetNode.y -= dy * force * .5;
-      }
-      for (let index = 0; index < nodes.length; index += 1) {
-        const node = nodes[index];
-        for (let sample = 1; sample <= Math.min(7, nodes.length - 1); sample += 1) {
-          const other = nodes[(index + sample * 97 + iteration * 31) % nodes.length];
-          if (other === node) continue;
-          const dx = node.x - other.x, dy = node.y - other.y, squared = Math.max(.4, dx * dx + dy * dy);
-          if (squared < 30) { node.x += dx * temperature * 1.4 / squared; node.y += dy * temperature * 1.4 / squared; }
-        }
-      }
-    }
+    links = (data.links || []).filter(link => byId.has(link.source) && byId.has(link.target)).map(link => ({ ...link, associative:association.links.get(associativeLinkKey(link)) || relationRule(link), sourceNode:byId.get(link.source), targetNode:byId.get(link.target), appendedAt:hadGraph && !previousLinkIds.has(linkIdentity(link)) ? appendedAt : 0 }));
     for (const node of nodes) {
       const prior = previousPositions.get(node.id);
       node.tx=node.x;node.ty=node.y;node.tz=node.z||0;
@@ -138,7 +469,7 @@ function initCanvasFallback(container) {
         const current = queue.shift(); traversed += 1;
         if (!event.cascade || current.depth >= 3) continue;
         const neighbors = [...(adjacency.get(current.nodeId) || [])]
-          .sort((left, right) => Number(right.link.confidence || 0) - Number(left.link.confidence || 0)).slice(0, 10);
+          .sort((left, right) => Number(right.link.associative?.tightness || 0) - Number(left.link.associative?.tightness || 0)).slice(0, 10);
         for (const neighbor of neighbors) {
           const delay = current.delay + activationHopMs;
           neighbor.link.activationAt = now + current.delay + activationHopMs * .45;
@@ -184,12 +515,13 @@ function initCanvasFallback(container) {
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.fillStyle = '#070d19'; context.fillRect(0, 0, width, height);
     for (const link of links) {
-      const source = point(link.sourceNode), target = point(link.targetNode), confidence = Math.max(.05, Math.min(1, Number(link.confidence ?? .5)));
-      const visible = matches(link.sourceNode) && matches(link.targetNode), dx = target.x - source.x, dy = target.y - source.y, length = Math.max(1, Math.hypot(dx,dy));
-      const bend = ((hash(link.id || `${link.source}:${link.target}`) & 1) ? 1 : -1) * (7 + (1-confidence) * 15);
-      context.beginPath(); context.moveTo(source.x, source.y); context.quadraticCurveTo((source.x+target.x)/2-dy/length*bend, (source.y+target.y)/2+dx/length*bend, target.x, target.y);
-      context.strokeStyle = visible ? `rgba(102,126,168,${.16 + confidence * .36})` : 'rgba(68,82,108,.025)';
-      context.lineWidth = visible ? .45 + confidence * 2.4 + Math.min(1.6, Math.log2(Math.max(1,Number(link.confirmations || 1))) * .35) : .35;
+      const associative = link.associative || relationRule(link);
+      const spline = associativeSplinePoints(link.sourceNode, link.targetNode, link, associative).map(point);
+      const source = spline[0], controlA = spline[1], controlB = spline[3], target = spline[4];
+      const visible = matches(link.sourceNode) && matches(link.targetNode);
+      context.beginPath(); context.moveTo(source.x, source.y); context.bezierCurveTo(controlA.x, controlA.y, controlB.x, controlB.y, target.x, target.y);
+      context.strokeStyle = visible ? `rgba(102,126,168,${.08 + associative.associationStrength * .34 + associative.recurrence * .12})` : 'rgba(68,82,108,.025)';
+      context.lineWidth = visible ? .45 + associative.thickness * 4.4 : .35;
       context.stroke();
       const flash = appendFlash(link);
       if (flash > 0 && visible) { context.strokeStyle = `rgba(255,255,255,${flash})`; context.lineWidth += 1.8 * flash; context.stroke(); }
@@ -198,8 +530,8 @@ function initCanvasFallback(container) {
         context.globalAlpha = Math.min(1,.22+firing); context.strokeStyle = link.activationColor || '#fff'; context.lineWidth += 2.6 * firing; context.stroke();context.globalAlpha=1;
         const raw = Math.max(0, Math.min(1, (now-link.activationAt)/activationPulseMs));
         const t = link.activationFrom === link.target ? 1-raw : raw, inverse = 1-t;
-        const controlX=(source.x+target.x)/2-dy/length*bend, controlY=(source.y+target.y)/2+dx/length*bend;
-        const sparkX=inverse*inverse*source.x+2*inverse*t*controlX+t*t*target.x, sparkY=inverse*inverse*source.y+2*inverse*t*controlY+t*t*target.y;
+        const sparkX=inverse**3*source.x+3*inverse*inverse*t*controlA.x+3*inverse*t*t*controlB.x+t**3*target.x;
+        const sparkY=inverse**3*source.y+3*inverse*inverse*t*controlA.y+3*inverse*t*t*controlB.y+t**3*target.y;
         context.fillStyle=link.activationColor||'#fff';context.shadowColor=link.activationColor||'#fff';context.shadowBlur=14*firing;context.beginPath();context.arc(sparkX,sparkY,1.8+2.4*firing,0,Math.PI*2);context.fill();context.shadowBlur=0;
       }
     }
@@ -373,64 +705,12 @@ if (container) {
       return 0xffffff;
     }
 
-    function initialPosition(node, index, total) {
-      const seed = hash(node.id);
-      const random = randomUnit(seed);
-      const angle = random() * Math.PI * 2;
-      const radius = 8 + random() * 14;
-      const subtype = String(node.subtype || '').toLowerCase();
-      const content = subtype.includes('content') || subtype.includes('ocr');
-      const person = subtype.includes('person') || subtype.includes('face') || subtype.includes('appearance');
-      const lobe = person ? -1 : content ? 1 : (seed & 1 ? 1 : -1);
-      const shell = node.kind === 'evidence' ? 1.25 : node.kind === 'episode' ? 0.62 : 1;
-      return new THREE.Vector3(
-        lobe * (7 + radius * 0.46) + Math.cos(angle) * radius * 0.7 * shell,
-        Math.sin(angle) * radius * 0.64 * shell,
-        (random() - 0.5) * 20 * shell + Math.sin((index / Math.max(1, total)) * Math.PI * 4) * 2,
-      );
-    }
-
-    function relationshipLayout(nodes, links) {
-      const positions = new Map(nodes.map((node, index) => [node.id, initialPosition(node, index, nodes.length)]));
-      const timestamps = nodes.map(node => Date.parse(node.updated_at || '')).filter(Number.isFinite);
-      const oldest = timestamps.length ? Math.min(...timestamps) : 0;
-      const newest = timestamps.length ? Math.max(...timestamps) : 0;
-      const chronology = new Map();
-      for (const node of nodes) {
-        const timestamp = Date.parse(node.updated_at || '');
-        const temporalZ = newest > oldest && Number.isFinite(timestamp) ? ((timestamp - oldest) / (newest - oldest) - 0.5) * 30 : 0;
-        chronology.set(node.id, temporalZ);
-        positions.get(node.id).z = temporalZ + positions.get(node.id).z * 0.2;
-      }
-      const usableLinks = links.filter(link => positions.has(link.source) && positions.has(link.target));
-      const scratch = new THREE.Vector3();
-      for (let iteration = 0; iteration < 42; iteration += 1) {
-        const temperature = 0.21 * (1 - iteration / 50);
-        for (const link of usableLinks) {
-          const source = positions.get(link.source), target = positions.get(link.target);
-          scratch.subVectors(target, source);
-          const distance = Math.max(0.01, scratch.length());
-          const confidence = THREE.MathUtils.clamp(Number(link.confidence ?? 0.5), 0.04, 1);
-          const desired = 5.2 + (1 - confidence) * 15;
-          const adjustment = (distance - desired) * temperature * (0.25 + confidence * 0.55);
-          scratch.multiplyScalar(adjustment / distance);
-          source.addScaledVector(scratch, 0.5);
-          target.addScaledVector(scratch, -0.5);
-        }
-        for (let index = 0; index < nodes.length; index += 1) {
-          const node = nodes[index], position = positions.get(node.id), random = randomUnit(hash(node.id) + iteration);
-          for (let sample = 0; sample < Math.min(9, nodes.length - 1); sample += 1) {
-            const other = positions.get(nodes[Math.floor(random() * nodes.length)].id);
-            if (other === position) continue;
-            scratch.subVectors(position, other);
-            const squared = Math.max(0.45, scratch.lengthSq());
-            if (squared < 36) position.addScaledVector(scratch, temperature * 1.8 / squared);
-          }
-          position.multiplyScalar(0.9985);
-          position.z += (chronology.get(node.id) - position.z) * temperature * 0.045;
-        }
-      }
-      return positions;
+    function relationshipLayout(nodes, links, revision = '') {
+      const association = associativeLayout3D(nodes, links, revision);
+      return {
+        positions:new Map([...association.positions].map(([id, position]) => [id, new THREE.Vector3(position.x, position.y, position.z)])),
+        links:association.links,
+      };
     }
 
     function disposeObject(object) {
@@ -464,16 +744,9 @@ if (container) {
       selected = null;
     }
 
-    function curveFor(source, target, link) {
-      const midpoint = source.clone().add(target).multiplyScalar(0.5);
-      const chord = target.clone().sub(source);
-      const normal = new THREE.Vector3(-chord.y, chord.x, chord.z * 0.18);
-      if (normal.lengthSq() < 0.001) normal.set(0, 1, 0);
-      normal.normalize();
-      const confidence = THREE.MathUtils.clamp(Number(link.confidence ?? 0.5), 0, 1);
-      const direction = (hash(link.id || `${link.source}:${link.target}`) & 1) ? 1 : -1;
-      midpoint.addScaledVector(normal, direction * (0.65 + (1 - confidence) * 1.7));
-      return new THREE.CatmullRomCurve3([source, midpoint, target]);
+    function curveFor(source, target, link, associative) {
+      const points = associativeSplinePoints(source, target, link, associative).map(point => new THREE.Vector3(point.x, point.y, point.z));
+      return new THREE.CatmullRomCurve3(points, false, 'centripetal', 0.5);
     }
 
     function linkIdentity(link) {
@@ -495,10 +768,11 @@ if (container) {
       lastDreamRevision = dreamRevision;
       clearGraph();
       const nodes = Array.isArray(graphData.nodes) ? graphData.nodes : [];
-      const links = Array.isArray(graphData.links) ? graphData.links : [];
+      const links = Array.isArray(graphData.links) ? graphData.links.map(link => ({ ...link })) : [];
       const dreamTouched = new Set(graphData.dream?.touched_node_ids || []);
       if (dreamChanged) for (const link of links) if (dreamTouched.has(link.source) || dreamTouched.has(link.target)) { dreamTouched.add(link.source); dreamTouched.add(link.target); }
-      const positions = relationshipLayout(nodes, links);
+      const association = relationshipLayout(nodes, links, dreamRevision), positions = association.positions;
+      for (const link of links) link.associative = association.links.get(associativeLinkKey(link)) || relationRule(link);
       nodes.forEach(node => nodeById.set(node.id, node));
       for (const link of links) {
         if (!linksByNode.has(link.source)) linksByNode.set(link.source, []);
@@ -509,19 +783,20 @@ if (container) {
 
       const renderedLinks = links
         .filter(link => positions.has(link.source) && positions.has(link.target))
-        .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0))
+        .sort((a, b) => Number(b.associative?.tightness || 0) - Number(a.associative?.tightness || 0))
         .slice(0, 1800);
       for (const link of renderedLinks) {
         const source = positions.get(link.source), target = positions.get(link.target);
-        const confidence = THREE.MathUtils.clamp(Number(link.confidence ?? 0.5), 0.05, 1);
-        const confirmations = Math.max(1, Number(link.confirmations || 1));
-        const radius = 0.014 + confidence * 0.045 + Math.min(0.028, Math.log2(confirmations + 1) * 0.007);
-        const curve = curveFor(source, target, link);
-        const geometry = new THREE.TubeGeometry(curve, 8, radius, 3, false);
-        const material = new THREE.MeshBasicMaterial({ color: 0x58709c, transparent: true, opacity: 0.1 + confidence * 0.27, depthWrite: false });
+        const associative = link.associative || relationRule(link);
+        const tightness = associative.tightness;
+        const radius = 0.009 + associative.thickness * 0.105;
+        const curve = curveFor(source, target, link, link.associative);
+        const geometry = new THREE.TubeGeometry(curve, 12, radius, 4, false);
+        const baseOpacity = 0.055 + associative.associationStrength * 0.27 + associative.recurrence * 0.12;
+        const material = new THREE.MeshBasicMaterial({ color: 0x58709c, transparent: true, opacity: baseOpacity, depthWrite: false });
         const edge = new THREE.Mesh(geometry, material);
         const appended = hadGraph && (!previousLinkIds.has(linkIdentity(link)) || (dreamChanged && (dreamTouched.has(link.source) || dreamTouched.has(link.target))));
-        edge.userData = { link, source: link.source, target: link.target, curve, baseColor:material.color.clone(), baseOpacity:material.opacity, appendedAt:appended ? appendedAt : 0 };
+        edge.userData = { link, tightness, associationStrength:associative.associationStrength, recurrence:associative.recurrence, confirmations:associative.confirmations, thickness:associative.thickness, arch:associative.arch, angle:associative.angle, family:associative.family, source: link.source, target: link.target, curve, baseColor:material.color.clone(), baseOpacity, appendedAt:appended ? appendedAt : 0 };
         graphRoot.add(edge);
         edgeObjects.push(edge);
         edgeById.set(linkIdentity(link), edge);
@@ -586,7 +861,7 @@ if (container) {
           const current = queue.shift(); traversed += 1;
           if (!event.cascade || current.depth >= 3) continue;
           const neighbors = [...(linksByNode.get(current.nodeId) || [])]
-            .sort((left, right) => Number(right.confidence || 0) - Number(left.confidence || 0)).slice(0, 10);
+            .sort((left, right) => Number(right.associative?.tightness || 0) - Number(left.associative?.tightness || 0)).slice(0, 10);
           for (const link of neighbors) {
             const neighborId = link.source === current.nodeId ? link.target : link.source;
             const delay = current.delay + activationHopMs;
@@ -646,8 +921,7 @@ if (container) {
       }
       for (const edge of edgeObjects) {
         const match = visible.has(edge.userData.source) && visible.has(edge.userData.target);
-        const confidence = THREE.MathUtils.clamp(Number(edge.userData.link.confidence ?? 0.5), 0.05, 1);
-        edge.userData.displayOpacity = match ? 0.1 + confidence * 0.27 : 0.012;
+        edge.userData.displayOpacity = match ? edge.userData.baseOpacity : 0.012;
         edge.material.opacity = edge.userData.displayOpacity;
       }
       if ((query || kind) && visible.size === 1) {
