@@ -19,12 +19,15 @@ class MemoryPipeline:
     def __init__(self, config: EggConfig, store: MemoryStore) -> None:
         self.store = store
         self.entities = EntityResolver(store)
-        self.context = ContextAssembler(store)
+        default_mode_config = getattr(config, "default_mode", DefaultModeConfig())
+        self.context = ContextAssembler(
+            store, default_mode_config.document_context_characters
+        )
         self.consolidator = MemoryConsolidator(store, config.privacy)
         self.governance = MemoryGovernance(store, config.privacy)
         self.segmenter = EventSegmenter(config.memory, config.event_segmentation)
         self.default_mode = DefaultModeNetwork(
-            store, getattr(config, "default_mode", DefaultModeConfig())
+            store, default_mode_config
         )
         self.accepted_events = 0
         self.closed_episodes = 0
@@ -109,6 +112,9 @@ class MemoryPipeline:
 
     def retrieval_snapshot(self) -> list[dict[str, object]]:
         return self.context.last_hits()
+
+    def reflective_context(self, maximum: int | None = None) -> str:
+        return self.context.reflective_context(maximum)
 
     def lifecycle_snapshot(self) -> dict[str, object]:
         return self.segmenter.snapshot()

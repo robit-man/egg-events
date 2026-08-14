@@ -1106,8 +1106,13 @@ class OmniusClient:
             "engine": "omnius-legacy-advanced-ocr",
         }
 
-    async def classify_masked_object(self, image_png: bytes, detector_label: str, detector_confidence: float) -> tuple[str, float] | None:
-        """Classify a real transparent-mask crop with the configured local Ornith VLM."""
+    async def classify_masked_object_analysis(
+        self,
+        image_png: bytes,
+        detector_label: str,
+        detector_confidence: float,
+    ) -> dict[str, object] | None:
+        """Classify a mask and report grounded visual evidence of visible text."""
         image_data = base64.b64encode(image_png).decode("ascii")
         payload = {
             "model": self.config.vision_model,
@@ -1119,7 +1124,12 @@ class OmniusClient:
                         "Identify the specific physical item with a short ordinary noun phrase. Correct the detector "
                         "when its category is vague, stylistic, or unsupported by the pixels. Do not return a scene, "
                         "genre, material, person occupation, or visual style as the object label. "
-                        "Return JSON only: {\"label\": string|null, \"confidence\": number}. "
+                        "Independently inspect the opaque pixels for actually visible printed, written, or displayed "
+                        "characters. Do not infer text merely because this kind of object commonly has a label, and "
+                        "do not guess or transcribe unreadable characters. Return JSON only: "
+                        "{\"label\":string|null,\"confidence\":number,\"visible_text\":boolean,"
+                        "\"text_regions\":[string]}. text_regions is at most four short location descriptions "
+                        "such as 'upper-left display' or 'shirt front'; it is empty when no text is visibly grounded. "
                         f"Detector candidate: {detector_label!r} at {detector_confidence:.2f}."
                     ),
                     "images": [image_data],
@@ -1148,7 +1158,18 @@ class OmniusClient:
             content = result["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError("Omnius VLM returned an invalid completion") from error
-        return self.parse_object_classification(content)
+        return self.parse_object_analysis(content)
+
+    async def classify_masked_object(
+        self, image_png: bytes, detector_label: str, detector_confidence: float
+    ) -> tuple[str, float] | None:
+        """Compatibility classification view over the richer visual analysis."""
+        analysis = await self.classify_masked_object_analysis(
+            image_png, detector_label, detector_confidence
+        )
+        if analysis is None:
+            return None
+        return str(analysis["label"]), float(analysis["confidence"])
 
     async def compare_temporal_person_detections(
         self,
@@ -1317,6 +1338,13 @@ class OmniusClient:
 
     @staticmethod
     def parse_object_classification(content: object) -> tuple[str, float] | None:
+        analysis = OmniusClient.parse_object_analysis(content)
+        if analysis is None:
+            return None
+        return str(analysis["label"]), float(analysis["confidence"])
+
+    @staticmethod
+    def parse_object_analysis(content: object) -> dict[str, object] | None:
         if not isinstance(content, str):
             return None
         try:
@@ -1329,7 +1357,25 @@ class OmniusClient:
         normalized = " ".join(label.strip().split())
         if not normalized or len(normalized) > 64 or not 0 <= float(confidence) <= 1:
             return None
-        return normalized, float(confidence)
+        visible_text = parsed.get("visible_text", False)
+        text_regions = parsed.get("text_regions", [])
+        if not isinstance(visible_text, bool) or not isinstance(text_regions, list):
+            return None
+        normalized_regions = [
+            " ".join(region.strip().split())[:80]
+            for region in text_regions[:4]
+            if isinstance(region, str) and region.strip()
+        ]
+        if bool(normalized_regions) != visible_text:
+            # A visual-language hint can schedule OCR but must itself be
+            # internally consistent before it enters provenance.
+            visible_text = bool(normalized_regions)
+        return {
+            "label": normalized,
+            "confidence": float(confidence),
+            "visible_text": visible_text,
+            "text_regions": normalized_regions,
+        }
 
     async def audit_object_label(self, profile: dict[str, object]) -> dict[str, object] | None:
         """Cheap, text-only confidence audit of an already-labelled object.

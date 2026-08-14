@@ -83,6 +83,16 @@ class _PersonComparisonJob:
 
 
 @dataclass(frozen=True)
+class _OcrTarget:
+    parent_id: str
+    parent_type: str
+    parent_label: str
+    confidence: float
+    bbox: tuple[float, float, float, float]
+    mask_polygon: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass(frozen=True)
 class _OcrCandidate:
     camera_id: str
     image_png: bytes
@@ -94,6 +104,9 @@ class _OcrCandidate:
     confidence: float
     bbox: tuple[float, float, float, float] | None = None
     mask_polygon: tuple[tuple[float, float], ...] = ()
+    source_size: tuple[int, int] | None = None
+    targets: tuple[_OcrTarget, ...] = ()
+    trigger: str = "scheduled"
 
 
 @dataclass(frozen=True)
@@ -2236,62 +2249,47 @@ class CompanionRuntime:
         if not self.config.ocr.enabled or self._ocr_candidates.full():
             return
         now = time.monotonic()
-        candidates: list[
-            tuple[
-                str,
-                str,
-                str,
-                str,
-                float,
-                object | None,
-                tuple[tuple[float, float], ...],
-            ]
-        ] = []
         frame_key = f"frame:{observation.camera_id}"
-        if now - self._last_ocr_candidate_at.get(frame_key, 0.0) >= (
+        if now - self._last_ocr_candidate_at.get(frame_key, 0.0) < (
             self.config.ocr.full_frame_interval_seconds
         ):
-            self._last_ocr_candidate_at[frame_key] = now
-            candidates.append(
-                (
-                    "frame",
-                    f"scene:{observation.camera_id}",
-                    "object_category",
-                    f"{observation.camera_id} scene",
-                    0.55,
-                    None,
-                    (),
-                )
-            )
+            return
+        self._last_ocr_candidate_at[frame_key] = now
+        targets: list[_OcrTarget] = []
         for detection in observation.detections:
-            labels = {
-                str(detection.label),
-                str(detection.attributes.get("base_label") or ""),
-            }
-            if not any(self._label_implies_text(label) for label in labels):
-                continue
             object_id = detection.attributes.get("object_id")
-            parent_id = (
-                str(object_id)
-                if object_id
-                else self._ocr_parent_for_detection(
+            identity_id = detection.attributes.get("identity_id")
+            parent_id = str(
+                object_id
+                or identity_id
+                or self._ocr_parent_for_detection(
                     observation.camera_id, detection, now
                 )
             )
-            key = f"object:{parent_id}"
-            if now - self._last_ocr_candidate_at.get(key, 0.0) < (
-                self.config.ocr.text_object_interval_seconds
-            ):
-                continue
-            self._last_ocr_candidate_at[key] = now
-            candidates.append(
-                (
-                    "object",
+            targets.append(
+                _OcrTarget(
                     parent_id,
-                    "object" if object_id else "object_category",
-                    detection.label,
-                    detection.confidence,
-                    detection.bbox,
+                    (
+                        "object"
+                        if object_id
+                        else "person"
+                        if identity_id
+                        and detection.attributes.get("identity_persistent")
+                        else "appearance_track"
+                        if identity_id
+                        else "object_category"
+                    ),
+                    str(detection.attributes.get("identity") or detection.label),
+                    float(
+                        detection.attributes.get("identity_confidence")
+                        or detection.confidence
+                    ),
+                    (
+                        float(detection.bbox.x1),
+                        float(detection.bbox.y1),
+                        float(detection.bbox.x2),
+                        float(detection.bbox.y2),
+                    ),
                     tuple(
                         (float(point[0]), float(point[1]))
                         for point in detection.attributes.get("mask_polygon", ())
@@ -2299,58 +2297,37 @@ class CompanionRuntime:
                     ),
                 )
             )
-        for (
-            scope,
-            parent_id,
-            parent_type,
-            parent_label,
-            confidence,
-            bbox,
-            mask_polygon,
-        ) in candidates[:4]:
-            if self._ocr_candidates.full():
-                break
-            try:
-                image_png = await asyncio.to_thread(
-                    self._encode_ocr_image,
-                    frame,
-                    bbox,
-                    self.config.ocr.max_image_size,
-                    mask_polygon,
+        try:
+            image_png = await asyncio.to_thread(
+                self._encode_ocr_image,
+                frame,
+                None,
+                self.config.ocr.max_image_size,
+            )
+            self._ocr_candidates.put_nowait(
+                _OcrCandidate(
+                    observation.camera_id,
+                    image_png,
+                    observation.timestamp,
+                    "frame",
+                    f"scene:{observation.camera_id}",
+                    "object_category",
+                    f"{observation.camera_id} scene",
+                    0.55,
+                    source_size=(int(frame.shape[1]), int(frame.shape[0])),
+                    targets=tuple(targets),
+                    trigger="visual-text-region-proposal",
                 )
-            except Exception as error:
-                self.telemetry.record_ocr("error", error)
-                self.telemetry.record_runtime_error("ocr-prepare", error)
-                continue
-            try:
-                self._ocr_candidates.put_nowait(
-                    _OcrCandidate(
-                        observation.camera_id,
-                        image_png,
-                        observation.timestamp,
-                        scope,
-                        parent_id,
-                        parent_type,
-                        parent_label,
-                        float(confidence),
-                        (
-                            (
-                                float(bbox.x1),
-                                float(bbox.y1),
-                                float(bbox.x2),
-                                float(bbox.y2),
-                            )
-                            if bbox is not None
-                            else None
-                        ),
-                        mask_polygon,
-                    )
-                )
-            except asyncio.QueueFull:
-                # Multiple camera preparation tasks can fill the bounded queue
-                # between the capacity check and this non-blocking write.
-                break
-            self.telemetry.record_ocr("queued", f"{observation.camera_id}:{scope}:{parent_label}")
+            )
+        except asyncio.QueueFull:
+            return
+        except Exception as error:
+            self.telemetry.record_ocr("error", error)
+            self.telemetry.record_runtime_error("ocr-prepare", error)
+            return
+        self.telemetry.record_ocr(
+            "queued", f"{observation.camera_id}:frame:{len(targets)} masks"
+        )
 
     def _ocr_parent_for_detection(
         self, camera_id: str, detection: Detection, now: float
@@ -2385,14 +2362,6 @@ class CompanionRuntime:
             match["last_seen"] = now
         self._ocr_mask_tracks[camera_id] = tracks[-48:]
         return str(match["id"])
-
-    def _label_implies_text(self, label: str) -> bool:
-        normalized = " ".join(label.casefold().replace("_", " ").replace("-", " ").split())
-        return any(
-            hint.casefold() in normalized or normalized in hint.casefold()
-            for hint in self.config.ocr.text_bearing_labels
-            if hint.strip() and normalized
-        )
 
     @staticmethod
     def _identifier_fragment(value: str) -> str:
@@ -2584,6 +2553,7 @@ class CompanionRuntime:
         if image is None or image.size == 0:
             return None
         height, width = image.shape[:2]
+        source_width, source_height = width, height
         scale = min(2.5, max(1.0, 1800.0 / max(height, width)))
         if scale > 1.0:
             image = cv2.resize(
@@ -2642,11 +2612,98 @@ class CompanionRuntime:
                 best_score = score
         if best is None:
             return None
+        if scale != 1.0:
+            for region in best.get("regions", []):
+                bbox = region.get("bbox") if isinstance(region, dict) else None
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    region["bbox"] = [
+                        round(float(bbox[0]) / scale, 1),
+                        round(float(bbox[1]) / scale, 1),
+                        round(float(bbox[2]) / scale, 1),
+                        round(float(bbox[3]) / scale, 1),
+                    ]
         return {
             **best,
             "vision_used": False,
             "engine": "local-tesseract-multipass",
             "preprocessed": True,
+            "image_size": [source_width, source_height],
+        }
+
+    @classmethod
+    def _local_text_region_proposals(
+        cls, image_png: bytes
+    ) -> dict[str, object] | None:
+        """Run one sparse frame pass; advanced OCR is reserved for its regions."""
+        import cv2
+
+        if not shutil.which("tesseract"):
+            return None
+        image = cv2.imdecode(
+            np.frombuffer(image_png, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        if image is None or image.size == 0:
+            return None
+        source_height, source_width = image.shape[:2]
+        scale = min(2.0, max(1.0, 1600.0 / max(source_height, source_width)))
+        if scale > 1.0:
+            image = cv2.resize(
+                image,
+                (
+                    round(source_width * scale),
+                    round(source_height * scale),
+                ),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        variant = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        encoded, payload = cv2.imencode(".png", variant)
+        if not encoded:
+            return None
+        try:
+            process = subprocess.run(
+                [
+                    "tesseract",
+                    "stdin",
+                    "stdout",
+                    "-l",
+                    "eng",
+                    "--oem",
+                    "1",
+                    "--psm",
+                    "11",
+                    "tsv",
+                ],
+                input=payload.tobytes(),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if process.returncode != 0:
+            return None
+        parsed = cls._parse_tesseract_tsv(
+            process.stdout.decode("utf-8", errors="replace")
+        )
+        if parsed is None:
+            return None
+        if scale != 1.0:
+            for region in parsed.get("regions", []):
+                bbox = region.get("bbox") if isinstance(region, dict) else None
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    region["bbox"] = [
+                        round(float(bbox[0]) / scale, 1),
+                        round(float(bbox[1]) / scale, 1),
+                        round(float(bbox[2]) / scale, 1),
+                        round(float(bbox[3]) / scale, 1),
+                    ]
+        return {
+            **parsed,
+            "vision_used": False,
+            "engine": "local-tesseract-region-proposal",
+            "preprocessed": True,
+            "image_size": [source_width, source_height],
         }
 
     async def _run_advanced_ocr(self, image_png: bytes) -> dict[str, object] | None:
@@ -2675,7 +2732,13 @@ class CompanionRuntime:
                 "request", f"{candidate.camera_id}:{candidate.scope}:{candidate.parent_label}"
             )
             try:
-                result = await self._run_advanced_ocr(candidate.image_png)
+                result = (
+                    await asyncio.to_thread(
+                        self._local_text_region_proposals, candidate.image_png
+                    )
+                    if candidate.scope == "frame"
+                    else await self._run_advanced_ocr(candidate.image_png)
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -2686,6 +2749,22 @@ class CompanionRuntime:
             if result is None:
                 self.telemetry.record_ocr("empty", candidate.parent_label)
                 continue
+            if candidate.scope == "frame" and not result.get("image_size"):
+                try:
+                    import cv2
+
+                    decoded = await asyncio.to_thread(
+                        cv2.imdecode,
+                        np.frombuffer(candidate.image_png, dtype=np.uint8),
+                        cv2.IMREAD_COLOR,
+                    )
+                    if decoded is not None and decoded.size:
+                        result = {
+                            **result,
+                            "image_size": [int(decoded.shape[1]), int(decoded.shape[0])],
+                        }
+                except Exception:
+                    logger.debug("OCR result image size could not be recovered", exc_info=True)
             text = "\n".join(
                 " ".join(line.split())
                 for line in str(result.get("text") or "").splitlines()
@@ -2709,6 +2788,230 @@ class CompanionRuntime:
                 },
             )
             self._queue_ocr_memory(candidate, text, result)
+            if candidate.scope == "frame" and candidate.targets:
+                await self._queue_spatially_grounded_ocr(candidate, result)
+
+    async def _queue_spatially_grounded_ocr(
+        self, candidate: _OcrCandidate, result: dict[str, object]
+    ) -> None:
+        """Attach pixel-detected text to the smallest physical mask containing it."""
+        for index, (target, regions) in enumerate(
+            self._associate_ocr_regions(candidate, result)
+        ):
+            key = f"object:{target.parent_id}"
+            now = time.monotonic()
+            if now - self._last_ocr_candidate_at.get(key, 0.0) < (
+                self.config.ocr.text_object_interval_seconds
+            ):
+                continue
+            self._last_ocr_candidate_at[key] = now
+            text = "\n".join(
+                str(region.get("text") or "").strip()
+                for region in regions
+                if str(region.get("text") or "").strip()
+            )
+            if not text:
+                continue
+            confidences = [
+                float(region["confidence"])
+                for region in regions
+                if isinstance(region.get("confidence"), (int, float))
+            ]
+            evidence_crop = self._crop_ocr_region_evidence(
+                candidate, target, regions
+            )
+            grounded_result: dict[str, object] = {
+                **result,
+                "text": text,
+                "confidence": (
+                    sum(confidences) / len(confidences)
+                    if confidences
+                    else result.get("confidence")
+                ),
+                "regions": regions,
+                "grounded_from": candidate.parent_id,
+            }
+            if index < self.config.ocr.max_region_refinements:
+                try:
+                    refined = await self._run_advanced_ocr(evidence_crop)
+                except Exception as error:
+                    logger.warning("grounded OCR refinement failed", exc_info=error)
+                    self.telemetry.record_runtime_error("ocr-region-refine", error)
+                    refined = None
+                if refined is not None and str(refined.get("text") or "").strip():
+                    grounded_result = {
+                        **refined,
+                        "text": str(refined["text"]),
+                        "regions": regions,
+                        "refinement_regions": refined.get("regions", []),
+                        "proposal_engine": result.get("engine"),
+                        "grounded_from": candidate.parent_id,
+                    }
+                    text = str(refined["text"])
+            grounded_candidate = _OcrCandidate(
+                candidate.camera_id,
+                evidence_crop,
+                candidate.observed_at,
+                "masked-text-region",
+                target.parent_id,
+                target.parent_type,
+                target.parent_label,
+                target.confidence,
+                target.bbox,
+                target.mask_polygon,
+                source_size=candidate.source_size,
+                trigger="pixel-region-mask-overlap",
+            )
+            self.telemetry.record_ocr(
+                "grounded",
+                f"{target.parent_label}:{' '.join(text.split())[:120]}",
+            )
+            self._queue_ocr_memory(grounded_candidate, text, grounded_result)
+
+    @classmethod
+    def _associate_ocr_regions(
+        cls, candidate: _OcrCandidate, result: dict[str, object]
+    ) -> list[tuple[_OcrTarget, list[dict[str, object]]]]:
+        """Ground OCR boxes to masks independent of their semantic class label."""
+        image_size = result.get("image_size")
+        if (
+            candidate.source_size is None
+            or not isinstance(image_size, (list, tuple))
+            or len(image_size) != 2
+            or not all(
+                isinstance(value, (int, float)) and value > 0
+                for value in image_size
+            )
+        ):
+            return []
+        scale_x = candidate.source_size[0] / float(image_size[0])
+        scale_y = candidate.source_size[1] / float(image_size[1])
+        grouped: dict[str, tuple[_OcrTarget, list[dict[str, object]]]] = {}
+        regions = result.get("regions")
+        if not isinstance(regions, list):
+            return []
+        for raw_region in regions:
+            if not isinstance(raw_region, dict):
+                continue
+            raw_bbox = raw_region.get("bbox")
+            if (
+                not isinstance(raw_bbox, (list, tuple))
+                or len(raw_bbox) != 4
+                or not all(isinstance(value, (int, float)) for value in raw_bbox)
+            ):
+                continue
+            image_bbox = tuple(float(value) for value in raw_bbox)
+            source_bbox = (
+                image_bbox[0] * scale_x,
+                image_bbox[1] * scale_y,
+                image_bbox[2] * scale_x,
+                image_bbox[3] * scale_y,
+            )
+            matches = [
+                target
+                for target in candidate.targets
+                if cls._text_region_belongs_to_target(source_bbox, target)
+            ]
+            if not matches:
+                continue
+            # Nested objects own their pixels instead of a larger person mask.
+            target = min(
+                matches,
+                key=lambda item: max(
+                    1.0,
+                    (item.bbox[2] - item.bbox[0])
+                    * (item.bbox[3] - item.bbox[1]),
+                ),
+            )
+            normalized_region = {
+                **raw_region,
+                "bbox": [round(value, 1) for value in source_bbox],
+                "image_bbox": [round(value, 1) for value in image_bbox],
+            }
+            grouped.setdefault(target.parent_id, (target, []))[1].append(
+                normalized_region
+            )
+        return list(grouped.values())
+
+    @classmethod
+    def _text_region_belongs_to_target(
+        cls,
+        region: tuple[float, float, float, float],
+        target: _OcrTarget,
+    ) -> bool:
+        x1, y1, x2, y2 = region
+        tx1, ty1, tx2, ty2 = target.bbox
+        intersection = max(0.0, min(x2, tx2) - max(x1, tx1)) * max(
+            0.0, min(y2, ty2) - max(y1, ty1)
+        )
+        region_area = max(1.0, (x2 - x1) * (y2 - y1))
+        center = ((x1 + x2) / 2, (y1 + y2) / 2)
+        inside_box = tx1 <= center[0] <= tx2 and ty1 <= center[1] <= ty2
+        if not inside_box and intersection / region_area < 0.55:
+            return False
+        return not target.mask_polygon or cls._point_in_polygon(
+            center, target.mask_polygon
+        ) or intersection / region_area >= 0.80
+
+    @staticmethod
+    def _point_in_polygon(
+        point: tuple[float, float], polygon: tuple[tuple[float, float], ...]
+    ) -> bool:
+        x, y = point
+        inside = False
+        prior_x, prior_y = polygon[-1]
+        for current_x, current_y in polygon:
+            if (current_y > y) != (prior_y > y):
+                crossing_x = (prior_x - current_x) * (y - current_y) / (
+                    prior_y - current_y
+                ) + current_x
+                if x < crossing_x:
+                    inside = not inside
+            prior_x, prior_y = current_x, current_y
+        return inside
+
+    @staticmethod
+    def _crop_ocr_region_evidence(
+        candidate: _OcrCandidate,
+        target: _OcrTarget,
+        regions: list[dict[str, object]],
+    ) -> bytes:
+        import cv2
+
+        image = cv2.imdecode(
+            np.frombuffer(candidate.image_png, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        if image is None or image.size == 0 or candidate.source_size is None:
+            return candidate.image_png
+        image_height, image_width = image.shape[:2]
+        boxes = [
+            region.get("image_bbox")
+            for region in regions
+            if isinstance(region.get("image_bbox"), list)
+            and len(region["image_bbox"]) == 4
+        ]
+        if not boxes:
+            scale_x = image_width / candidate.source_size[0]
+            scale_y = image_height / candidate.source_size[1]
+            boxes = [[
+                target.bbox[0] * scale_x,
+                target.bbox[1] * scale_y,
+                target.bbox[2] * scale_x,
+                target.bbox[3] * scale_y,
+            ]]
+        x1 = min(float(box[0]) for box in boxes)
+        y1 = min(float(box[1]) for box in boxes)
+        x2 = max(float(box[2]) for box in boxes)
+        y2 = max(float(box[3]) for box in boxes)
+        margin = max(8.0, 0.25 * max(x2 - x1, y2 - y1))
+        x1 = max(0, int(x1 - margin))
+        y1 = max(0, int(y1 - margin))
+        x2 = min(image_width, int(x2 + margin))
+        y2 = min(image_height, int(y2 + margin))
+        if x2 <= x1 or y2 <= y1:
+            return candidate.image_png
+        encoded, payload = cv2.imencode(".png", image[y1:y2, x1:x2])
+        return payload.tobytes() if encoded else candidate.image_png
 
     def _queue_ocr_memory(
         self, candidate: _OcrCandidate, text: str, result: dict[str, object]
@@ -2719,6 +3022,12 @@ class CompanionRuntime:
             " ".join(line.split()) for line in text.splitlines() if line.strip()
         )[:2000]
         display_text = " ".join(normalized.split())
+        raw_ocr_confidence = result.get("confidence")
+        ocr_confidence = (
+            max(0.0, min(1.0, float(raw_ocr_confidence)))
+            if isinstance(raw_ocr_confidence, (int, float))
+            else candidate.confidence
+        )
         content_id = f"content:{hashlib.sha256(normalized.casefold().encode()).hexdigest()[:24]}"
         fragments = self._ocr_fragments(normalized, self.config.ocr.max_fragments)
         descriptors: list[dict[str, object]] = [
@@ -2730,12 +3039,13 @@ class CompanionRuntime:
                 "source": "advanced-ocr",
                 "camera_id": candidate.camera_id,
                 "ocr_scope": candidate.scope,
+                "ocr_trigger": candidate.trigger,
             },
             {
                 "id": content_id,
                 "type": "content",
                 "label": display_text[:120],
-                "confidence": candidate.confidence,
+                "confidence": ocr_confidence,
                 "source": "advanced-ocr",
                 "content_level": "block",
                 "camera_id": candidate.camera_id,
@@ -2748,8 +3058,12 @@ class CompanionRuntime:
                 "source_id": candidate.parent_id,
                 "relation": "contains_text",
                 "target_id": content_id,
-                "confidence": candidate.confidence,
-                "metadata": {"scope": candidate.scope, "camera_id": candidate.camera_id},
+                "confidence": ocr_confidence,
+                "metadata": {
+                    "scope": candidate.scope,
+                    "camera_id": candidate.camera_id,
+                    "trigger": candidate.trigger,
+                },
             }
         ]
         fragment_ids: list[str] = []
@@ -2767,7 +3081,7 @@ class CompanionRuntime:
                         "id": fragment_id,
                         "type": "content",
                         "label": fragment[:120],
-                        "confidence": candidate.confidence,
+                        "confidence": ocr_confidence,
                         "source": "advanced-ocr",
                         "content_level": "fragment",
                         "fragment_index": index,
@@ -2779,7 +3093,7 @@ class CompanionRuntime:
                         "source_id": content_id,
                         "relation": "contains_fragment",
                         "target_id": fragment_id,
-                        "confidence": candidate.confidence,
+                        "confidence": ocr_confidence,
                         "metadata": {"fragment_index": index},
                     }
                 )
@@ -2804,10 +3118,11 @@ class CompanionRuntime:
             "camera-advanced-ocr",
             candidate.camera_id,
             media_key=media_key,
-            quality=candidate.confidence,
+            quality=ocr_confidence,
             metadata={
                 "text": normalized,
                 "scope": candidate.scope,
+                "trigger": candidate.trigger,
                 "parent_id": candidate.parent_id,
                 "parent_label": candidate.parent_label,
                 "vision_used": bool(result.get("vision_used")),
@@ -2908,28 +3223,47 @@ class CompanionRuntime:
     async def _classify_with_ocr(
         self, image_png: bytes, detector_label: str, detector_confidence: float
     ) -> tuple[tuple[str, float] | None, dict[str, object] | None]:
-        """Classify a mask and OCR it when its category plausibly carries text."""
-        ocr_applicable = self._label_implies_text(detector_label)
-        vlm_result, ocr_result = await asyncio.gather(
-            self._omnius.classify_masked_object(
+        """Analyze one sparse stable mask; OCR admission is pixel-grounded."""
+        analysis_method = getattr(
+            self._omnius, "classify_masked_object_analysis", None
+        )
+        vlm_call = (
+            analysis_method(image_png, detector_label, detector_confidence)
+            if callable(analysis_method)
+            else self._omnius.classify_masked_object(
                 image_png, detector_label, detector_confidence
-            ),
-            (
-                self._run_advanced_ocr(image_png)
-                if ocr_applicable
-                else asyncio.sleep(0, result=None)
-            ),
+            )
+        )
+        vlm_response, ocr_result = await asyncio.gather(
+            vlm_call,
+            self._run_advanced_ocr(image_png),
             return_exceptions=True,
         )
-        if isinstance(vlm_result, BaseException):
-            raise vlm_result
-        if ocr_applicable:
-            self.telemetry.record_object_learning("ocr_request")
+        if isinstance(vlm_response, BaseException):
+            raise vlm_response
+        vlm_analysis = vlm_response if isinstance(vlm_response, dict) else None
+        vlm_result = (
+            (
+                str(vlm_analysis["label"]),
+                float(vlm_analysis["confidence"]),
+            )
+            if vlm_analysis is not None
+            else vlm_response
+        )
+        self.telemetry.record_object_learning("ocr_request")
         if isinstance(ocr_result, BaseException):
             logger.warning("advanced OCR failed; continuing with VLM result only", exc_info=ocr_result)
             self.telemetry.record_runtime_error("ocr-advanced", ocr_result)
             ocr_result = None
         elif ocr_result is not None:
+            if vlm_analysis is not None:
+                ocr_result = {
+                    **ocr_result,
+                    "vlm_visible_text": bool(vlm_analysis.get("visible_text")),
+                    "vlm_text_regions": list(
+                        vlm_analysis.get("text_regions") or []
+                    ),
+                }
             self.telemetry.record_object_learning("ocr_hit", ocr_result["text"][:80])
         return vlm_result, ocr_result
 
@@ -2997,6 +3331,36 @@ class CompanionRuntime:
                 if profile:
                     await self._sync_object_profile(profile.profile_id)
                     self._cache_object_recall(camera_id, detection, profile, confidence)
+                    if ocr_result is not None:
+                        self._queue_ocr_memory(
+                            _OcrCandidate(
+                                camera_id,
+                                image_png,
+                                datetime.now(timezone.utc),
+                                "vlm-mask",
+                                profile.profile_id,
+                                "object",
+                                profile.label,
+                                confidence,
+                                (
+                                    float(detection.bbox.x1),
+                                    float(detection.bbox.y1),
+                                    float(detection.bbox.x2),
+                                    float(detection.bbox.y2),
+                                ),
+                                tuple(
+                                    (float(point[0]), float(point[1]))
+                                    for point in detection.attributes.get(
+                                        "mask_polygon", ()
+                                    )
+                                    if isinstance(point, (list, tuple))
+                                    and len(point) >= 2
+                                ),
+                                trigger="stable-mask-visual-analysis",
+                            ),
+                            str(ocr_result.get("text") or ""),
+                            ocr_result,
+                        )
                     self.telemetry.record_object_learning(
                         "vlm_success", f"{profile.profile_id}:{profile.label}:{confidence:.3f}"
                     )
@@ -3477,8 +3841,23 @@ class CompanionRuntime:
                 )
                 try:
                     image = await asyncio.to_thread(self._encode_visual_question_frame, frame)
+                    reflective = (
+                        await asyncio.to_thread(
+                            self._memory.reflective_context, 900
+                        )
+                        if self._memory is not None
+                        else ""
+                    )
                     reply = await self._omnius.answer_visual_question(
-                        image, transcript, f"camera={camera_id}; {live_context}"
+                        image,
+                        transcript,
+                        f"camera={camera_id}; {live_context}"
+                        + (
+                            "; reflective working model (derived and revisable): "
+                            + reflective
+                            if reflective
+                            else ""
+                        ),
                     )
                 except Exception as error:
                     logger.warning("fresh visual question path unavailable: %s", error)
@@ -3893,6 +4272,15 @@ class CompanionRuntime:
             return
         try:
             scene = self._describe_scene(target, observation)
+            if self._memory is not None:
+                reflective = await asyncio.to_thread(
+                    self._memory.reflective_context, 900
+                )
+                if reflective:
+                    scene += (
+                        "\nReflective working model (derived and revisable): "
+                        + reflective
+                    )
             reply = await self._omnius.companion_reply(scene)
             spoken = await self._speak(reply)
             reason = "communicative visual action passed proactive policy"

@@ -4,7 +4,7 @@ from egg_companion.config import EggConfig
 from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.store import MemoryStore
 from egg_companion.models import BoundingBox, Detection, EvidenceRef, PerceptualEvent
-from egg_companion.runtime import CompanionRuntime
+from egg_companion.runtime import CompanionRuntime, _OcrCandidate, _OcrTarget
 
 
 def _config(tmp_path) -> EggConfig:
@@ -20,16 +20,10 @@ def _config(tmp_path) -> EggConfig:
     )
 
 
-def test_ocr_configuration_recognizes_text_bearing_objects(tmp_path) -> None:
+def test_ocr_fragments_preserve_nested_content(tmp_path) -> None:
     runtime = object.__new__(CompanionRuntime)
     runtime.config = _config(tmp_path)
 
-    assert runtime._label_implies_text("flat screen television")
-    assert runtime._label_implies_text("hard-cover book")
-    assert runtime._label_implies_text("store sign")
-    assert runtime._label_implies_text("aluminum can")
-    assert runtime._label_implies_text("water bottle")
-    assert not runtime._label_implies_text("wooden chair")
     assert runtime._ocr_fragments("First heading\nSecond nested line. Final line.", 8) == [
         "First heading",
         "Second nested line.",
@@ -86,6 +80,47 @@ def test_tesseract_tsv_parser_keeps_confident_nested_lines_and_rejects_noise() -
         [header, "5\t1\t1\t1\t1\t1\t0\t0\t100\t20\t93\tOCULUS"]
     )
     assert CompanionRuntime._parse_tesseract_tsv(confident_single_label) is not None
+
+
+def test_pixel_text_regions_attach_to_smallest_nested_mask_without_label_filter() -> None:
+    person = _OcrTarget(
+        "person-1", "person", "Sam", 0.9, (100, 50, 900, 950)
+    )
+    unknown_item = _OcrTarget(
+        "visual-mask-1",
+        "object_category",
+        "unseen thing",
+        0.8,
+        (300, 300, 700, 650),
+        ((300, 300), (700, 300), (700, 650), (300, 650)),
+    )
+    candidate = _OcrCandidate(
+        "camera-0",
+        b"frame",
+        datetime.now(timezone.utc),
+        "frame",
+        "scene:camera-0",
+        "object_category",
+        "camera-0 scene",
+        0.55,
+        source_size=(1000, 1000),
+        targets=(person, unknown_item),
+    )
+
+    associations = CompanionRuntime._associate_ocr_regions(
+        candidate,
+        {
+            "image_size": [500, 500],
+            "regions": [
+                {"text": "ORBITAL", "confidence": 0.94, "bbox": [175, 190, 275, 220]}
+            ],
+        },
+    )
+
+    assert len(associations) == 1
+    target, regions = associations[0]
+    assert target.parent_id == "visual-mask-1"
+    assert regions[0]["bbox"] == [350.0, 380.0, 550.0, 440.0]
 
 
 def test_ocr_event_persists_parent_content_fragments_and_explicit_relations(tmp_path) -> None:

@@ -686,6 +686,242 @@ class MemoryStore:
             )
         return reflection_id, created
 
+    def recurrent_entity_pairs(
+        self,
+        minimum_confirmations: int = 2,
+        limit: int = 24,
+        period_seconds: int = 600,
+    ) -> list[dict[str, Any]]:
+        """Return motifs repeated across time windows, not adjacent frames."""
+        minimum = max(2, int(minimum_confirmations))
+        bounded = max(1, min(int(limit), self.config.graph_max_nodes))
+        period = max(60, min(int(period_seconds), 86400))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT left_entity.entity_id AS left_id,
+                left_entity.entity_type AS left_type,
+                left_entity.display_name AS left_label,
+                right_entity.entity_id AS right_id,
+                right_entity.entity_type AS right_type,
+                right_entity.display_name AS right_label,
+                COUNT(DISTINCT CAST(strftime('%s', episode.started_at) / ? AS INTEGER))
+                  AS confirmations,
+                COUNT(DISTINCT left_episode.episode_id) AS observation_count,
+                MAX(episode.started_at) AS last_observed_at
+                FROM episode_entities left_episode
+                JOIN episode_entities right_episode
+                  ON left_episode.episode_id=right_episode.episode_id
+                 AND left_episode.entity_id < right_episode.entity_id
+                JOIN entities left_entity
+                  ON left_entity.entity_id=left_episode.entity_id
+                JOIN entities right_entity
+                  ON right_entity.entity_id=right_episode.entity_id
+                JOIN episodes episode ON episode.episode_id=left_episode.episode_id
+                WHERE left_entity.state='active' AND right_entity.state='active'
+                  AND left_entity.merged_into IS NULL
+                  AND right_entity.merged_into IS NULL
+                  AND left_entity.entity_type IN
+                    ('person','object','object_category','content','sound_event')
+                  AND right_entity.entity_type IN
+                    ('person','object','object_category','content','sound_event')
+                GROUP BY left_entity.entity_id, right_entity.entity_id
+                HAVING confirmations >= ?
+                ORDER BY confirmations DESC, last_observed_at DESC LIMIT ?""",
+                (period, minimum, bounded),
+            ).fetchall()
+            records = [dict(row) for row in rows]
+            for record in records:
+                episode_rows = self._connection.execute(
+                    """SELECT MIN(left_episode.episode_id) AS episode_id,
+                    CAST(strftime('%s', episode.started_at) / ? AS INTEGER) AS period_id
+                    FROM episode_entities left_episode
+                    JOIN episode_entities right_episode
+                      ON left_episode.episode_id=right_episode.episode_id
+                    JOIN episodes episode ON episode.episode_id=left_episode.episode_id
+                    WHERE left_episode.entity_id=? AND right_episode.entity_id=?
+                    GROUP BY period_id ORDER BY period_id DESC LIMIT 100""",
+                    (period, record["left_id"], record["right_id"]),
+                ).fetchall()
+                record["episode_ids"] = ",".join(
+                    str(item["episode_id"])
+                    for item in episode_rows
+                    if item["episode_id"]
+                )
+                record["support_period_ids"] = [
+                    str(item["period_id"])
+                    for item in episode_rows
+                    if item["period_id"] is not None
+                ]
+        return records
+
+    def retire_inactive_meta_graph(
+        self, active_abstraction_ids: list[str], at: datetime
+    ) -> int:
+        """Supersede derived motifs no longer admitted by current support rules."""
+        active = set(active_abstraction_ids)
+        timestamp = _timestamp(at)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """SELECT entity_id FROM entities WHERE entity_type='abstraction'
+                AND state='active'
+                AND json_extract(metadata_json, '$.abstraction_kind')=
+                  'recurring_episode_association'"""
+            ).fetchall()
+            stale = [str(row["entity_id"]) for row in rows if row["entity_id"] not in active]
+            for abstraction_id in stale:
+                connection.execute(
+                    "UPDATE entities SET state='superseded', updated_at=? WHERE entity_id=?",
+                    (timestamp, abstraction_id),
+                )
+                connection.execute(
+                    """UPDATE edges SET state='retracted', valid_to=?
+                    WHERE state='active' AND (
+                      source_id=? OR target_id=? OR
+                      json_extract(metadata_json, '$.abstraction_id')=?
+                    )""",
+                    (timestamp, abstraction_id, abstraction_id, abstraction_id),
+                )
+        return len(stale)
+
+    def update_entity_summary(
+        self, entity_id: str, summary: str, at: datetime
+    ) -> None:
+        """Store a bounded derived summary while retaining its source entity."""
+        normalized = " ".join(summary.split())[:600]
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT metadata_json FROM entities WHERE entity_id=?", (entity_id,)
+            ).fetchone()
+        if existing is None:
+            return
+        metadata = json.loads(existing["metadata_json"])
+        if metadata.get("derived_summary") == normalized:
+            return
+        self.upsert_entity(
+            "unknown",
+            metadata={
+                "derived_summary": normalized,
+                "summary_updated_at": at.isoformat(),
+            },
+            entity_id=entity_id,
+            now=at,
+        )
+
+    def upsert_cognitive_document(
+        self,
+        kind: str,
+        title: str,
+        content: str,
+        confidence: float,
+        source_entity_ids: list[str],
+        at: datetime,
+    ) -> dict[str, Any]:
+        """Create or revise one stable, inspectable meta-graph document node."""
+        document_id = f"cognitive-document:{kind}"
+        normalized = "\n".join(
+            line.rstrip() for line in content.splitlines() if line.strip()
+        )[:5000]
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT metadata_json FROM entities WHERE entity_id=?",
+                (document_id,),
+            ).fetchone()
+        metadata = json.loads(existing["metadata_json"]) if existing else {}
+        bounded_confidence = max(0.0, min(1.0, float(confidence)))
+        normalized_sources = list(dict.fromkeys(source_entity_ids))[:100]
+        changed = (
+            metadata.get("content") != normalized
+            or metadata.get("source_entity_ids") != normalized_sources
+            or metadata.get("confidence") != bounded_confidence
+        )
+        revision = int(metadata.get("revision") or 0) + int(changed)
+        if not changed and existing is not None:
+            return {
+                "document_id": document_id,
+                "kind": kind,
+                "revision": revision,
+                "changed": False,
+                "content": normalized,
+            }
+        self.upsert_entity(
+            "cognitive_document",
+            title[:120],
+            {
+                "document_kind": kind,
+                "content": normalized,
+                "revision": revision,
+                "confidence": bounded_confidence,
+                "source_entity_ids": normalized_sources,
+                "epistemic_status": "derived_from_local_evidence",
+                "updated_at": at.isoformat(),
+            },
+            document_id,
+            now=at,
+        )
+        return {
+            "document_id": document_id,
+            "kind": kind,
+            "revision": revision,
+            "changed": changed,
+            "content": normalized,
+        }
+
+    def cognitive_documents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT entity_id, display_name, updated_at, metadata_json
+                FROM entities WHERE entity_type='cognitive_document'
+                AND state='active' ORDER BY updated_at DESC"""
+            ).fetchall()
+        return [_row(row) for row in rows]
+
+    def upsert_derived_edge(
+        self,
+        edge_id: str,
+        source_id: str,
+        relation: str,
+        target_id: str,
+        confidence: float,
+        confirmations: int,
+        at: datetime,
+        metadata: dict[str, Any],
+    ) -> str:
+        """Project a stable derived synapse without inflating repeat counts."""
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO edges
+                (edge_id, source_id, relation, target_id, confidence, valid_from,
+                 confirmation_count, state, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                ON CONFLICT(edge_id) DO UPDATE SET confidence=excluded.confidence,
+                confirmation_count=excluded.confirmation_count, state='active',
+                metadata_json=excluded.metadata_json""",
+                (
+                    edge_id,
+                    source_id,
+                    relation,
+                    target_id,
+                    max(0.0, min(1.0, float(confidence))),
+                    _timestamp(at),
+                    max(1, int(confirmations)),
+                    json.dumps(metadata, sort_keys=True),
+                ),
+            )
+        return edge_id
+
+    def recent_interaction_outcomes(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Return bounded observed dialogue outcomes for strategy consolidation."""
+        bounded = max(1, min(int(limit), 1000))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT evidence_id, captured_at, quality, payload_json
+                FROM evidence WHERE modality='action'
+                AND source_type='interaction-policy'
+                ORDER BY captured_at DESC LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+        return [_row(row) for row in rows]
+
     def find_entity_by_source(self, source_system: str, source_profile_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(

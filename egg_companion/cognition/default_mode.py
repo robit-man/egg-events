@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 
 from egg_companion.config import DefaultModeConfig
+from egg_companion.cognition.world_model import WorldModelSynthesizer
 from egg_companion.memory.store import MemoryStore
 
 
@@ -18,6 +19,7 @@ class DefaultModeNetwork:
     def __init__(self, store: MemoryStore, config: DefaultModeConfig) -> None:
         self.store = store
         self.config = config
+        self.world_model = WorldModelSynthesizer(store, config)
 
     def run_once(self) -> dict[str, object]:
         job_id = self.store.create_job("default-mode-replay")
@@ -139,9 +141,11 @@ class DefaultModeNetwork:
                     "inventory_size": len(inventory),
                 }
             )
+            result["meta_graph"] = self.world_model.update(
+                replayed, reflection_ids, now
+            )
             self.store.update_job(job_id, "complete")
             return result
         except Exception as error:
             self.store.update_job(job_id, "failed", str(error))
             raise
-

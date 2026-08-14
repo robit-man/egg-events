@@ -170,6 +170,7 @@ ocr:
   max_image_size: 1280
   min_text_characters: 2
   max_fragments: 8
+  max_region_refinements: 2
 
 memory:
   enabled: true
@@ -221,6 +222,11 @@ default_mode:
   proactive_budget_per_hour: 2
   proactive_cooldown_seconds: 300
   question_timeout_seconds: 240
+  meta_graph_min_confirmations: 2
+  meta_graph_period_seconds: 600
+  meta_graph_limit: 24
+  entity_summary_limit: 12
+  document_context_characters: 1800
 
 privacy:
   persistent_identity_enabled: true

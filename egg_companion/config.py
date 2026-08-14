@@ -271,16 +271,7 @@ class OcrConfig(BaseModel):
     max_image_size: int = Field(default=1280, ge=320, le=2560)
     min_text_characters: int = Field(default=2, ge=1, le=100)
     max_fragments: int = Field(default=8, ge=1, le=32)
-    text_bearing_labels: list[str] = Field(
-        default_factory=lambda: [
-            "appliance", "book", "bottle", "box", "can", "card", "carton",
-            "computer", "container", "device", "document", "jar", "keyboard",
-            "label", "laptop", "license plate", "magazine", "menu", "monitor",
-            "newspaper", "package", "packaging", "paper", "phone", "poster",
-            "receipt", "remote", "screen", "sign", "tablet", "television",
-            "text", "tv", "whiteboard",
-        ]
-    )
+    max_region_refinements: int = Field(default=2, ge=0, le=8)
 
 
 class MemoryConfig(BaseModel):
@@ -340,6 +331,11 @@ class DefaultModeConfig(BaseModel):
     proactive_budget_per_hour: int = Field(default=2, ge=0, le=20)
     proactive_cooldown_seconds: float = Field(default=300, ge=0, le=86400)
     question_timeout_seconds: float = Field(default=240, gt=0, le=3600)
+    meta_graph_min_confirmations: int = Field(default=2, ge=2, le=1000)
+    meta_graph_period_seconds: int = Field(default=600, ge=60, le=86400)
+    meta_graph_limit: int = Field(default=24, ge=1, le=200)
+    entity_summary_limit: int = Field(default=12, ge=1, le=100)
+    document_context_characters: int = Field(default=1800, ge=400, le=8000)
 
 
 class PrivacyConfig(BaseModel):

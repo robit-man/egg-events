@@ -226,14 +226,15 @@ ocr:
   # live Ornith model and must never stall the bounded OCR queue.
   local_multipass_enabled: true
   omnius_refinement_enabled: false
-  # Full-frame scans catch signs and loose text; text-bearing object crops are
-  # prioritized between those scans.
+  # Full-frame visual text regions are spatially grounded to the smallest
+  # overlapping mask; labels never gate OCR admission.
   full_frame_interval_seconds: 20
   text_object_interval_seconds: 8
   queue_size: 8
   max_image_size: 1280
   min_text_characters: 2
   max_fragments: 8
+  max_region_refinements: 2
 
 memory:
   enabled: true
@@ -281,6 +282,12 @@ default_mode:
   proactive_budget_per_hour: 2
   proactive_cooldown_seconds: 300
   question_timeout_seconds: 240
+  # Repeated episode motifs become inspectable non-causal abstraction nodes.
+  meta_graph_min_confirmations: 2
+  meta_graph_period_seconds: 600
+  meta_graph_limit: 24
+  entity_summary_limit: 12
+  document_context_characters: 1800
 
 privacy:
   persistent_identity_enabled: true

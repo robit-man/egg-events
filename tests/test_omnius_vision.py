@@ -13,6 +13,24 @@ def test_vlm_object_response_requires_bounded_json_label() -> None:
     assert OmniusClient.parse_object_classification('{"label":"mug","confidence":1.2}') is None
 
 
+def test_vlm_object_analysis_reports_grounded_text_regions_without_changing_label_api() -> None:
+    payload = (
+        '{"label":"cotton shirt","confidence":0.91,"visible_text":true,'
+        '"text_regions":["shirt front"]}'
+    )
+
+    assert OmniusClient.parse_object_analysis(payload) == {
+        "label": "cotton shirt",
+        "confidence": 0.91,
+        "visible_text": True,
+        "text_regions": ["shirt front"],
+    }
+    assert OmniusClient.parse_object_classification(payload) == (
+        "cotton shirt",
+        0.91,
+    )
+
+
 def test_temporal_person_comparison_requires_bounded_explainable_json() -> None:
     response = (
         '{"same_person":true,"confidence":0.93,'
