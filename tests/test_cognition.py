@@ -84,3 +84,35 @@ def test_graph_familiarity_downweights_raw_novelty_without_erasing_gap() -> None
     assert familiar.components["effective_novelty"] < unfamiliar.components["effective_novelty"]
     assert familiar.capture_priority < unfamiliar.capture_priority
     assert familiar.components["graph_relevance"] == 0.8
+
+
+def test_model_authored_policy_can_direct_bounded_proactive_path() -> None:
+    now = datetime.now(timezone.utc)
+    detection = Detection(
+        "microscope", 0.92, BoundingBox(100, 100, 500, 500),
+        {"object_id": "object-microscope", "frame_shape": [1080, 1920]},
+    )
+    observation = Observation("camera-0", now, (detection,))
+    attention = AttentionTarget(
+        "track-microscope", detection, 1.0, 0.9, "new microscope", "camera-0", now
+    )
+    decision = CognitiveAttentionController(
+        CognitiveAttentionConfig(), proactive_enabled=True
+    ).evaluate(
+        attention,
+        observation,
+        GraphCognitiveSignal(
+            "object-microscope", familiarity=0.0, structural_relevance=0.2,
+            knowledge_gap=0.9, evidence_count=1, edge_count=0,
+        ),
+        {
+            "focus_terms": ["microscope"],
+            "focus_entity_ids": ["object-microscope"],
+            "proactive_entity_ids": ["object-microscope"],
+        },
+    )
+
+    assert decision.allow_outward_speech
+    assert decision.components["model_directed_action"] == 1.0
+    assert decision.components["observation_policy_relevance"] == 1.0
+    assert "model-authored" in decision.reason

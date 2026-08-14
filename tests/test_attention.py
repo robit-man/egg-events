@@ -3,6 +3,7 @@ import unittest
 
 from egg_companion.core.attention import AttentionManager
 from egg_companion.models import BoundingBox, Detection, Observation
+from egg_companion.models import GraphCognitiveSignal
 
 
 class AttentionTests(unittest.TestCase):
@@ -48,3 +49,29 @@ class AttentionTests(unittest.TestCase):
         )
         manager.select(Observation("front", now, (person,)))
         assert manager.select(Observation("front", now + timedelta(seconds=1), (person,))) == []
+
+    def test_graph_familiarity_prevents_expired_stable_track_from_false_novelty(self) -> None:
+        manager = AttentionManager(track_ttl_seconds=1, min_priority=0.35)
+        now = datetime.now(timezone.utc)
+        person = Detection(
+            "person", 0.9, BoundingBox(100, 100, 500, 900),
+            {"frame_shape": [1080, 1920], "identity_id": "person-001"},
+        )
+        manager.select(Observation("front", now, (person,)))
+        signal = GraphCognitiveSignal(
+            "person-001", familiarity=0.95, structural_relevance=0.6,
+            knowledge_gap=0.3, evidence_count=30, edge_count=10,
+        )
+
+        assert manager.select(
+            Observation("front", now + timedelta(seconds=2), (person,)),
+            {"person-001": signal},
+        ) == []
+
+        selected = manager.select(
+            Observation("front", now + timedelta(seconds=4), (person,)),
+            {"person-001": signal},
+            {"focus_terms": ["person"], "focus_entity_ids": ["person-001"]},
+        )
+        assert selected
+        assert "conversation-relevant" in selected[0].reason

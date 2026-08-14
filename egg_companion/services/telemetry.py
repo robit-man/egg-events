@@ -148,6 +148,7 @@ class RuntimeTelemetry:
         self._scene = SceneInventory()
         self._brain: dict[str, object] = {}
         self._default_mode: dict[str, object] = {"state": "idle"}
+        self._narrative_semantics: dict[str, object] = {"state": "idle"}
         self._gpu: dict[str, object] = {}
 
     def set_rotation(self, camera_id: str, angle: int) -> None:
@@ -319,6 +320,13 @@ class RuntimeTelemetry:
     def record_default_mode(self, state: dict[str, object]) -> None:
         with self._lock:
             self._default_mode = {
+                **dict(state),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def record_narrative_semantics(self, state: dict[str, object]) -> None:
+        with self._lock:
+            self._narrative_semantics = {
                 **dict(state),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -574,6 +582,7 @@ class RuntimeTelemetry:
                     }
                     for entity_id, signal in tick.graph_feedback.items()
                 },
+                "observation_policy": dict(tick.observation_policy),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -796,6 +805,7 @@ class RuntimeTelemetry:
                 "memory": dict(self._memory),
                 "brain": {**self._brain, "memory": dict(self._memory)},
                 "default_mode": dict(self._default_mode),
+                "narrative_semantics": dict(self._narrative_semantics),
                 "gpu": dict(self._gpu),
                 "attention_decisions": list(self._attention_decisions),
                 "interaction_decisions": list(self._interaction_decisions),

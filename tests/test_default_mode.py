@@ -10,7 +10,7 @@ def _store(tmp_path) -> MemoryStore:
     return MemoryStore(MemoryConfig(storage_dir=str(tmp_path / "memory")))
 
 
-def test_default_mode_replays_source_backed_gap_and_stops_after_answer(tmp_path) -> None:
+def test_default_mode_replays_provenance_without_manufacturing_semantics(tmp_path) -> None:
     store = _store(tmp_path)
     now = datetime.now(timezone.utc)
     store.upsert_entity("object", "amber mug", entity_id="object-1", now=now)
@@ -21,19 +21,15 @@ def test_default_mode_replays_source_backed_gap_and_stops_after_answer(tmp_path)
         )
         store.append_evidence(evidence)
         store.link_entity_evidence("object-1", evidence.evidence_id)
-    network = DefaultModeNetwork(
-        store,
-        DefaultModeConfig(
-            reflection_min_evidence=2, curiosity_threshold=0.4, replay_limit=8
-        ),
-    )
+    network = DefaultModeNetwork(store, DefaultModeConfig(replay_limit=8))
 
     first = network.run_once()
 
     assert first["phase"] == "complete"
     assert first["replayed_entity_ids"] == ["object-1"]
-    assert first["reflections_created"] == 1
-    assert first["curiosity_candidates"][0]["predicate"] == "used_for"
+    assert first["reflections_created"] == 0
+    assert first["reflection_ids"] == []
+    assert first["curiosity_candidates"] == []
 
     store.assert_claim_once(
         "object-1", "used_for", "morning coffee", 1.0, now, source="human-answer"

@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
-from egg_companion.models import AttentionTarget, Detection, Observation
+from egg_companion.models import (
+    AttentionTarget, Detection, GraphCognitiveSignal, Observation,
+)
 
 
 def intersection_over_union(first: Detection, second: Detection) -> float:
@@ -40,14 +42,33 @@ class AttentionManager:
         self.max_targets = max_targets
         self._tracks: dict[str, _Track] = {}
 
-    def select(self, observation: Observation) -> list[AttentionTarget]:
+    def select(
+        self,
+        observation: Observation,
+        graph_feedback: dict[str, GraphCognitiveSignal] | None = None,
+        observation_policy: dict[str, object] | None = None,
+    ) -> list[AttentionTarget]:
         self._expire_tracks(observation.timestamp)
-        targets = [self._score(detection, observation) for detection in observation.detections]
+        targets = [
+            self._score(
+                detection,
+                observation,
+                graph_feedback or {},
+                observation_policy or {},
+            )
+            for detection in observation.detections
+        ]
         selected = [target for target in targets if target.priority >= self.min_priority]
         selected.sort(key=lambda target: target.priority, reverse=True)
         return selected[: self.max_targets]
 
-    def _score(self, detection: Detection, observation: Observation) -> AttentionTarget:
+    def _score(
+        self,
+        detection: Detection,
+        observation: Observation,
+        graph_feedback: dict[str, GraphCognitiveSignal],
+        observation_policy: dict[str, object],
+    ) -> AttentionTarget:
         matched = self._match(detection, observation.camera_id)
         if matched is None:
             track = _Track(str(uuid4()), detection, observation.camera_id, observation.timestamp)
@@ -75,10 +96,35 @@ class AttentionManager:
         shape = detection.attributes.get("frame_shape")
         frame_area = float(shape[0] * shape[1]) if isinstance(shape, list) and len(shape) == 2 else 1.0
         size = min(1.0, detection.bbox.area / max(frame_area * 0.2, 1.0))
-        person_bonus = 0.25 * novelty if detection.label == "person" else 0.0
+        stable_id = str(
+            detection.attributes.get("identity_id")
+            or detection.attributes.get("object_id")
+            or ""
+        )
+        signal = graph_feedback.get(stable_id)
+        familiarity = signal.familiarity if signal else 0.0
+        effective_novelty = novelty * (1.0 - 0.85 * familiarity)
+        focus_entities = {
+            str(value) for value in observation_policy.get("focus_entity_ids", []) if value
+        }
+        policy_relevant = bool(stable_id and stable_id in focus_entities)
+        person_bonus = 0.25 * effective_novelty if detection.label == "person" else 0.0
         action_bonus = 0.2 if detection.attributes.get("behavior") in {"waving", "approaching"} else 0.0
         direction_bonus = 0.1 if detection.attributes.get("audio_aligned") is True else 0.0
-        priority = min(1.0, 0.45 * novelty + 0.2 * size + person_bonus + action_bonus + direction_bonus)
+        policy_bonus = 0.22 if policy_relevant else 0.0
+        gap_bonus = 0.06 * signal.knowledge_gap if signal and policy_relevant else 0.0
+        priority = min(
+            1.0,
+            0.45 * effective_novelty
+            + 0.2 * size
+            + person_bonus
+            + action_bonus
+            + direction_bonus
+            + policy_bonus
+            + gap_bonus,
+        )
+        if policy_relevant:
+            reason += "; conversation-relevant"
         return AttentionTarget(
             track_id=track.id,
             detection=detection,

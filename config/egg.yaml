@@ -264,6 +264,7 @@ cognitive_attention:
   speech_weight: 0.30
   prediction_error_weight: 0.15
   epistemic_value_weight: 0.18
+  observation_policy_weight: 0.22
   graph_familiarity_discount: 0.85
   irreducible_uncertainty_discount: 0.65
   interruption_threshold: 0.75
@@ -277,14 +278,9 @@ default_mode:
   interval_min_seconds: 60
   interval_max_seconds: 180
   replay_limit: 8
-  reflection_min_evidence: 2
-  curiosity_threshold: 0.64
   proactive_budget_per_hour: 2
   proactive_cooldown_seconds: 300
   question_timeout_seconds: 240
-  # Repeated episode motifs become inspectable non-causal abstraction nodes.
-  meta_graph_min_confirmations: 2
-  meta_graph_period_seconds: 600
   meta_graph_limit: 24
   entity_summary_limit: 12
   document_context_characters: 1800

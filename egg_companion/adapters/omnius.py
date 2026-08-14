@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import math
 import os
 import tempfile
@@ -19,6 +20,9 @@ from egg_companion.cognition.dialogue import (
     InterruptionDecision,
     parse_interruption_decision,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class OmniusClient:
@@ -429,6 +433,626 @@ class OmniusClient:
             "tool": tool,
             "tool_query": tool_query,
         }
+
+    async def plan_narrative_dream(
+        self,
+        daily_evidence: dict[str, object],
+        constitution: dict[str, object],
+        prior_policy: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Let the cognition model decide which evidence tools it needs."""
+        raw = await self._narrative_structured_chat(
+            "Plan an evidence-grounded dream synthesis. The narrative constitution is mutable "
+            "strategy, not evidence. Decide whether additional tools are needed before synthesis.\n"
+            f"Constitution: {self._bounded_prompt_json(constitution, 1000)}\n"
+            "Prior model-authored observation policy: "
+            f"{self._bounded_prompt_json(prior_policy, 1000)}\n"
+            f"Daily provenance ledger: {self._bounded_prompt_json(daily_evidence, 5000)}\n"
+            "Return JSON with exactly: {\"tool_requests\":[{\"tool\":\"memory_search\"|"
+            "\"graph_inspect\"|\"evidence_inspect\"|\"web_search\",\"query\":string|null,"
+            "\"entity_ids\":[string],\"evidence_ids\":[string],\"purpose\":string}],"
+            "\"planning_summary\":string}. Request web search only when external knowledge is "
+            "needed to interpret evidence; local memory and artifacts are authoritative for lived events."
+            " Return at most two requests, at most four IDs in each reference list, keep query and "
+            "purpose under 180 characters, and finish the complete JSON under 1,800 characters.",
+            max_tokens=512,
+        )
+        parsed = self._parse_narrative_plan(raw)
+        if parsed is not None:
+            return parsed
+        repaired = await self._narrative_structured_chat(
+            "Reformat the prior tool plan to the exact contract without adding facts. Return only "
+            "{\"tool_requests\":[{\"tool\":\"memory_search\"|\"graph_inspect\"|"
+            "\"evidence_inspect\"|\"web_search\",\"query\":string|null,\"entity_ids\":[string],"
+            "\"evidence_ids\":[string],\"purpose\":string}],\"planning_summary\":string}. "
+            "Use every field, no extra fields, at most two requests, no more than four IDs per "
+            "reference list, and finish the complete JSON under 1,800 characters.\nPrior response: "
+            + self._bounded_prompt_json(raw, 3000),
+            max_tokens=512,
+        )
+        parsed = self._parse_narrative_plan(repaired)
+        if parsed is None:
+            logger.warning(
+                "narrative planner violated its JSON contract; initial=%r repair=%r",
+                raw[:2000],
+                repaired[:2000],
+            )
+        return parsed
+
+    @classmethod
+    def _parse_narrative_plan(cls, raw: str) -> dict[str, object] | None:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if set(parsed) != {"tool_requests", "planning_summary"}:
+            return None
+        requests = parsed.get("tool_requests")
+        summary = parsed.get("planning_summary")
+        if (
+            not isinstance(requests, list)
+            or len(requests) > 4
+            or not isinstance(summary, str)
+            or not summary.strip()
+        ):
+            return None
+        normalized: list[dict[str, object]] = []
+        for request in requests:
+            if (
+                not isinstance(request, dict)
+                or set(request) != {
+                    "tool", "query", "entity_ids", "evidence_ids", "purpose"
+                }
+                or request.get("tool") not in {
+                "memory_search", "graph_inspect", "evidence_inspect", "web_search"
+                }
+            ):
+                return None
+            query = request.get("query")
+            entity_ids = request.get("entity_ids", [])
+            evidence_ids = request.get("evidence_ids", [])
+            purpose = request.get("purpose")
+            if query is not None and (
+                not isinstance(query, str) or not query.strip()
+            ):
+                return None
+            if not isinstance(entity_ids, list) or not all(
+                isinstance(value, str) and value.strip() for value in entity_ids
+            ):
+                return None
+            if not isinstance(evidence_ids, list) or not all(
+                isinstance(value, str) and value.strip() for value in evidence_ids
+            ):
+                return None
+            if not isinstance(purpose, str) or not purpose.strip():
+                return None
+            normalized.append(
+                {
+                    "tool": request["tool"],
+                    "query": " ".join(query.split())[:300] if query else None,
+                    "entity_ids": [value[:300] for value in entity_ids[:12]],
+                    "evidence_ids": [value[:300] for value in evidence_ids[:12]],
+                    "purpose": " ".join(purpose.split())[:300],
+                }
+            )
+        return {
+            "tool_requests": normalized,
+            "planning_summary": " ".join(summary.split())[:1000],
+        }
+
+    async def synthesize_narrative_dream(
+        self,
+        daily_evidence: dict[str, object],
+        constitution: dict[str, object],
+        prior_policy: dict[str, object],
+        plan: dict[str, object],
+        tool_results: list[dict[str, object]],
+    ) -> dict[str, object] | None:
+        """Produce learned narrative semantics and a self-revisable future policy."""
+        core_context = (
+            "Synthesize one day into an evolving associative world account. Do not expose hidden "
+            "reasoning. Do not use lexical frequency or detector repetition as meaning by itself. "
+            "Distinguish sensory evidence, heard speech, agent speech, tool evidence, inference, and "
+            "uncertainty. The observation policy must be learned from this evidence and the prior "
+            "policy, not copied as a static checklist. Constitution changes must improve the general "
+            "future method rather than encode facts or keywords from this day. Your response is the "
+            "semantic interpretation pass: do not describe the account as still awaiting or pending "
+            "model semantics merely because the provenance ledger carries that pre-synthesis state. "
+            "Resolve what the evidence supports and state remaining epistemic uncertainty directly.\n"
+            f"Constitution: {self._bounded_prompt_json(constitution, 600)}\n"
+            f"Prior policy: {self._bounded_prompt_json(prior_policy, 600)}\n"
+            f"Daily ledger: {self._bounded_prompt_json(daily_evidence, 2200)}\n"
+            f"Plan: {self._bounded_prompt_json(plan, 500)}\n"
+            f"Tool results: {self._bounded_prompt_json(tool_results, 1000)}\n"
+        )
+        core_raw = await self._narrative_structured_chat(
+            core_context
+            + "Return the narrative core only as JSON with exactly: narrative_summary string, "
+            "story_update string, themes, episodes. themes contain label, summary, confidence, "
+            "entity_ids, evidence_ids, context_ids. episodes contain title, summary, significance, "
+            "confidence, started_at, ended_at, entity_ids, evidence_ids, context_ids. Use empty "
+            "reference arrays when there is no supported reference. Return at most two themes and "
+            "two episodes, selected by you. Keep each prose field under 500 characters and each "
+            "reference array to at most four IDs so the complete JSON stays under 4,500 characters.",
+            max_tokens=1200,
+        )
+        core = self._parse_narrative_core(core_raw)
+        if core is None:
+            core_repair = await self._narrative_structured_chat(
+                "Re-author the prior narrative core to the exact requested JSON contract without "
+                "adding evidence or conclusions. Preserve only supported content. Return exactly "
+                "narrative_summary, story_update, themes, episodes; include confidence and empty "
+                "entity_ids, evidence_ids, and context_ids arrays where no reference exists. "
+                "Use at most two themes and two episodes, prose fields under 500 characters, no "
+                "more than four IDs per reference array, and finish the JSON under 4,500 characters.\n"
+                "Prior response: " + self._bounded_prompt_json(core_raw, 3000),
+                max_tokens=1200,
+            )
+            core = self._parse_narrative_core(core_repair)
+            if core is None:
+                logger.warning(
+                    "narrative core violated its JSON contract; initial=%r repair=%r",
+                    core_raw[:2000],
+                    core_repair[:2000],
+                )
+                return None
+        reflection_context = (
+            "Reflect on an evidence-grounded daily narrative to revise future attention and inquiry. "
+            "Do not expose hidden reasoning. Preserve uncertainty and provenance. Changes to the "
+            "constitution must improve the general method rather than encode this day's facts or "
+            "keywords.\n"
+            f"Constitution: {self._bounded_prompt_json(constitution, 600)}\n"
+            f"Prior policy: {self._bounded_prompt_json(prior_policy, 700)}\n"
+            f"Daily ledger: {self._bounded_prompt_json(daily_evidence, 1800)}\n"
+            f"Tool results: {self._bounded_prompt_json(tool_results, 800)}\n"
+        )
+        reflection_raw = await self._narrative_structured_chat(
+            reflection_context
+            + f"Narrative core already authored: {self._bounded_prompt_json(core, 1600)}\n"
+            "Return reflective policy only as JSON with exactly: unresolved_questions, learned_context, "
+            "observation_policy, constitution_update. unresolved_questions and learned_context contain "
+            "summary, confidence, entity_ids, evidence_ids, context_ids. observation_policy has summary, "
+            "attend_to, deprioritize, open_questions; every item contains summary, reason, action, predicate, "
+            "confidence, entity_ids, evidence_ids, context_ids. predicate is a claim predicate or null. "
+            "attend_to actions: observe, retrieve, ask, speak. deprioritize action: deprioritize. "
+            "open_questions actions: observe, retrieve, ask. constitution_update is a general revised "
+            "constitution string or null. Use empty arrays where appropriate and at most two items per list. "
+            "Keep each prose field under 400 characters and each reference array to at most four IDs.",
+            max_tokens=1000,
+        )
+        reflection = self._parse_narrative_reflection(reflection_raw)
+        if reflection is None:
+            reflection_repair = await self._narrative_structured_chat(
+                "Re-author the prior reflective policy to the exact requested JSON contract without "
+                "adding evidence or conclusions. Return exactly unresolved_questions, learned_context, "
+                "observation_policy, constitution_update. observation_policy must be an object shaped "
+                "exactly as {\"summary\":string,\"attend_to\":[],\"deprioritize\":[],"
+                "\"open_questions\":[]}, never an array. Include every required field and empty "
+                "reference arrays where no reference exists; predicate may be null. Use only the "
+                "allowed actions and at most two items per list. Keep each prose field under 400 "
+                "characters and each reference array to at most four IDs.\nPrior response: "
+                + self._bounded_prompt_json(reflection_raw, 3000),
+                max_tokens=1000,
+            )
+            reflection = self._parse_narrative_reflection(reflection_repair)
+            if reflection is None:
+                logger.warning(
+                    "narrative reflection violated its JSON contract; initial=%r repair=%r",
+                    reflection_raw[:2000],
+                    reflection_repair[:2000],
+                )
+                return None
+        combined = {"version": 1, **core, **reflection}
+        return self._parse_narrative_synthesis(
+            json.dumps(combined, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    @classmethod
+    def _parse_narrative_core(cls, raw: str) -> dict[str, object] | None:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or set(parsed) != {
+            "narrative_summary", "story_update", "themes", "episodes"
+        }:
+            return None
+        if not cls._bounded_text(parsed.get("narrative_summary"), 6000):
+            return None
+        story = parsed.get("story_update")
+        if isinstance(story, dict):
+            for key in ("entity_ids", "evidence_ids", "context_ids"):
+                story.setdefault(key, [])
+            if not cls._narrative_items(
+                [story], maximum=1, text_fields={"summary": 2000}
+            ):
+                return None
+        elif not cls._bounded_text(story, 8000):
+            return None
+        for key in ("themes", "episodes"):
+            values = parsed.get(key)
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, dict):
+                        for reference_key in (
+                            "entity_ids", "evidence_ids", "context_ids"
+                        ):
+                            item.setdefault(reference_key, [])
+        if not cls._narrative_items(
+            parsed.get("themes"), maximum=8,
+            text_fields={"label": 200, "summary": 2000},
+        ) or not cls._narrative_items(
+            parsed.get("episodes"), maximum=8,
+            text_fields={"title": 200, "summary": 2400, "significance": 1600},
+            temporal=True,
+        ):
+            return None
+        return parsed
+
+    @classmethod
+    def _parse_narrative_reflection(cls, raw: str) -> dict[str, object] | None:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or set(parsed) != {
+            "unresolved_questions", "learned_context", "observation_policy",
+            "constitution_update",
+        }:
+            return None
+        flat_policy = parsed.get("observation_policy")
+        if isinstance(flat_policy, list):
+            for item in flat_policy:
+                if isinstance(item, dict):
+                    item.setdefault("predicate", None)
+                    for reference_key in (
+                        "entity_ids", "evidence_ids", "context_ids"
+                    ):
+                        item.setdefault(reference_key, [])
+            if not cls._narrative_items(
+                flat_policy,
+                maximum=8,
+                text_fields={"summary": 1200, "reason": 1600},
+                enum_fields={
+                    "action": {
+                        "observe", "retrieve", "ask", "speak", "deprioritize"
+                    }
+                },
+                nullable_text_fields={"predicate": 200},
+            ):
+                return None
+            active = [
+                item for item in flat_policy
+                if item.get("action") != "deprioritize"
+            ]
+            deprioritized = [
+                item for item in flat_policy
+                if item.get("action") == "deprioritize"
+            ]
+            summaries = [str(item["summary"]) for item in flat_policy]
+            parsed["observation_policy"] = {
+                "summary": " ".join(summaries)[:4000],
+                "attend_to": active,
+                "deprioritize": deprioritized,
+                "open_questions": [],
+            }
+        for key in ("unresolved_questions", "learned_context"):
+            values = parsed.get(key)
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, dict):
+                        for reference_key in (
+                            "entity_ids", "evidence_ids", "context_ids"
+                        ):
+                            item.setdefault(reference_key, [])
+            if not cls._narrative_items(
+                values, maximum=8, text_fields={"summary": 2000}
+            ):
+                return None
+        policy = parsed.get("observation_policy")
+        if not isinstance(policy, dict) or set(policy) != {
+            "summary", "attend_to", "deprioritize", "open_questions"
+        } or not cls._bounded_text(policy.get("summary"), 4000):
+            return None
+        policy_actions = {
+            "attend_to": {"observe", "retrieve", "ask", "speak"},
+            "deprioritize": {"deprioritize"},
+            "open_questions": {"observe", "retrieve", "ask"},
+        }
+        for key, actions in policy_actions.items():
+            values = policy.get(key)
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, dict):
+                        item.setdefault("predicate", None)
+                        for reference_key in (
+                            "entity_ids", "evidence_ids", "context_ids"
+                        ):
+                            item.setdefault(reference_key, [])
+            if not cls._narrative_items(
+                values, maximum=8,
+                text_fields={"summary": 1200, "reason": 1600},
+                enum_fields={"action": actions},
+                nullable_text_fields={"predicate": 200},
+            ):
+                return None
+        constitution = parsed.get("constitution_update")
+        if constitution is not None and not cls._bounded_text(constitution, 6000):
+            return None
+        return parsed
+
+    @classmethod
+    def _parse_narrative_synthesis(cls, raw: str) -> dict[str, object] | None:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if set(parsed) != {
+            "version",
+            "narrative_summary",
+            "story_update",
+            "themes",
+            "episodes",
+            "unresolved_questions",
+            "learned_context",
+            "observation_policy",
+            "constitution_update",
+        } or parsed.get("version") != 1:
+            return None
+        story_update_detail: dict[str, object] | None = None
+        if isinstance(parsed.get("story_update"), dict):
+            story_update_detail = dict(parsed["story_update"])
+            for reference_key in ("entity_ids", "evidence_ids", "context_ids"):
+                story_update_detail.setdefault(reference_key, [])
+            if not cls._narrative_items(
+                [story_update_detail],
+                maximum=1,
+                text_fields={"summary": 2000},
+            ):
+                return None
+            parsed = {**parsed, "story_update": story_update_detail.get("summary")}
+        for key in ("themes", "episodes", "unresolved_questions", "learned_context"):
+            values = parsed.get(key)
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, dict):
+                        for reference_key in (
+                            "entity_ids", "evidence_ids", "context_ids"
+                        ):
+                            item.setdefault(reference_key, [])
+        policy_value = parsed.get("observation_policy")
+        if isinstance(policy_value, dict):
+            for key in ("attend_to", "deprioritize", "open_questions"):
+                values = policy_value.get(key)
+                if isinstance(values, list):
+                    for item in values:
+                        if isinstance(item, dict):
+                            item.setdefault("predicate", None)
+                            for reference_key in (
+                                "entity_ids", "evidence_ids", "context_ids"
+                            ):
+                                item.setdefault(reference_key, [])
+        if not cls._bounded_text(parsed.get("narrative_summary"), 6000):
+            return None
+        if not cls._bounded_text(parsed.get("story_update"), 8000):
+            return None
+        if not cls._narrative_items(
+            parsed.get("themes"),
+            maximum=20,
+            text_fields={"label": 200, "summary": 2000},
+        ):
+            return None
+        if not cls._narrative_items(
+            parsed.get("episodes"),
+            maximum=48,
+            text_fields={"title": 200, "summary": 2400, "significance": 1600},
+            temporal=True,
+        ):
+            return None
+        for key, maximum in (("unresolved_questions", 20), ("learned_context", 30)):
+            if not cls._narrative_items(
+                parsed.get(key), maximum=maximum, text_fields={"summary": 2000}
+            ):
+                return None
+        policy = parsed.get("observation_policy")
+        if (
+            not isinstance(policy, dict)
+            or set(policy) != {"summary", "attend_to", "deprioritize", "open_questions"}
+            or not cls._bounded_text(policy.get("summary"), 4000)
+        ):
+            return None
+        policy_actions = {
+            "attend_to": {"observe", "retrieve", "ask", "speak"},
+            "deprioritize": {"deprioritize"},
+            "open_questions": {"observe", "retrieve", "ask"},
+        }
+        for key, allowed_actions in policy_actions.items():
+            if not cls._narrative_items(
+                policy.get(key),
+                maximum=20,
+                text_fields={"summary": 1200, "reason": 1600},
+                enum_fields={"action": allowed_actions},
+                nullable_text_fields={"predicate": 200},
+            ):
+                return None
+        constitution_update = parsed.get("constitution_update")
+        if constitution_update is not None and not cls._bounded_text(
+            constitution_update, 6000
+        ):
+            return None
+        if story_update_detail is not None:
+            parsed["story_update_detail"] = story_update_detail
+        return parsed
+
+    async def review_narrative_constitution_update(
+        self,
+        current_constitution: dict[str, object],
+        proposed_constitution: str,
+    ) -> dict[str, object] | None:
+        """Ask a separate model pass to review reversible prompt self-modification."""
+        raw = await self._narrative_structured_chat(
+            "Review a proposed update to an evolving narrative constitution. Accept or revise it "
+            "only when it improves the general evidence-grounding, associative synthesis, tool-use, "
+            "uncertainty, or attention method. It must remain applicable to future unknown experience "
+            "and must not encode people, objects, phrases, conclusions, or keywords from one lived day. "
+            "Do not expose hidden reasoning.\n"
+            f"Current constitution: {self._bounded_prompt_json(current_constitution, 7000)}\n"
+            f"Proposed constitution: {self._bounded_prompt_json(proposed_constitution, 7000)}\n"
+            "Return only JSON with exactly: accepted (boolean), constitution (the accepted/revised "
+            "string or null), review_summary (a concise inspectable explanation).",
+            max_tokens=1024,
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if (
+            not isinstance(parsed, dict)
+            or set(parsed) != {"accepted", "constitution", "review_summary"}
+            or not isinstance(parsed.get("accepted"), bool)
+            or not self._bounded_text(parsed.get("review_summary"), 1200)
+        ):
+            return None
+        constitution = parsed.get("constitution")
+        if parsed["accepted"]:
+            if not self._bounded_text(constitution, 6000):
+                return None
+        elif constitution is not None:
+            return None
+        return parsed
+
+    async def interpret_proactive_answer(
+        self,
+        question: str,
+        utterance: str,
+        predicate: str | None,
+    ) -> dict[str, object] | None:
+        """Resolve a reply to a model-authored question without lexical rules."""
+        raw = await self._structured_chat(
+            "Determine how the new utterance relates to a proactive question you previously asked. "
+            "Return JSON only with relation ('answer', 'unknown', or 'unrelated'), value (the concise "
+            "claim value or null), and reply (a concise natural acknowledgement or null). Do not turn "
+            "an unrelated utterance into an answer.\n"
+            f"Question: {question}\nClaim predicate, if any: {predicate or 'none'}\n"
+            f"New utterance: {utterance}"
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or set(parsed) != {"relation", "value", "reply"}:
+            return None
+        relation = parsed.get("relation")
+        value = parsed.get("value")
+        reply = parsed.get("reply")
+        if relation not in {"answer", "unknown", "unrelated"}:
+            return None
+        if value is not None and not self._bounded_text(value, 1200):
+            return None
+        if reply is not None and not self._bounded_text(reply, 600):
+            return None
+        if relation == "answer" and (value is None or reply is None):
+            return None
+        if relation == "unknown" and reply is None:
+            return None
+        if relation == "unrelated" and (value is not None or reply is not None):
+            return None
+        return parsed
+
+    @staticmethod
+    def _bounded_prompt_json(value: object, maximum: int) -> str:
+        """Serialize model context with a transparent, semantics-agnostic capacity bound."""
+        encoded = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        if len(encoded) <= maximum:
+            return encoded
+        return json.dumps(
+            {
+                "capacity_truncated": True,
+                "original_characters": len(encoded),
+                "serialized_prefix": encoded[:maximum],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _bounded_text(value: object, maximum: int) -> bool:
+        return isinstance(value, str) and bool(value.strip()) and len(value) <= maximum
+
+    @classmethod
+    def _reference_list(cls, value: object, *, maximum: int = 32) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) <= maximum
+            and all(cls._bounded_text(item, 300) for item in value)
+        )
+
+    @classmethod
+    def _narrative_items(
+        cls,
+        value: object,
+        *,
+        maximum: int,
+        text_fields: dict[str, int],
+        temporal: bool = False,
+        enum_fields: dict[str, set[str]] | None = None,
+        nullable_text_fields: dict[str, int] | None = None,
+    ) -> bool:
+        if not isinstance(value, list) or len(value) > maximum:
+            return False
+        expected = {
+            *text_fields,
+            *(enum_fields or {}),
+            *(nullable_text_fields or {}),
+            "confidence",
+            "entity_ids",
+            "evidence_ids",
+            "context_ids",
+        }
+        if temporal:
+            expected.update({"started_at", "ended_at"})
+        for item in value:
+            if not isinstance(item, dict) or set(item) != expected:
+                return False
+            if any(
+                not cls._bounded_text(item.get(field), bound)
+                for field, bound in text_fields.items()
+            ):
+                return False
+            if any(
+                item.get(field) not in allowed
+                for field, allowed in (enum_fields or {}).items()
+            ):
+                return False
+            if any(
+                item.get(field) is not None
+                and not cls._bounded_text(item.get(field), bound)
+                for field, bound in (nullable_text_fields or {}).items()
+            ):
+                return False
+            confidence = item.get("confidence")
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= float(confidence) <= 1
+            ):
+                return False
+            if any(
+                not cls._reference_list(item.get(field))
+                for field in ("entity_ids", "evidence_ids", "context_ids")
+            ):
+                return False
+            if temporal and any(
+                item.get(field) is not None
+                and not cls._bounded_text(item.get(field), 80)
+                for field in ("started_at", "ended_at")
+            ):
+                return False
+        return True
 
     async def interpret_correction(
         self, utterance: str, candidate: dict[str, object]
@@ -1452,6 +2076,52 @@ class OmniusClient:
             raise RuntimeError("Omnius structured chat returned an invalid completion") from error
         if not isinstance(reply, str) or not reply.strip():
             raise RuntimeError("Omnius structured chat returned an empty completion")
+        return reply.strip()
+
+    async def _narrative_structured_chat(
+        self, prompt: str, *, max_tokens: int
+    ) -> str:
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        bounded_max_tokens = max(256, min(int(max_tokens), 4096))
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Return only the requested JSON object with no prose or markdown.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "temperature": 0.2,
+            "max_tokens": bounded_max_tokens,
+            "tools": False,
+            "think": False,
+            "realtime": False,
+            "realtime_options": {
+                "max_history_messages": 2,
+                "max_tokens": bounded_max_tokens,
+            },
+        }
+        async with self._model_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.base_url).rstrip('/')}/v1/chat",
+                    json=payload,
+                    headers=self._headers(),
+                ) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(
+                            f"Omnius narrative chat HTTP {response.status}: {detail}"
+                        )
+                    result = await response.json()
+        try:
+            reply = result["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError("Omnius narrative chat returned an invalid completion") from error
+        if not isinstance(reply, str) or not reply.strip():
+            raise RuntimeError("Omnius narrative chat returned an empty completion")
         return reply.strip()
 
     async def _chat(

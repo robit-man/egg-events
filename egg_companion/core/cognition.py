@@ -37,6 +37,7 @@ class CognitiveAttentionController:
         target: AttentionTarget,
         observation: Observation,
         graph_signal: GraphCognitiveSignal | None = None,
+        observation_policy: dict[str, object] | None = None,
     ) -> AttentionDecision:
         detection = target.detection
         entity_id = str(
@@ -68,6 +69,14 @@ class CognitiveAttentionController:
         graph_familiarity = graph_signal.familiarity if graph_signal else 0.0
         graph_relevance = graph_signal.structural_relevance if graph_signal else 0.0
         knowledge_gap = graph_signal.knowledge_gap if graph_signal else 1.0
+        policy = observation_policy or {}
+        focus_entities = {
+            str(value) for value in policy.get("focus_entity_ids", []) if value
+        }
+        proactive_entities = {
+            str(value) for value in policy.get("proactive_entity_ids", []) if value
+        }
+        policy_relevance = 1.0 if entity_id in focus_entities else 0.0
         raw_novelty = max(float(target.novelty), new_entity)
         effective_novelty = raw_novelty * (
             1.0 - self.config.graph_familiarity_discount * graph_familiarity
@@ -93,6 +102,7 @@ class CognitiveAttentionController:
             * prediction_error
             * (1.0 - 0.65 * graph_familiarity)
             + self.config.epistemic_value_weight * epistemic_value
+            + self.config.observation_policy_weight * policy_relevance
         )
         # Habituation suppresses recurrent novelty/prediction channels, while a
         # genuinely communicative action remains capable of attracting focus.
@@ -101,7 +111,10 @@ class CognitiveAttentionController:
             weighted * (0.40 + 0.60 * habituation)
             + 0.08 * graph_relevance * epistemic_value,
         )
-        action = behavior in {"waving", "approaching"}
+        model_directed_action = bool(
+            stable_entity and entity_id in proactive_entities
+        )
+        action = behavior in {"waving", "approaching"} or model_directed_action
         cooldown = (
             (observation.timestamp - self._last_proactive).total_seconds()
             if self._last_proactive else float("inf")
@@ -114,11 +127,15 @@ class CognitiveAttentionController:
         )
         if allow_speech:
             self._last_proactive = observation.timestamp
-            reason = f"outward speech permitted: {behavior} with prediction residual"
+            reason = (
+                f"outward speech permitted: {behavior} with prediction residual"
+                if behavior in {"waving", "approaching"}
+                else "outward speech permitted by the active model-authored observation policy"
+            )
         elif not self.proactive_enabled:
             reason = "captured internally; proactive speech disabled"
         elif not action:
-            reason = "captured internally; no communicative action"
+            reason = "captured internally; no communicative or model-directed action"
         elif capture_priority < self.config.communicative_action_threshold:
             reason = "captured internally; below communicative-action threshold"
         else:
@@ -141,6 +158,8 @@ class CognitiveAttentionController:
                 "graph_familiarity": round(graph_familiarity, 4),
                 "graph_relevance": round(graph_relevance, 4),
                 "graph_knowledge_gap": round(knowledge_gap, 4),
+                "observation_policy_relevance": policy_relevance,
+                "model_directed_action": float(model_directed_action),
             },
             reason,
             max(0.0, self.config.proactive_rate_limit_seconds - cooldown) if cooldown != float("inf") else 0.0,

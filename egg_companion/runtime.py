@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import random
 import re
@@ -121,7 +122,7 @@ class _PendingIdentityQuestion:
 class _PendingCuriosityQuestion:
     subject_id: str
     subject_label: str
-    predicate: str
+    predicate: str | None
     question: str
     asked_at: datetime
     expires_at: float
@@ -222,6 +223,8 @@ class CompanionRuntime:
         self._active_reasoning_task: asyncio.Task[None] | None = None
         self._active_reasoning_revision: int | None = None
         self._superseded_reasoning_tasks: set[asyncio.Task[None]] = set()
+        self._active_narrative_semantic_task: asyncio.Task[dict[str, object]] | None = None
+        self._narrative_yield_to_speech = False
         self._speech_lock = asyncio.Lock()
         self._proactive_question_lock = asyncio.Lock()
         self._camera_rotations = {camera.id: camera.rotation_degrees if isinstance(camera.rotation_degrees, int) else None for camera in config.cameras}
@@ -665,6 +668,7 @@ class CompanionRuntime:
             ("advanced-ocr", self._process_ocr_candidates),
             ("object-review-scheduler", self._object_review_scheduler),
             ("narrative-backfill", self._narrative_backfill_scheduler),
+            ("narrative-semantic-dream", self._narrative_semantic_scheduler),
             ("identity-dream-scheduler", self._identity_dream_scheduler),
             ("default-mode-network", self._default_mode_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
@@ -1325,7 +1329,6 @@ class CompanionRuntime:
                     self._conversation_turns.reject_audio_input()
                     self._record_voice_transition("acoustic_candidate_rejected")
                     continue
-                self._last_valid_speech_at = time.monotonic()
                 if self._speech_segments.full():
                     reason = "speech ingress overload; rejected newest complete utterance"
                     logger.warning(reason)
@@ -1468,6 +1471,11 @@ class CompanionRuntime:
                     await self._resume_barge(segment.barge_id, "asr_empty")
                 self._record_voice_transition("asr_empty")
                 continue
+            self._last_valid_speech_at = time.monotonic()
+            semantic_task = self._active_narrative_semantic_task
+            if semantic_task is not None and not semantic_task.done():
+                self._narrative_yield_to_speech = True
+                semantic_task.cancel()
             transcript_metadata = {
                 **dict(self._omnius.last_transcription_metadata),
                 "utterance_id": segment.utterance_id,
@@ -2134,6 +2142,336 @@ class CompanionRuntime:
             previous_remaining = remaining
             await asyncio.sleep(2.0 if made_progress else 300.0)
 
+    async def _narrative_semantic_scheduler(self) -> None:
+        """Run model-authored, tool-using narrative synthesis only while quiet."""
+        if self._memory is None:
+            await asyncio.Event().wait()
+        self.telemetry.record_narrative_semantics({"state": "starting"})
+        await asyncio.sleep(10.0)
+        while True:
+            now = time.monotonic()
+            last_activity = max(self._last_valid_speech_at, self._last_spoken_at or 0.0)
+            busy = (
+                self._speaking
+                or not self._speech_segments.empty()
+                or not self._utterances.empty()
+            )
+            if busy or now - last_activity < self.config.default_mode.idle_seconds:
+                self.telemetry.record_narrative_semantics(
+                    {
+                        "state": "waiting_for_quiet",
+                        "busy": busy,
+                        "activity_age_seconds": round(now - last_activity, 1),
+                    }
+                )
+                await asyncio.sleep(5.0)
+                continue
+            candidate = await asyncio.to_thread(
+                self._memory.pending_narrative_semantics
+            )
+            if candidate is None:
+                self.telemetry.record_narrative_semantics({"state": "caught_up"})
+                await asyncio.sleep(30.0)
+                continue
+            self.telemetry.record_narrative_semantics(
+                {"state": "queued", "local_date": candidate.get("local_date")}
+            )
+            task = asyncio.create_task(
+                self._run_narrative_semantic_pass(candidate),
+                name=f"narrative-semantics:{candidate.get('local_date')}",
+            )
+            self._narrative_yield_to_speech = False
+            self._active_narrative_semantic_task = task
+            try:
+                result = await task
+                logger.info(
+                    "model narrative synthesis %s for %s",
+                    "applied" if result.get("applied") else "deferred",
+                    candidate.get("local_date"),
+                )
+                self.telemetry.record_narrative_semantics(
+                    {
+                        "state": "applied" if result.get("applied") else "deferred",
+                        **result,
+                    }
+                )
+                if self._system_service:
+                    await self._system_service.publish_event(
+                        {"type": "narrative.semantic_update", **result}
+                    )
+            except asyncio.CancelledError:
+                if not self._narrative_yield_to_speech:
+                    raise
+                logger.info("model narrative synthesis yielded to live speech")
+                self.telemetry.record_narrative_semantics(
+                    {"state": "yielded_to_speech", "local_date": candidate.get("local_date")}
+                )
+            except Exception as error:
+                logger.exception("model narrative synthesis failed")
+                self.telemetry.record_runtime_error("narrative-semantics", error)
+                self.telemetry.record_narrative_semantics(
+                    {
+                        "state": "error",
+                        "local_date": candidate.get("local_date"),
+                        "detail": f"{type(error).__name__}: {error}"[:500],
+                    }
+                )
+                await asyncio.sleep(30.0)
+            finally:
+                if self._active_narrative_semantic_task is task:
+                    self._active_narrative_semantic_task = None
+                self._narrative_yield_to_speech = False
+            await asyncio.sleep(2.0)
+
+    async def _run_narrative_semantic_pass(
+        self, candidate: dict[str, object]
+    ) -> dict[str, object]:
+        assert self._memory is not None
+        constitution = await asyncio.to_thread(
+            self._memory.narrative_constitution
+        )
+        prior_policy = await asyncio.to_thread(
+            self._memory.observation_policy, 0.0
+        )
+        timeline = candidate.get("timeline")
+        daily_evidence = {
+            "local_date": candidate.get("local_date"),
+            "timezone": candidate.get("timezone"),
+            "abstract_summary": candidate.get("abstract_summary"),
+            "conversation_ledger": candidate.get("conversation_ledger"),
+            "timeline_provenance": [
+                {
+                    "started_at": entry.get("started_at"),
+                    "ended_at": entry.get("ended_at"),
+                    "summary": str(entry.get("summary") or "")[:320],
+                    "modalities": list(entry.get("modalities") or []),
+                    "entity_ids": list(entry.get("entity_ids") or [])[:12],
+                    "evidence_ids": list(entry.get("evidence_ids") or [])[:12],
+                    "event_count": entry.get("event_count"),
+                }
+                for entry in list(timeline or [])[:200]
+                if isinstance(entry, dict)
+            ] if isinstance(timeline, list) else [],
+            "period_count": len(timeline) if isinstance(timeline, list) else 0,
+            "source_entity_ids": list(candidate.get("source_entity_ids") or [])[:100],
+            "source_evidence_ids": list(
+                candidate.get("source_evidence_ids") or []
+            )[:200],
+            "source_evidence_count": len(candidate.get("source_evidence_ids") or []),
+        }
+        local_date = candidate.get("local_date")
+        logger.info("model narrative planning started for %s", local_date)
+        self.telemetry.record_narrative_semantics(
+            {"state": "planning", "local_date": local_date}
+        )
+        plan = await self._omnius.plan_narrative_dream(
+            daily_evidence, constitution, prior_policy
+        )
+        if plan is None:
+            raise RuntimeError("Omnius returned an invalid narrative tool plan")
+        tool_audit: list[dict[str, object]] = []
+        tool_results: list[dict[str, object]] = []
+        logger.info("model narrative research started for %s", local_date)
+        self.telemetry.record_narrative_semantics(
+            {
+                "state": "researching",
+                "local_date": local_date,
+                "tool_count": len(plan.get("tool_requests", [])),
+            }
+        )
+        for request in plan.get("tool_requests", []):
+            if not isinstance(request, dict):
+                continue
+            started = time.monotonic()
+            try:
+                result = await self._execute_narrative_tool(request)
+                success = True
+                detail = result
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                success = False
+                detail = {"error": str(error)[:500]}
+            bounded_detail = self._bounded_narrative_tool_result(detail)
+            record = {
+                "tool": request.get("tool"),
+                "purpose": request.get("purpose"),
+                "success": success,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "result": bounded_detail,
+            }
+            tool_audit.append(record)
+            tool_results.append(record)
+        logger.info("model narrative composition started for %s", local_date)
+        self.telemetry.record_narrative_semantics(
+            {"state": "composing", "local_date": local_date}
+        )
+        synthesis = await self._omnius.synthesize_narrative_dream(
+            daily_evidence,
+            constitution,
+            prior_policy,
+            plan,
+            tool_results,
+        )
+        if synthesis is None:
+            raise RuntimeError("Omnius returned invalid narrative semantics")
+        themes = list(synthesis.get("themes") or [])
+        unresolved = list(synthesis.get("unresolved_questions") or [])
+        learned = list(synthesis.get("learned_context") or [])
+        semantics = {
+            **synthesis,
+            "state": "model_complete",
+            "model_id": self.config.omnius.model,
+            "focus_terms": [
+                str(item.get("label"))
+                for item in themes
+                if isinstance(item, dict) and item.get("label")
+            ],
+            "topics": themes,
+            "unresolved_question_summaries": [
+                str(item.get("summary"))
+                for item in unresolved
+                if isinstance(item, dict) and item.get("summary")
+            ],
+            "learned_context_summaries": [
+                str(item.get("summary"))
+                for item in learned
+                if isinstance(item, dict) and item.get("summary")
+            ],
+        }
+        raw_policy = dict(synthesis["observation_policy"])
+        attend_to = list(raw_policy.get("attend_to") or [])
+        policy_open = list(raw_policy.get("open_questions") or [])
+        policy = {
+            **raw_policy,
+            "state": "model_complete",
+            "focus_terms": [
+                str(item.get("summary"))
+                for item in attend_to
+                if isinstance(item, dict) and item.get("summary")
+            ],
+            "focus_entity_ids": list(
+                dict.fromkeys(
+                    str(entity_id)
+                    for item in attend_to
+                    if isinstance(item, dict)
+                    for entity_id in item.get("entity_ids", [])
+                    if entity_id
+                )
+            ),
+            "proactive_entity_ids": list(
+                dict.fromkeys(
+                    str(entity_id)
+                    for item in attend_to
+                    if isinstance(item, dict)
+                    and item.get("action") in {"ask", "speak"}
+                    for entity_id in item.get("entity_ids", [])
+                    if entity_id
+                )
+            ),
+            "open_questions": [
+                str(item.get("summary"))
+                for item in policy_open
+                if isinstance(item, dict) and item.get("summary")
+            ],
+            "learned_context": list(semantics["learned_context_summaries"]),
+            "theme_ids": [
+                "narrative-theme:"
+                + hashlib.sha256(str(item.get("label")).encode()).hexdigest()[:20]
+                for item in themes
+                if isinstance(item, dict) and item.get("label")
+            ],
+            "directive": str(raw_policy.get("summary") or ""),
+        }
+        proposed_constitution = synthesis.get("constitution_update")
+        constitution_review: dict[str, object] | None = None
+        if proposed_constitution:
+            logger.info("model narrative constitution review started for %s", local_date)
+            self.telemetry.record_narrative_semantics(
+                {"state": "reviewing_constitution", "local_date": local_date}
+            )
+            constitution_review = await self._omnius.review_narrative_constitution_update(
+                constitution,
+                str(proposed_constitution),
+            )
+            if constitution_review is None:
+                raise RuntimeError("Omnius returned an invalid constitution review")
+            tool_audit.append(
+                {
+                    "tool": "constitution_review",
+                    "purpose": "independent model review of self-modifying narrative strategy",
+                    "success": True,
+                    "result": constitution_review,
+                }
+            )
+            proposed_constitution = (
+                constitution_review.get("constitution")
+                if constitution_review.get("accepted")
+                else None
+            )
+        logger.info("model narrative apply started for %s", local_date)
+        self.telemetry.record_narrative_semantics(
+            {"state": "applying", "local_date": local_date}
+        )
+        applied = await asyncio.to_thread(
+            self._memory.apply_narrative_semantics,
+            str(candidate.get("local_date") or ""),
+            str(candidate.get("semantic_input_fingerprint") or ""),
+            semantics,
+            policy,
+            str(proposed_constitution) if proposed_constitution else None,
+            self.config.omnius.model,
+            tool_audit,
+        )
+        return {
+            "local_date": candidate.get("local_date"),
+            "applied": applied,
+            "themes": semantics["focus_terms"],
+            "tools": [item.get("tool") for item in tool_audit],
+            "constitution_updated": bool(proposed_constitution),
+        }
+
+    @staticmethod
+    def _bounded_narrative_tool_result(
+        value: object, maximum: int = 2000
+    ) -> object:
+        encoded = json.dumps(
+            value, ensure_ascii=False, default=str, separators=(",", ":")
+        )
+        if len(encoded) <= maximum:
+            return value
+        return {
+            "capacity_truncated": True,
+            "original_characters": len(encoded),
+            "serialized_prefix": encoded[:maximum],
+        }
+
+    async def _execute_narrative_tool(
+        self, request: dict[str, object]
+    ) -> object:
+        assert self._memory is not None
+        tool = str(request.get("tool") or "")
+        if tool == "memory_search":
+            return await asyncio.to_thread(
+                self._memory.narrative_memory_search,
+                str(request.get("query") or request.get("purpose") or ""),
+            )
+        if tool == "graph_inspect":
+            return await asyncio.to_thread(
+                self._memory.narrative_graph_inspect,
+                list(request.get("entity_ids") or []),
+            )
+        if tool == "evidence_inspect":
+            return await asyncio.to_thread(
+                self._memory.narrative_evidence_inspect,
+                list(request.get("evidence_ids") or []),
+            )
+        if tool == "web_search":
+            return await self._omnius.web_search(
+                str(request.get("query") or request.get("purpose") or "")
+            )
+        raise RuntimeError(f"unsupported narrative tool: {tool}")
+
     async def _identity_dream_scheduler(self) -> None:
         if not self.config.dreams.enabled:
             await asyncio.Event().wait()
@@ -2228,6 +2566,9 @@ class CompanionRuntime:
             self.telemetry.record_default_mode({"state": "replaying"})
             try:
                 result = await asyncio.to_thread(self._memory.default_mode_pass)
+                result["observation_policy"] = await asyncio.to_thread(
+                    self._memory.observation_policy, 0.0
+                )
                 result["state"] = "complete"
                 self.telemetry.record_default_mode(result)
                 await self._maybe_ask_default_mode_question(result)
@@ -2267,6 +2608,7 @@ class CompanionRuntime:
         if len(self._curiosity_spoken_at) >= settings.proactive_budget_per_hour:
             return False
         visible_ids: set[str] = set()
+        visible_labels: dict[str, str] = {}
         visible_preferred_names: list[str] = []
         for observation in self._latest_observations.values():
             if (datetime.now(timezone.utc) - observation.timestamp).total_seconds() > 5:
@@ -2277,7 +2619,13 @@ class CompanionRuntime:
                     detection.attributes.get("identity_id"),
                 ):
                     if entity_id:
-                        visible_ids.add(str(entity_id))
+                        resolved_id = str(entity_id)
+                        visible_ids.add(resolved_id)
+                        visible_labels[resolved_id] = str(
+                            detection.attributes.get("identity")
+                            or detection.label
+                            or resolved_id
+                        )
                 preferred_name = detection.attributes.get("identity")
                 if (
                     detection.attributes.get("identity_persistent") is True
@@ -2291,48 +2639,61 @@ class CompanionRuntime:
         # empty room to explain them.
         if not visible_preferred_names:
             return False
-        candidates = result.get("curiosity_candidates")
-        if not isinstance(candidates, list):
+        policy = result.get("observation_policy")
+        if not isinstance(policy, dict):
             return False
-        candidate = next(
-            (
-                item for item in candidates
-                if isinstance(item, dict)
-                and str(item.get("subject_id")) in visible_ids
-                and (
-                    str(item.get("subject_id")), str(item.get("predicate"))
-                ) not in self._curiosity_asked
-            ),
-            None,
-        )
-        if candidate is None:
+        candidates = [
+            item
+            for key in ("open_questions", "attend_to")
+            for item in policy.get(key, [])
+            if isinstance(item, dict) and item.get("action") == "ask"
+        ]
+        selected: tuple[dict[str, object], str, str] | None = None
+        for candidate in candidates:
+            subject_id = next(
+                (
+                    str(entity_id)
+                    for entity_id in candidate.get("entity_ids", [])
+                    if str(entity_id) in visible_ids
+                ),
+                None,
+            )
+            question = " ".join(str(candidate.get("summary") or "").split())
+            predicate = str(candidate.get("predicate") or "")
+            deduplication_key = predicate or question
+            if (
+                subject_id
+                and question
+                and (subject_id, deduplication_key) not in self._curiosity_asked
+            ):
+                selected = (candidate, subject_id, deduplication_key)
+                break
+        if selected is None:
             return False
-        question = " ".join(str(candidate.get("question") or "").split())
-        if not question:
-            return False
+        candidate, subject_id, deduplication_key = selected
+        question = " ".join(str(candidate["summary"]).split())
         question = f"{visible_preferred_names[0]}, {question}"
         revision = self._conversation_turns.revision
         spoken = await self._speak(question, expected_revision=revision)
         if not spoken:
             return False
-        subject_id = str(candidate["subject_id"])
-        predicate = str(candidate["predicate"])
+        predicate = str(candidate.get("predicate") or "") or None
         self._pending_curiosity = _PendingCuriosityQuestion(
             subject_id=subject_id,
-            subject_label=str(candidate.get("subject_label") or subject_id),
+            subject_label=visible_labels.get(subject_id, subject_id),
             predicate=predicate,
             question=question,
             asked_at=datetime.now(timezone.utc),
             expires_at=now + settings.question_timeout_seconds,
         )
-        self._curiosity_asked.add((subject_id, predicate))
+        self._curiosity_asked.add((subject_id, deduplication_key))
         self._curiosity_spoken_at.append(now)
         self._last_curiosity_at = now
         self.telemetry.record_interaction(
-            True, "source-backed reducible graph gap", "", question
+            True, "model-authored grounded question", "", question
         )
         self._queue_interaction_memory(
-            "", question, True, "source-backed reducible graph gap"
+            "", question, True, "model-authored grounded question"
         )
         return True
 
@@ -3749,28 +4110,29 @@ class CompanionRuntime:
 
         pending_curiosity = self._active_curiosity_question()
         if pending_curiosity is not None:
-            normalized_answer = " ".join(transcript.strip().split())
-            leading = normalized_answer.casefold().split(maxsplit=1)[0].strip(".,!?")
-            is_new_question = normalized_answer.endswith("?") or leading in (
-                DialogueClassifier.QUESTION_WORDS | {"can", "could", "would"}
-            )
-            if not is_new_question:
-                self._pending_curiosity = None
-                unknown = bool(
-                    re.search(
-                        r"\b(i don't know|not sure|no idea|don't remember)\b",
-                        normalized_answer.casefold(),
-                    )
+            try:
+                interpretation = await self._omnius.interpret_proactive_answer(
+                    pending_curiosity.question,
+                    transcript,
+                    pending_curiosity.predicate,
                 )
-                if unknown:
-                    reply = "No problem. I'll leave that open."
-                else:
+            except Exception as error:
+                logger.warning("proactive-answer interpretation unavailable: %s", error)
+                interpretation = None
+            if interpretation and interpretation.get("relation") in {"answer", "unknown"}:
+                self._pending_curiosity = None
+                if (
+                    interpretation["relation"] == "answer"
+                    and pending_curiosity.predicate
+                ):
                     self._queue_curiosity_answer_memory(
-                        pending_curiosity, normalized_answer, turn.utterance_id
+                        pending_curiosity,
+                        str(interpretation["value"]),
+                        turn.utterance_id,
                     )
-                    reply = f"Got it. I'll remember: {normalized_answer.rstrip('.')}."
+                reply = str(interpretation["reply"])
                 spoken = await self._speak(reply, expected_revision=turn.revision)
-                reason = "answered active curiosity question"
+                reason = "model interpreted response to its proactive question"
                 self.telemetry.record_interaction(
                     spoken, reason, transcript, reply
                 )
@@ -4368,11 +4730,24 @@ class CompanionRuntime:
             and await self._maybe_ask_identity_name(target)
         ):
             return
-        if not decision.allow_outward_speech or target.detection.label != "person":
+        person_present = any(
+            detection.label == "person" for detection in observation.detections
+        )
+        if not decision.allow_outward_speech or not person_present:
             return
         try:
             scene = self._describe_scene(target, observation)
             if self._memory is not None:
+                policy = await asyncio.to_thread(self._memory.observation_policy)
+                scene += (
+                    "\nLearned observation policy (derived, revisable): "
+                    + str(policy.get("directive") or "")
+                    + " Focus terms: "
+                    + ", ".join(str(value) for value in policy.get("focus_terms", [])[:8])
+                    + ". Open grounded threads: "
+                    + "; ".join(str(value) for value in policy.get("open_questions", [])[:3])
+                    + ". Respond with one concise, natural, evidence-grounded observation or question; do not invent a connection."
+                )
                 reflective = await asyncio.to_thread(
                     self._memory.reflective_context, 900
                 )
@@ -4383,7 +4758,11 @@ class CompanionRuntime:
                     )
             reply = await self._omnius.companion_reply(scene)
             spoken = await self._speak(reply)
-            reason = "communicative visual action passed proactive policy"
+            reason = (
+                "model-authored observation policy requested proactive engagement"
+                if decision.components.get("model_directed_action")
+                else "communicative visual action passed proactive policy"
+            )
             self.telemetry.record_interaction(spoken, reason, "", reply)
             self._queue_interaction_memory("", reply, spoken, reason)
             self._last_greeting = target.timestamp
@@ -4745,6 +5124,9 @@ class CompanionRuntime:
             "default_mode": self.telemetry.snapshot(self.config).get(
                 "default_mode", {}
             ),
+            "observation_policy": await asyncio.to_thread(
+                self._memory.observation_policy
+            ),
         }
         context = await asyncio.to_thread(
             self._memory.context_for,
@@ -4892,7 +5274,14 @@ class CompanionRuntime:
     @staticmethod
     def _describe_scene(target: AttentionTarget, observation: Observation) -> str:
         behavior = target.detection.attributes.get("behavior")
-        parts = [f"a person is {behavior}" if behavior else "a person is present"]
+        label = target.detection.label
+        if label == "person":
+            parts = [f"a person is {behavior}" if behavior else "a person is present"]
+        else:
+            parts = [
+                f"attention was drawn to a {label}"
+                + (f" whose observed behavior/state is {behavior}" if behavior else "")
+            ]
         if observation.semantic_labels:
             parts.append("visual context: " + ", ".join(observation.semantic_labels[:3]))
         if observation.microphone_direction is not None:

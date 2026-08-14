@@ -176,7 +176,7 @@ def test_local_realtime_router_and_deictic_vision_intent_need_no_llm() -> None:
     assert not CompanionRuntime._is_visual_question("Tell me the current weather")
 
 
-def test_default_mode_curiosity_requires_and_addresses_named_visible_person() -> None:
+def test_model_authored_question_requires_and_addresses_named_visible_person() -> None:
     async def scenario() -> None:
         config = _config()
         config.attention.proactive_speech_enabled = True
@@ -196,14 +196,21 @@ def test_default_mode_curiosity_requires_and_addresses_named_visible_person() ->
             "front": Observation("front", now, (object_detection,))
         }
         result = {
-            "curiosity_candidates": [
-                {
-                    "subject_id": "object-1",
-                    "subject_label": "keyboard",
-                    "predicate": "used_for",
-                    "question": "I've seen the keyboard a few times. What do you use it for?",
-                }
-            ]
+            "observation_policy": {
+                "open_questions": [
+                    {
+                        "summary": "I've seen the keyboard a few times. What do you use it for?",
+                        "reason": "The dream agent chose to ask while the object is present.",
+                        "action": "ask",
+                        "predicate": "used_for",
+                        "confidence": 0.9,
+                        "entity_ids": ["object-1"],
+                        "evidence_ids": [],
+                        "context_ids": [],
+                    }
+                ],
+                "attend_to": [],
+            }
         }
         assert not await runtime._maybe_ask_default_mode_question(result)
 

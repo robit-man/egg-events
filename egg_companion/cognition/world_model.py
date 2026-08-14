@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
@@ -11,21 +10,8 @@ from egg_companion.config import DefaultModeConfig
 from egg_companion.memory.store import MemoryStore
 
 
-_TERM_STOPWORDS = {
-    "about", "after", "again", "also", "because", "could", "from", "have",
-    "into", "just", "like", "some", "that", "their", "there", "these",
-    "they", "this", "what", "when", "where", "which", "with", "would",
-    "your", "youre", "will", "then", "than", "them", "were", "been",
-}
-
-
 class WorldModelSynthesizer:
-    """Project evidence-grounded graph motifs into a revisable meta-graph.
-
-    The output is an inspectable working model, not hidden chain-of-thought.
-    Every abstraction records its supporting entity and episode IDs, and
-    repeated co-occurrence is always labelled non-causal.
-    """
+    """Project model-authored dream semantics into a provenance-linked meta-graph."""
 
     DOCUMENT_TITLES = {
         "world-model": "World model",
@@ -33,7 +19,7 @@ class WorldModelSynthesizer:
         "communication-strategy": "Communication strategy",
         "reflective-working-set": "Reflective working set",
     }
-    NARRATIVE_SCHEMA_REVISION = 4
+    NARRATIVE_SCHEMA_REVISION = 10
 
     def __init__(self, store: MemoryStore, config: DefaultModeConfig) -> None:
         self.store = store
@@ -48,22 +34,10 @@ class WorldModelSynthesizer:
         inventory = self.store.cognitive_inventory(
             max(self.config.entity_summary_limit, self.config.replay_limit)
         )[: self.config.entity_summary_limit]
-        pairs = self.store.recurrent_entity_pairs(
-            self.config.meta_graph_min_confirmations,
-            self.config.meta_graph_limit * 4,
-            self.config.meta_graph_period_seconds,
+        abstractions = self.store.active_narrative_themes(
+            self.config.meta_graph_limit
         )
-        pairs = self._deduplicate_semantic_pairs(pairs)[
-            : self.config.meta_graph_limit
-        ]
-        abstractions = [self._project_association(pair, at) for pair in pairs]
-        retired = self.store.retire_inactive_meta_graph(
-            [str(item["abstraction_id"]) for item in abstractions], at
-        )
-        for item in inventory:
-            self.store.update_entity_summary(
-                str(item["entity_id"]), self._entity_summary(item), at
-            )
+        retired = self.store.retire_inactive_meta_graph([], at)
 
         outcomes = self.store.recent_interaction_outcomes(200)
         history = self.store.conversation_history(500)
@@ -102,7 +76,7 @@ class WorldModelSynthesizer:
                 kind,
                 self.DOCUMENT_TITLES[kind],
                 content,
-                self._document_confidence(inventory, abstractions),
+                0.0,
                 source_ids,
                 at,
             )
@@ -166,7 +140,7 @@ class WorldModelSynthesizer:
             "abstractions_projected": len(abstractions),
             "abstractions_retired": retired,
             "abstraction_ids": [item["abstraction_id"] for item in abstractions],
-            "entity_summaries_updated": len(inventory),
+            "entity_summaries_updated": 0,
             "documents": document_records,
         }
 
@@ -311,11 +285,18 @@ class WorldModelSynthesizer:
                     int(daily["reviewed_evidence_count"]),
                     int(daily["reviewed_episode_count"]),
                     self.NARRATIVE_SCHEMA_REVISION,
+                    dict(daily["semantic_context"]),
                 )
                 record["source_links"] = self.store.link_daily_narrative_sources(
                     str(record["narrative_id"]),
                     list(daily["evidence_ids"]),
                     list(daily["episode_ids"]),
+                )
+                record["semantic_links"] = self._project_daily_semantics(
+                    str(record["narrative_id"]),
+                    local_day.isoformat(),
+                    dict(daily["semantic_context"]),
+                    replayed_at,
                 )
                 for entity_id, entity_type in dict(daily["entity_types"]).items():
                     relation = {
@@ -410,6 +391,28 @@ class WorldModelSynthesizer:
                     replayed_at,
                     {"derived": True, "temporal_order": "local-calendar"},
                 )
+            active_theme_ids = {
+                "narrative-theme:"
+                + hashlib.sha256(
+                    str(topic.get("label") or topic.get("term")).encode()
+                ).hexdigest()[:20]
+                for chapter in self.store.recent_daily_narratives(3650)
+                if isinstance((chapter_metadata := chapter.get("metadata")), dict)
+                and isinstance(
+                    (chapter_semantics := chapter_metadata.get("semantic_context")),
+                    dict,
+                )
+                for topic in list(
+                    chapter_semantics.get("themes")
+                    or chapter_semantics.get("topics")
+                    or []
+                )[:12]
+                if isinstance(topic, dict)
+                and (topic.get("label") or topic.get("term"))
+            }
+            retired_themes = self.store.retire_inactive_narrative_themes(
+                sorted(active_theme_ids), replayed_at
+            )
             result = {
                 "job_id": job_id,
                 "dream_run_id": run_id,
@@ -462,6 +465,8 @@ class WorldModelSynthesizer:
                         for item in refreshed.get("documents", [])
                         if isinstance(item, dict)
                     ),
+                    "narrative_themes_active": len(active_theme_ids),
+                    "narrative_themes_retired": retired_themes,
                 },
             }
             self.store.update_job(job_id, "complete")
@@ -513,6 +518,7 @@ class WorldModelSynthesizer:
         evidence_ids: list[str] = []
         episode_ids: list[str] = []
         qualities: list[float] = []
+        dialogue_by_context: dict[str, dict[str, object]] = {}
         ignored_types = {
             "appearance_track",
             "abstraction",
@@ -542,6 +548,7 @@ class WorldModelSynthesizer:
                     "observation_keys": set(),
                     "detection_counts": Counter(),
                     "camera_frames": 0,
+                    "dialogue_context_ids": set(),
                     "event_count": 0,
                 },
             )
@@ -586,6 +593,36 @@ class WorldModelSynthesizer:
                 all_entities[entity_id] = (entity_type, label)
                 bucket["entities"][entity_id] = (entity_type, label)
             payload = event.get("payload")
+            dialogue = self._dialogue_record(event, local_at)
+            if dialogue is not None:
+                context_id = str(dialogue["context_id"])
+                existing = dialogue_by_context.setdefault(context_id, dialogue)
+                for field in ("heard", "response"):
+                    if dialogue.get(field) and not existing.get(field):
+                        existing[field] = dialogue[field]
+                if dialogue.get("response_status"):
+                    existing["response_status"] = dialogue["response_status"]
+                existing["grounded_interaction"] = bool(
+                    existing.get("grounded_interaction")
+                    or dialogue.get("grounded_interaction")
+                )
+                existing["explicitly_directed"] = bool(
+                    existing.get("explicitly_directed")
+                    or dialogue.get("explicitly_directed")
+                )
+                existing["open_thread"] = bool(
+                    existing.get("open_thread") or dialogue.get("open_thread")
+                )
+                existing["learned_context"] = self._unique(
+                    [
+                        *list(existing.get("learned_context") or []),
+                        *list(dialogue.get("learned_context") or []),
+                    ]
+                )
+                for value in dialogue.get("evidence_ids", []):
+                    if value not in existing["evidence_ids"]:
+                        existing["evidence_ids"].append(value)
+                bucket["dialogue_context_ids"].add(context_id)
             if isinstance(payload, dict) and source_type == "camera":
                 bucket["camera_frames"] = int(bucket["camera_frames"]) + 1
                 detections = payload.get("detections")
@@ -605,62 +642,47 @@ class WorldModelSynthesizer:
 
         if not buckets:
             return None
-        pair_counts: Counter[tuple[str, str]] = Counter()
         timeline: list[dict[str, object]] = []
-        previous_stable_labels: set[str] = set()
         for bucket in sorted(buckets.values(), key=lambda item: item["start"]):
             typed: dict[str, list[str]] = defaultdict(list)
             entity_ids = sorted(bucket["entities"])
             for entity_id in entity_ids:
                 entity_type, label = bucket["entities"][entity_id]
                 typed[entity_type].append(label)
-            for left_index, left_id in enumerate(entity_ids):
-                for right_id in entity_ids[left_index + 1 :]:
-                    pair_counts[tuple(sorted((left_id, right_id)))] += 1
             people = self._unique(typed.get("person", []))
             objects = self._unique(
                 [*typed.get("object", []), *typed.get("object_category", [])]
             )
             content = self._unique(typed.get("content", []))
             sounds = self._unique(typed.get("sound_event", []))
-            ranked_observations = sorted(
-                bucket["observation_candidates"],
-                key=lambda item: (-int(item[0]), int(item[1])),
+            dialogue = self._unique_dialogue_records(
+                [
+                    dialogue_by_context[context_id]
+                    for context_id in bucket["dialogue_context_ids"]
+                    if context_id in dialogue_by_context
+                ]
             )
+            period_conversation = self._period_conversation_summary(dialogue)
             observations = [
-                str(item[2]) for item in ranked_observations if int(item[0]) >= 2
-            ][:8]
+                str(item[1]) for item in bucket["observation_candidates"]
+            ][:32]
             camera_frames = int(bucket["camera_frames"])
-            recurring_threshold = max(2, math.ceil(camera_frames * 0.08))
             recurring_detections = [
                 (str(label), int(count))
-                for label, count in bucket["detection_counts"].most_common(12)
-                if int(count) >= recurring_threshold
+                for label, count in sorted(
+                    bucket["detection_counts"].items(),
+                    key=lambda item: str(item[0]),
+                )[:32]
             ]
-            stable_labels = {label for label, _count in recurring_detections}
             scene_summary = (
-                f"Across {camera_frames} retained camera updates, repeatedly visible: "
+                f"Detector counts across {camera_frames} retained camera updates: "
                 + ", ".join(
-                    f"{label} ({count})" for label, count in recurring_detections[:8]
+                    f"{label} ({count})" for label, count in recurring_detections
                 )
                 if camera_frames and recurring_detections
                 else ""
             )
             changes: list[str] = []
-            if previous_stable_labels:
-                arrived = sorted(stable_labels - previous_stable_labels)[:6]
-                departed = sorted(previous_stable_labels - stable_labels)[:6]
-                if arrived:
-                    changes.append(
-                        "Newly persistent since the prior period: "
-                        + ", ".join(arrived)
-                    )
-                if departed:
-                    changes.append(
-                        "No longer repeatedly detected: " + ", ".join(departed)
-                    )
-            if stable_labels:
-                previous_stable_labels = stable_labels
             start = bucket["start"]
             end = bucket["end"]
             entry = {
@@ -678,6 +700,8 @@ class WorldModelSynthesizer:
                 "modalities": sorted(bucket["modalities"]),
                 "sources": sorted(bucket["sources"])[:12],
                 "observations": observations,
+                "dialogue": dialogue,
+                "conversation_summary": period_conversation,
                 "scene_summary": scene_summary,
                 "changes": changes,
                 "recurring_detections": [
@@ -694,22 +718,16 @@ class WorldModelSynthesizer:
             timeline.append(entry)
         timeline = timeline[: self.config.narrative_max_entries]
 
+        discourse = self._conversation_semantics(
+            self._unique_dialogue_records(list(dialogue_by_context.values()))
+        )
+
         people = self._labels_by_type(all_entities, {"person"})
         objects = self._labels_by_type(
             all_entities, {"object", "object_category"}
         )
         content = self._labels_by_type(all_entities, {"content"})
         sounds = self._labels_by_type(all_entities, {"sound_event"})
-        recurring = [
-            (pair, count)
-            for pair, count in pair_counts.most_common(12)
-            if count >= 2 and pair[0] in all_entities and pair[1] in all_entities
-        ]
-        recurring_lines = [
-            f"{all_entities[left][1]} and {all_entities[right][1]} co-occurred in "
-            f"{count} replay periods (association, not causation)."
-            for (left, right), count in recurring[:8]
-        ]
         dialogue_periods = sum(
             any(
                 str(observation).startswith(("Heard:", "Egg replied:"))
@@ -723,6 +741,8 @@ class WorldModelSynthesizer:
         abstract_parts = [
             f"Reviewed {len(events)} retained evidence items and consolidated them into {len(timeline)} chronological periods."
         ]
+        if discourse["conversation_summary"]:
+            abstract_parts.append(str(discourse["conversation_summary"]))
         grounded_periods = [
             label
             for count, label in (
@@ -739,47 +759,75 @@ class WorldModelSynthesizer:
             )
         if people:
             abstract_parts.append(f"People encountered: {', '.join(people[:12])}.")
-        if objects:
-            abstract_parts.append(f"Objects observed: {', '.join(objects[:16])}.")
+        if discourse["unresolved_questions"]:
+            abstract_parts.append(
+                "Open conversational threads: "
+                + "; ".join(str(value) for value in discourse["unresolved_questions"][:3])
+                + "."
+            )
+        if objects and not discourse["dialogue_turns"]:
+            abstract_parts.append(f"Objects observed: {', '.join(objects[:12])}.")
         if content:
             abstract_parts.append(f"Text or content retained: {', '.join(content[:12])}.")
         if sounds:
             abstract_parts.append(f"Sounds retained: {', '.join(sounds[:12])}.")
-        if recurring_lines:
-            abstract_parts.append(recurring_lines[0])
         abstract_summary = " ".join(abstract_parts)[:1200]
         content_lines = [
             "## Day",
             f"- {local_day.strftime('%A, %B %d, %Y')} ({timezone_name}).",
             f"- {abstract_summary}",
-            "## Chronological replay",
         ]
+        if discourse["dialogue_turns"]:
+            content_lines.extend(
+                [
+                    "## Conversation and developing meaning",
+                    f"- {discourse['conversation_summary']}",
+                    *[
+                        f"- {line}"
+                        for line in list(discourse["conversation_arc"])[:8]
+                    ],
+                    *(
+                        [
+                            "- Heard statements retained as context, not automatically promoted to facts: "
+                            + "; ".join(
+                                str(value)
+                                for value in list(discourse["heard_assertions"])[:5]
+                            )
+                            + "."
+                        ]
+                        if discourse["heard_assertions"]
+                        else []
+                    ),
+                    *(
+                        [
+                            "- Unresolved questions that may guide later perception or retrieval: "
+                            + "; ".join(
+                                str(value)
+                                for value in list(discourse["unresolved_questions"])[:5]
+                            )
+                            + "."
+                        ]
+                        if discourse["unresolved_questions"]
+                        else []
+                    ),
+                ]
+            )
+        content_lines.append("## Chronological replay")
         content_lines.extend(
             f"- {entry['local_time']} — {entry['summary']}"
             for entry in timeline
         )
         content_lines.extend(
             [
-                "## Consolidated understanding",
-                *(
-                    [f"- {line}" for line in recurring_lines]
-                    if recurring_lines
-                    else [
-                        "- No within-day association repeated enough to support a higher-order motif."
-                    ]
-                ),
+                "## Semantic synthesis",
+                "- Pending interruptible model dream analysis. This deterministic ledger does not assign themes, novelty, meaning, or future attention weight.",
                 "## Provenance",
                 f"- {len(set(evidence_ids))} retained evidence items and {len(set(episode_ids))} source episodes.",
                 "- This chapter is a revisable synthesis; source artifacts remain authoritative.",
             ]
         )
         average_quality = sum(qualities) / max(1, len(qualities))
-        confidence = min(
-            0.98,
-            0.42
-            + 0.12 * math.log1p(len(timeline))
-            + 0.28 * average_quality,
-        )
+        confidence = max(0.0, min(1.0, average_quality))
         unique_evidence_ids = list(dict.fromkeys(evidence_ids))
         unique_episode_ids = list(dict.fromkeys(episode_ids))
         return {
@@ -796,6 +844,397 @@ class WorldModelSynthesizer:
             "episode_ids": unique_episode_ids[:2000],
             "reviewed_evidence_count": len(unique_evidence_ids),
             "reviewed_episode_count": len(unique_episode_ids),
+            "semantic_context": discourse,
+        }
+
+    def _project_daily_semantics(
+        self,
+        narrative_id: str,
+        local_date: str,
+        semantics: dict[str, object],
+        at: datetime,
+    ) -> int:
+        """Materialize recurring discourse themes as an evidence-linked meta-graph."""
+        linked = 0
+        active_semantic_node_ids: list[str] = []
+        topics = semantics.get("themes") or semantics.get("topics") or []
+        for topic in list(topics)[:12]:
+            if not isinstance(topic, dict):
+                continue
+            term = " ".join(
+                str(topic.get("label") or topic.get("term") or "").split()
+            )[:120]
+            if not term:
+                continue
+            theme_id = (
+                "narrative-theme:"
+                + hashlib.sha256(term.encode()).hexdigest()[:20]
+            )
+            detail = self.store.entity_detail(theme_id)
+            prior = (
+                detail.get("entity", {}).get("metadata", {})
+                if isinstance(detail, dict)
+                else {}
+            )
+            support_days = self._unique(
+                [
+                    *(
+                        list(prior.get("support_days") or [])
+                        if isinstance(prior, dict)
+                        else []
+                    ),
+                    local_date,
+                ]
+            )[-90:]
+            source_narratives = self._unique(
+                [
+                    *(
+                        list(
+                            prior.get("source_narrative_ids")
+                            or prior.get("source_entity_ids")
+                            or []
+                        )
+                        if isinstance(prior, dict)
+                        else []
+                    ),
+                    narrative_id,
+                ]
+            )[-90:]
+            model_source_ids = self._unique(
+                [
+                    str(value)
+                    for value in topic.get("entity_ids", [])
+                    if value
+                ]
+            )[:32]
+            model_evidence_ids = self._unique(
+                [
+                    str(value)
+                    for value in topic.get("evidence_ids", [])
+                    if value
+                ]
+            )[:32]
+            confidence = max(0.0, min(1.0, float(topic.get("confidence") or 0.0)))
+            salience = confidence
+            self.store.upsert_entity(
+                "abstraction",
+                f"Narrative theme · {term}",
+                {
+                    "abstraction_kind": "narrative_theme",
+                    "theme": term,
+                    "summary": self._clean_text(topic.get("summary"), 2000),
+                    "support_days": support_days,
+                    "support_count": len(support_days),
+                    "salience": round(salience, 3),
+                    "source_entity_ids": model_source_ids,
+                    "source_evidence_ids": model_evidence_ids,
+                    "source_narrative_ids": source_narratives,
+                    "confidence": round(confidence, 4),
+                    "epistemic_status": "model_synthesis_from_provenance",
+                },
+                theme_id,
+                now=at,
+            )
+            self._edge(
+                narrative_id,
+                "expresses_theme",
+                theme_id,
+                confidence,
+                max(1, int(round(salience))),
+                at,
+                {"derived": True, "local_date": local_date},
+            )
+            for source_id in model_source_ids:
+                self._edge(
+                    source_id,
+                    "supports_theme",
+                    theme_id,
+                    confidence,
+                    1,
+                    at,
+                    {
+                        "derived": True,
+                        "source_narrative_id": narrative_id,
+                        "epistemic_status": "model_selected_association",
+                    },
+                )
+            for evidence_id in model_evidence_ids:
+                self.store.link_entity_evidence(
+                    theme_id, evidence_id, "model-theme-source"
+                )
+            self._edge(
+                theme_id,
+                "informs_observation_policy",
+                "cognitive-document:reflective-working-set",
+                confidence,
+                len(support_days),
+                at,
+                {"derived": True, "support_days": support_days},
+            )
+            linked += 1
+        projections = (
+            (
+                "episodes",
+                "narrative_episode",
+                "nested_episode",
+                "title",
+                "Narrative episode",
+                "contains_narrative_episode",
+            ),
+            (
+                "unresolved_questions",
+                "reflection",
+                "narrative_question",
+                "summary",
+                "Open narrative question",
+                "leaves_open_question",
+            ),
+            (
+                "learned_context",
+                "reflection",
+                "learned_context",
+                "summary",
+                "Learned context",
+                "updates_world_model",
+            ),
+        )
+        for (
+            collection,
+            entity_type,
+            projection_kind,
+            label_field,
+            label_prefix,
+            relation,
+        ) in projections:
+            for item in list(semantics.get(collection) or [])[:48]:
+                if not isinstance(item, dict):
+                    continue
+                label = self._clean_text(item.get(label_field), 240)
+                if not label:
+                    continue
+                digest = hashlib.sha256(
+                    f"{local_date}:{projection_kind}:{label}".encode()
+                ).hexdigest()[:24]
+                node_id = f"narrative-semantic:{digest}"
+                active_semantic_node_ids.append(node_id)
+                confidence = max(
+                    0.0, min(1.0, float(item.get("confidence") or 0.0))
+                )
+                source_entity_ids = self._unique(
+                    [str(value) for value in item.get("entity_ids", []) if value]
+                )[:32]
+                source_evidence_ids = self._unique(
+                    [str(value) for value in item.get("evidence_ids", []) if value]
+                )[:32]
+                self.store.upsert_entity(
+                    entity_type,
+                    f"{label_prefix} · {label}"[:300],
+                    {
+                        "model_semantic_projection": True,
+                        "projection_kind": projection_kind,
+                        "source_narrative_id": narrative_id,
+                        "source_entity_ids": source_entity_ids,
+                        "source_evidence_ids": source_evidence_ids,
+                        "confidence": round(confidence, 4),
+                        "analysis": item,
+                        "epistemic_status": "model_synthesis_from_provenance",
+                    },
+                    node_id,
+                    now=at,
+                )
+                self._edge(
+                    narrative_id,
+                    relation,
+                    node_id,
+                    confidence,
+                    1,
+                    at,
+                    {"derived": True, "model_authored": True},
+                )
+                for source_id in source_entity_ids:
+                    self._edge(
+                        source_id,
+                        "supports_model_semantic",
+                        node_id,
+                        confidence,
+                        1,
+                        at,
+                        {
+                            "derived": True,
+                            "source_narrative_id": narrative_id,
+                        },
+                    )
+                for evidence_id in source_evidence_ids:
+                    self.store.link_entity_evidence(
+                        node_id, evidence_id, "model-semantic-source"
+                    )
+        self.store.retire_narrative_semantic_nodes(
+            narrative_id, active_semantic_node_ids, at
+        )
+        return linked
+
+    def apply_model_semantics(
+        self, local_date: str, semantics: dict[str, object], at: datetime
+    ) -> dict[str, int]:
+        narrative_id = f"daily-narrative:{local_date}"
+        projected = self._project_daily_semantics(
+            narrative_id, local_date, semantics, at
+        )
+        active_theme_ids = {
+            "narrative-theme:"
+            + hashlib.sha256(str(topic.get("label") or topic.get("term")).encode()).hexdigest()[:20]
+            for chapter in self.store.recent_daily_narratives(3650)
+            if isinstance((metadata := chapter.get("metadata")), dict)
+            and isinstance((chapter_semantics := metadata.get("semantic_context")), dict)
+            for topic in list(
+                chapter_semantics.get("themes")
+                or chapter_semantics.get("topics")
+                or []
+            )[:12]
+            if isinstance(topic, dict) and (topic.get("label") or topic.get("term"))
+        }
+        retired = self.store.retire_inactive_narrative_themes(
+            sorted(active_theme_ids), at
+        )
+        self.update([], [], at)
+        return {"projected": projected, "retired": retired}
+
+    def _dialogue_record(
+        self, event: dict[str, object], local_at: datetime
+    ) -> dict[str, object] | None:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        heard = self._clean_text(
+            payload.get("transcript") or payload.get("input_transcript"), 800
+        )
+        if heard and self._is_known_silence_hallucination(heard):
+            heard = ""
+        response = self._clean_text(payload.get("candidate_response"), 800)
+        spoken = payload.get("spoken") is not False
+        if not heard and not response:
+            return None
+        evidence_id = str(event.get("evidence_id") or "")
+        context_value = payload.get("context_id") or payload.get("utterance_id")
+        context_id = (
+            str(context_value)
+            if isinstance(context_value, str) and context_value
+            else evidence_id or f"dialogue:{local_at.isoformat()}"
+        )
+        learned: list[str] = []
+        if payload.get("preferred_name"):
+            learned.append(f"preferred name: {payload['preferred_name']}")
+        if payload.get("corrected_label"):
+            learned.append(f"corrected label: {payload['corrected_label']}")
+        if payload.get("predicate"):
+            learned.append(f"claim update: {payload['predicate']}")
+        if payload.get("memory_update"):
+            learned.append(f"memory update: {payload['memory_update']}")
+        return {
+            "context_id": context_id,
+            "at": local_at.isoformat(),
+            "heard": heard,
+            "response": response if spoken else "",
+            "response_status": "spoken" if response and spoken else "suppressed" if response else "none",
+            "grounded_interaction": bool(
+                response
+                or payload.get("directed") is True
+                or str(event.get("source_type") or "")
+                in {"interaction-policy", "human-answer", "user-correction"}
+            ),
+            "explicitly_directed": payload.get("directed") is True,
+            "open_thread": payload.get("open_thread") is True,
+            "learned_context": learned,
+            "evidence_ids": [evidence_id] if evidence_id else [],
+        }
+
+    @staticmethod
+    def _unique_dialogue_records(
+        records: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        selected: dict[tuple[str, str], dict[str, object]] = {}
+        for record in sorted(records, key=lambda item: str(item.get("at") or "")):
+            key = (
+                " ".join(str(record.get("heard") or "").casefold().split()),
+                " ".join(str(record.get("response") or "").casefold().split()),
+            )
+            if not any(key):
+                continue
+            if key in selected:
+                if record.get("grounded_interaction") and not selected[key].get(
+                    "grounded_interaction"
+                ):
+                    selected[key] = record
+                continue
+            selected[key] = record
+        return list(selected.values())
+
+    @classmethod
+    def _period_conversation_summary(
+        cls, records: list[dict[str, object]]
+    ) -> str:
+        if not records:
+            return ""
+        parts: list[str] = []
+        for record in records[:4]:
+            heard = cls._clean_text(record.get("heard"), 220)
+            response = cls._clean_text(record.get("response"), 220)
+            if heard and response:
+                parts.append(f'Conversation: heard “{heard}”; Egg replied “{response}”')
+            elif heard:
+                parts.append(f'Heard discourse: “{heard}”')
+            elif response:
+                parts.append(f'Egg replied: “{response}”')
+        return "; ".join(parts)
+
+    @classmethod
+    def _conversation_semantics(
+        cls, records: list[dict[str, object]]
+    ) -> dict[str, object]:
+        arcs: list[str] = []
+        learned: list[str] = []
+        exchanges = ambient_turns = 0
+        heard_turns = agent_initiated_turns = 0
+        for record in records:
+            heard = cls._clean_text(record.get("heard"), 800)
+            response = cls._clean_text(record.get("response"), 800)
+            grounded = bool(record.get("grounded_interaction"))
+            heard_turns += int(bool(heard))
+            agent_initiated_turns += int(bool(response) and not heard)
+            ambient_turns += int(bool(heard) and not grounded)
+            exchanges += int(bool(heard and response))
+            if heard and response:
+                arcs.append(f'“{heard[:220]}” → Egg: “{response[:220]}”')
+            elif heard:
+                arcs.append(f'Heard: “{heard[:300]}”')
+            if grounded:
+                learned.extend(str(value) for value in record.get("learned_context", []))
+        conversation_summary = ""
+        if records:
+            conversation_summary = (
+                f"Retained {len(records)} conversation-linked record(s): {heard_turns} heard turn(s), "
+                f"{exchanges} grounded exchange(s), and "
+                f"{agent_initiated_turns} agent-initiated utterance(s)."
+            )
+            if ambient_turns:
+                conversation_summary += f" {ambient_turns} turn(s) were ambient heard discourse rather than confirmed interaction."
+            if learned:
+                conversation_summary += " Conversation produced explicit memory updates: " + ", ".join(cls._unique(learned)[:5]) + "."
+        return {
+            "state": "pending_model_semantics",
+            "dialogue_turns": len(records),
+            "grounded_exchanges": exchanges,
+            "ambient_discourse_turns": ambient_turns,
+            "heard_turns": heard_turns,
+            "agent_initiated_turns": agent_initiated_turns,
+            "conversation_summary": conversation_summary,
+            "conversation_arc": cls._unique(arcs)[:16],
+            "learned_context": cls._unique(learned)[:12],
+            "epistemic_status": "provenance_ledger_awaiting_model_semantics",
+            "topics": [],
+            "focus_terms": [],
+            "heard_assertions": [],
+            "unresolved_questions": [],
         }
 
     @staticmethod
@@ -883,32 +1322,11 @@ class WorldModelSynthesizer:
         normalized = text.casefold()
         if normalized in bucket["observation_keys"]:
             return
-        if normalized.startswith(("episode involving", "observed:")):
-            priority = 1
-        elif normalized.startswith(("heard:", "egg replied:", "read:")):
-            priority = 6
-        elif normalized.startswith(("text:", "audio context:")):
-            priority = 5
-        elif "temporal-person" in source_type or modality in {
-            "audio_comprehension",
-            "ocr",
-        }:
-            priority = 5
-        elif source_type.startswith("ornith"):
-            priority = 4
-        else:
-            priority = 3
         candidates = bucket["observation_candidates"]
         if len(candidates) >= 128:
-            weakest_index, weakest = min(
-                enumerate(candidates), key=lambda item: (int(item[1][0]), -int(item[1][1]))
-            )
-            if priority <= int(weakest[0]):
-                return
-            bucket["observation_keys"].discard(str(weakest[2]).casefold())
-            candidates.pop(weakest_index)
+            return
         bucket["observation_keys"].add(normalized)
-        candidates.append((priority, len(candidates), text))
+        candidates.append((len(candidates), text))
 
     @staticmethod
     def _unique(values: list[str]) -> list[str]:
@@ -935,8 +1353,17 @@ class WorldModelSynthesizer:
         sounds = entry.get("sounds") or []
         if people:
             parts.append("People present: " + ", ".join(people))
+        conversation = str(entry.get("conversation_summary") or "")
+        if conversation:
+            parts.append(conversation)
         observations = entry.get("observations") or []
-        parts.extend(str(value) for value in observations[:5])
+        parts.extend(
+            str(value)
+            for value in observations
+            if not conversation
+            or not str(value).startswith(("Heard:", "Egg replied:"))
+        )
+        parts = parts[:6]
         if content:
             parts.append("Recognized text/content: " + ", ".join(content))
         if sounds:
@@ -955,106 +1382,6 @@ class WorldModelSynthesizer:
                 + " evidence"
             )
         return "; ".join(parts).rstrip(".")[:1199] + "."
-
-    @staticmethod
-    def _deduplicate_semantic_pairs(
-        pairs: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
-        """Avoid duplicate profile IDs manufacturing duplicate semantic motifs."""
-        selected: dict[tuple[tuple[str, str], tuple[str, str]], dict[str, object]] = {}
-        for pair in pairs:
-            left = (
-                str(pair.get("left_type") or "unknown"),
-                " ".join(str(pair.get("left_label") or "").casefold().split()),
-            )
-            right = (
-                str(pair.get("right_type") or "unknown"),
-                " ".join(str(pair.get("right_label") or "").casefold().split()),
-            )
-            if not left[1] or not right[1] or left == right:
-                continue
-            key = tuple(sorted((left, right)))
-            previous = selected.get(key)
-            if previous is None or (
-                int(pair.get("confirmations") or 0),
-                int(pair.get("observation_count") or 0),
-            ) > (
-                int(previous.get("confirmations") or 0),
-                int(previous.get("observation_count") or 0),
-            ):
-                selected[key] = pair
-        return list(selected.values())
-
-    def _project_association(
-        self, pair: dict[str, object], at: datetime
-    ) -> dict[str, object]:
-        left_id, right_id = str(pair["left_id"]), str(pair["right_id"])
-        confirmations = int(pair.get("confirmations") or 0)
-        confidence = min(0.97, 1.0 - math.exp(-confirmations / 3.0))
-        digest = hashlib.sha256(f"{left_id}:{right_id}".encode()).hexdigest()[:24]
-        abstraction_id = f"abstraction:recurring-association:{digest}"
-        left_label = str(pair.get("left_label") or left_id)
-        right_label = str(pair.get("right_label") or right_id)
-        episode_ids = [
-            value for value in str(pair.get("episode_ids") or "").split(",") if value
-        ][:100]
-        summary = (
-            f"{left_label} and {right_label} recur together across "
-            f"{confirmations} distinct encounter periods. This supports association, not causation."
-        )
-        self.store.upsert_entity(
-            "abstraction",
-            summary[:300],
-            {
-                "abstraction_kind": "recurring_episode_association",
-                "source_entity_ids": [left_id, right_id],
-                "source_episode_ids": episode_ids,
-                "source_period_ids": list(pair.get("support_period_ids") or []),
-                "support_count": confirmations,
-                "observation_count": int(pair.get("observation_count") or 0),
-                "confidence": round(confidence, 4),
-                "epistemic_status": "inferred_noncausal",
-                "derived_summary": summary,
-                "last_observed_at": pair.get("last_observed_at"),
-            },
-            abstraction_id,
-            now=at,
-        )
-        for source_id in (left_id, right_id):
-            self._edge(
-                source_id,
-                "supports_pattern",
-                abstraction_id,
-                confidence,
-                confirmations,
-                at,
-                {
-                    "derived": True,
-                    "source_episode_ids": episode_ids,
-                    "epistemic_status": "noncausal_association",
-                },
-            )
-        self._edge(
-            left_id,
-            "recurrently_associated_with",
-            right_id,
-            confidence,
-            confirmations,
-            at,
-            {
-                "derived": True,
-                "abstraction_id": abstraction_id,
-                "source_episode_ids": episode_ids,
-                "epistemic_status": "noncausal_association",
-            },
-        )
-        return {
-            "abstraction_id": abstraction_id,
-            "summary": summary,
-            "confidence": round(confidence, 4),
-            "confirmations": confirmations,
-            "source_entity_ids": [left_id, right_id],
-        }
 
     def _document_contents(
         self,
@@ -1088,12 +1415,25 @@ class WorldModelSynthesizer:
         daily_chapters = [
             (
                 f"{metadata.get('local_date')}: "
-                f"{metadata.get('abstract_summary') or 'chronological replay retained'}"
+                f"{(semantic.get('narrative_summary') if isinstance(semantic, dict) else None) or metadata.get('abstract_summary') or 'chronological replay retained'}"
             )
             for item in daily_narratives
             if isinstance((metadata := item.get("metadata")), dict)
             and metadata.get("local_date")
+            for semantic in [metadata.get("semantic_context")]
         ][:7]
+        narrative_policy = self.store.observational_policy(
+            max(1, len(daily_narratives))
+        )
+        narrative_topics = [
+            str(value) for value in narrative_policy.get("focus_terms", [])[:12]
+        ]
+        open_threads = [
+            str(value) for value in narrative_policy.get("open_questions", [])[:8]
+        ]
+        learned_context = [
+            str(value) for value in narrative_policy.get("learned_context", [])[:8]
+        ]
         world_model = self._sectioned(
             "Grounding",
             [
@@ -1109,10 +1449,26 @@ class WorldModelSynthesizer:
             "Supported facts",
             active_claims or ["No active source-backed semantic claims in this replay set."],
             "Higher-order associations",
-            pattern_lines or ["No recurrent multi-episode motif has crossed the support threshold."],
+            pattern_lines or ["No model-authored higher-order theme is active yet."],
             "Chronological world chapters",
             daily_chapters
             or ["No dated dream replay has generated a daily chapter yet."],
+            "Conversation-shaped understanding",
+            [
+                "Recent grounded discourse themes: "
+                + (", ".join(narrative_topics) or "none consolidated yet")
+                + ".",
+                *(
+                    ["Explicit conversational memory updates: " + "; ".join(learned_context) + "."]
+                    if learned_context
+                    else []
+                ),
+                *(
+                    ["Open questions remain prompts for retrieval or observation, not established facts: " + "; ".join(open_threads) + "."]
+                    if open_threads
+                    else []
+                ),
+            ],
         )
 
         episode_summaries = [
@@ -1136,6 +1492,13 @@ class WorldModelSynthesizer:
             "Dated chapters consolidated during dreams",
             daily_chapters
             or ["No daily story chapter has been consolidated yet."],
+            "What conversation has made salient",
+            [
+                "My recent conversations have centered on: "
+                + (", ".join(narrative_topics) or "no stable theme yet")
+                + ".",
+                *(["Questions still left open: " + "; ".join(open_threads) + "."] if open_threads else []),
+            ],
         )
 
         spoken = sum(
@@ -1149,34 +1512,21 @@ class WorldModelSynthesizer:
             for item in outcomes
             if isinstance(item.get("payload"), dict)
         )
-        shared_terms = self._shared_dialogue_terms(outcomes)
-        interruption_count = sum(
-            "interrupt" in reason.casefold() or "supersed" in reason.casefold()
-            for reason in reasons
-        )
-        memory_updates = sum(
-            any(tag.get("kind") == "memory" for tag in turn.get("tags", []))
-            for turn in history
-            if isinstance(turn, dict)
-        )
-        strategy_lines = [
-            "Ground replies in current sensory evidence and explicit retrieved memory; state uncertainty when support is weak.",
-            "Prefer short spoken responses so new human speech can interrupt naturally.",
+        policy_items = [
+            item
+            for key in ("attend_to", "deprioritize", "open_questions")
+            for item in narrative_policy.get(key, [])
+            if isinstance(item, dict) and item.get("summary")
         ]
-        if shared_terms:
-            strategy_lines.append(
-                "Reuse established user terminology when it remains unambiguous: "
-                + ", ".join(shared_terms[:10])
-                + "."
+        strategy_lines = [
+            str(value)
+            for value in (
+                narrative_policy.get("summary"),
+                narrative_policy.get("directive"),
+                *(item.get("summary") for item in policy_items[:8]),
             )
-        if interruption_count:
-            strategy_lines.append(
-                "Observed supersession/interruption evidence supports yielding immediately to newer directed speech."
-            )
-        if memory_updates:
-            strategy_lines.append(
-                "Conversation-linked memory updates support acknowledging learned names, labels, and claims without repeatedly announcing them."
-            )
+            if isinstance(value, str) and value.strip()
+        ] or ["No model-authored communication or observation strategy is active yet."]
         communication_strategy = self._sectioned(
             "Observed outcomes",
             [
@@ -1188,7 +1538,7 @@ class WorldModelSynthesizer:
                 )
                 + ".",
             ],
-            "Current strategy",
+            "Current model-authored strategy",
             strategy_lines,
         )
 
@@ -1196,23 +1546,14 @@ class WorldModelSynthesizer:
             f"{item['subject_id']} has competing values for {item['predicate']}."
             for item in conflicts[:8]
         ]
-        unfamiliar = [
-            f"{item.get('display_name') or item['entity_id']} lacks a user-confirmed purpose."
-            for item in inventory
-            if item.get("entity_type") == "object"
-            and not any(
-                isinstance(claim, dict) and claim.get("predicate") == "used_for"
-                for claim in item.get("claims", [])
-            )
-        ][:8]
         working_set = self._sectioned(
             "Stable enough to use",
-            pattern_lines[:6] or ["No higher-order association is stable enough yet."],
+            pattern_lines[:6] or ["No model-authored higher-order theme is active yet."],
             "Changes and uncertainties to monitor",
-            unresolved + unfamiliar
+            open_threads + unresolved
             or ["No active claim conflict or reducible replay gap is present."],
-            "Behavioral focus",
-            strategy_lines[:4],
+            "Model-authored observation policy",
+            strategy_lines,
         )
         return {
             "world-model": world_model,
@@ -1229,55 +1570,6 @@ class WorldModelSynthesizer:
             for item in parts[index + 1]:
                 lines.append(f"- {item}")
         return "\n".join(lines)[:5000]
-
-    @staticmethod
-    def _entity_summary(item: dict[str, object]) -> str:
-        label = str(item.get("display_name") or item["entity_id"])
-        claims = [
-            f"{claim.get('predicate')}={claim.get('object_id_or_text')}"
-            for claim in item.get("claims", [])[:4]
-            if isinstance(claim, dict)
-        ]
-        summary = (
-            f"{label}: {int(item.get('evidence_count') or 0)} evidence items and "
-            f"{int(item.get('edge_count') or 0)} graph relationships"
-        )
-        if claims:
-            summary += "; active claims: " + ", ".join(claims)
-        return summary + "."
-
-    @staticmethod
-    def _shared_dialogue_terms(outcomes: list[dict[str, object]]) -> list[str]:
-        counts: Counter[str] = Counter()
-        for outcome in outcomes:
-            payload = outcome.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            heard = {
-                token
-                for token in re.findall(
-                    r"[a-z0-9][a-z0-9_-]+",
-                    str(payload.get("input_transcript") or "").casefold(),
-                )
-                if len(token) >= 4 and token not in _TERM_STOPWORDS
-            }
-            replied = set(
-                re.findall(
-                    r"[a-z0-9][a-z0-9_-]+",
-                    str(payload.get("candidate_response") or "").casefold(),
-                )
-            )
-            counts.update(heard & replied)
-        return [term for term, count in counts.most_common(20) if count >= 2]
-
-    @staticmethod
-    def _document_confidence(
-        inventory: list[dict[str, object]],
-        abstractions: list[dict[str, object]],
-    ) -> float:
-        evidence = sum(int(item.get("evidence_count") or 0) for item in inventory)
-        support = sum(int(item.get("confirmations") or 0) for item in abstractions)
-        return round(min(0.98, 0.35 + 0.08 * math.log1p(evidence + support)), 4)
 
     def _edge(
         self,

@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import wave
 
 from egg_companion.adapters.omnius import OmniusClient
@@ -378,6 +379,203 @@ def test_dialogue_router_preserves_web_search_tool_contract() -> None:
         assert result["tool_query"] == "current Jetson Linux release"
 
     asyncio.run(scenario())
+
+
+def test_narrative_dream_contracts_are_strict_and_model_owned() -> None:
+    async def scenario() -> None:
+        client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+        responses = iter(
+            [
+                '{"tool_requests":[{"tool":"memory_search","query":"prior encounter",'
+                '"entity_ids":[],"evidence_ids":[],"purpose":"retrieve associated context"}],'
+                '"planning_summary":"The model chose one local retrieval."}',
+                '{"narrative_summary":"A grounded account.",'
+                '"story_update":"The account changed after retrieved context.",'
+                '"themes":[],"episodes":[]}',
+                '{"unresolved_questions":[],"learned_context":[],'
+                '"observation_policy":{"summary":"Remain responsive to grounded change.",'
+                '"attend_to":[{"summary":"Ask about the artifact.","reason":"The model selected it.",'
+                '"action":"ask","predicate":"used_for","confidence":0.9,"entity_ids":[],'
+                '"evidence_ids":[],"context_ids":[]}],"deprioritize":[],"open_questions":[]},'
+                '"constitution_update":null}',
+                '{"accepted":true,"constitution":"Integrate evidence through explicit, revisable associations.",'
+                '"review_summary":"The update changes the general method without encoding a lived fact."}',
+                '{"narrative_summary":"A grounded account.",'
+                '"story_update":"A changed account.","themes":[],"episodes":[],'
+                '"unexpected":"rejected"}',
+                '{}',
+            ]
+        )
+
+        async def structured(prompt: str, *, max_tokens: int) -> str:
+            assert prompt
+            assert max_tokens > 0
+            return next(responses)
+
+        client._narrative_structured_chat = structured  # type: ignore[method-assign]
+        plan = await client.plan_narrative_dream({}, {}, {})
+        assert plan is not None
+        assert plan["tool_requests"][0]["tool"] == "memory_search"
+        synthesis = await client.synthesize_narrative_dream({}, {}, {}, plan, [])
+        assert synthesis is not None
+        assert synthesis["narrative_summary"] == "A grounded account."
+        assert synthesis["observation_policy"]["attend_to"][0]["action"] == "ask"
+        review = await client.review_narrative_constitution_update(
+            {}, "Integrate evidence through explicit associations."
+        )
+        assert review is not None and review["accepted"] is True
+        assert await client.synthesize_narrative_dream({}, {}, {}, plan, []) is None
+
+    asyncio.run(scenario())
+
+
+def test_split_narrative_contracts_reject_semantic_shape_drift() -> None:
+    assert OmniusClient._parse_narrative_core(
+        '{"narrative_summary":"Grounded.","story_update":"Changed.",'
+        '"themes":[],"episodes":[]}'
+    ) is not None
+    assert OmniusClient._parse_narrative_reflection(
+        '{"unresolved_questions":[],"learned_context":[],"observation_policy":'
+        '{"summary":"Continue grounding.","attend_to":[],"deprioritize":[],'
+        '"open_questions":[]},"constitution_update":null}'
+    ) is not None
+    assert OmniusClient._parse_narrative_core(
+        '{"narrative_summary":"Grounded.","story_update":"Changed.",'
+        '"themes":[],"episodes":[],"invented":true}'
+    ) is None
+
+
+def test_narrative_reflection_normalizes_model_owned_flat_policy() -> None:
+    parsed = OmniusClient._parse_narrative_reflection(
+        json.dumps(
+            {
+                "unresolved_questions": [],
+                "learned_context": [],
+                "observation_policy": [
+                    {
+                        "summary": "Retrieve the linked encounter.",
+                        "reason": "The model selected the unresolved relationship.",
+                        "action": "retrieve",
+                        "predicate": None,
+                        "confidence": 0.8,
+                        "entity_ids": ["person-1"],
+                        "evidence_ids": [],
+                    },
+                    {
+                        "summary": "Reduce attention to unsupported repetition.",
+                        "reason": "The model found no semantic link.",
+                        "action": "deprioritize",
+                        "predicate": None,
+                        "confidence": 0.7,
+                        "entity_ids": [],
+                        "evidence_ids": [],
+                    },
+                ],
+                "constitution_update": None,
+            }
+        )
+    )
+    assert parsed is not None
+    assert parsed["observation_policy"]["attend_to"][0]["action"] == "retrieve"
+    assert parsed["observation_policy"]["deprioritize"][0]["action"] == "deprioritize"
+    assert parsed["observation_policy"]["attend_to"][0]["context_ids"] == []
+    assert OmniusClient._parse_narrative_reflection(
+        '{"unresolved_questions":[],"learned_context":[],"observation_policy":'
+        '{"summary":"Continue grounding.","attend_to":[],"deprioritize":[],'
+        '"open_questions":[]},"constitution_update":null,"invented":true}'
+    ) is None
+
+
+def test_proactive_answer_is_interpreted_by_model_contract() -> None:
+    async def scenario() -> None:
+        client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+        async def structured(prompt: str) -> str:
+            assert "What is it used for?" in prompt
+            return (
+                '{"relation":"answer","value":"inspecting circuit boards",'
+                '"reply":"Thanks, I will remember that relationship."}'
+            )
+
+        client._structured_chat = structured  # type: ignore[method-assign]
+        result = await client.interpret_proactive_answer(
+            "What is it used for?", "I use it for inspecting circuit boards.", "used_for"
+        )
+        assert result is not None
+        assert result["relation"] == "answer"
+        assert result["value"] == "inspecting circuit boards"
+
+    asyncio.run(scenario())
+
+
+def test_narrative_prompt_capacity_boundary_is_transparent_json() -> None:
+    encoded = OmniusClient._bounded_prompt_json({"ledger": "x" * 200}, 30)
+    parsed = json.loads(encoded)
+    assert parsed["capacity_truncated"] is True
+    assert parsed["original_characters"] > 30
+    assert len(parsed["serialized_prefix"]) == 30
+
+
+def test_narrative_plan_capacity_is_bounded_without_inventing_fields() -> None:
+    raw = json.dumps(
+        {
+            "tool_requests": [
+                {
+                    "tool": "graph_inspect",
+                    "query": None,
+                    "entity_ids": [f"entity-{index}" for index in range(20)],
+                    "evidence_ids": [],
+                    "purpose": "p" * 500,
+                }
+            ],
+            "planning_summary": "s" * 1500,
+        }
+    )
+    parsed = OmniusClient._parse_narrative_plan(raw)
+    assert parsed is not None
+    assert len(parsed["tool_requests"][0]["entity_ids"]) == 12
+    assert len(parsed["tool_requests"][0]["purpose"]) == 300
+    assert len(parsed["planning_summary"]) == 1000
+    assert OmniusClient._parse_narrative_plan('{"tool_requests":[],"planning_summary":"ok","extra":1}') is None
+
+
+def test_narrative_synthesis_normalizes_explicit_empty_reference_slots() -> None:
+    raw = json.dumps(
+        {
+            "version": 1,
+            "narrative_summary": "A grounded day.",
+            "story_update": {
+                "summary": "The account gained one supported relationship.",
+                "confidence": 0.8,
+                "entity_ids": ["person-1"],
+                "evidence_ids": ["evidence-1"],
+            },
+            "themes": [
+                {
+                    "label": "shared work",
+                    "summary": "A person and tool appeared in one supported episode.",
+                    "confidence": 0.7,
+                    "entity_ids": ["person-1"],
+                    "evidence_ids": ["evidence-1"],
+                }
+            ],
+            "episodes": [],
+            "unresolved_questions": [],
+            "learned_context": [],
+            "observation_policy": {
+                "summary": "Observe future grounded changes.",
+                "attend_to": [],
+                "deprioritize": [],
+                "open_questions": [],
+            },
+            "constitution_update": None,
+        }
+    )
+    parsed = OmniusClient._parse_narrative_synthesis(raw)
+    assert parsed is not None
+    assert parsed["story_update"] == "The account gained one supported relationship."
+    assert parsed["story_update_detail"]["context_ids"] == []
+    assert parsed["themes"][0]["context_ids"] == []
 
 
 def test_asr_grounding_rejects_no_speech_low_probability_and_repetition() -> None:

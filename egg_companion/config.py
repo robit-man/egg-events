@@ -308,6 +308,7 @@ class CognitiveAttentionConfig(BaseModel):
     speech_weight: float = Field(default=0.30, ge=0, le=1)
     prediction_error_weight: float = Field(default=0.15, ge=0, le=1)
     epistemic_value_weight: float = Field(default=0.18, ge=0, le=1)
+    observation_policy_weight: float = Field(default=0.22, ge=0, le=1)
     graph_familiarity_discount: float = Field(default=0.85, ge=0, le=1)
     irreducible_uncertainty_discount: float = Field(default=0.65, ge=0, le=1)
     interruption_threshold: float = Field(default=0.75, ge=0, le=1)
@@ -319,20 +320,16 @@ class CognitiveAttentionConfig(BaseModel):
 
 
 class DefaultModeConfig(BaseModel):
-    """Bounded quiet-period replay, reflection, and curiosity controls."""
+    """Bounded quiet-period provenance replay and model-dream controls."""
 
     enabled: bool = True
     idle_seconds: float = Field(default=45, ge=5, le=3600)
     interval_min_seconds: float = Field(default=60, ge=15, le=86400)
     interval_max_seconds: float = Field(default=180, ge=15, le=172800)
     replay_limit: int = Field(default=8, ge=1, le=100)
-    reflection_min_evidence: int = Field(default=2, ge=1, le=1000)
-    curiosity_threshold: float = Field(default=0.64, ge=0, le=1)
     proactive_budget_per_hour: int = Field(default=2, ge=0, le=20)
     proactive_cooldown_seconds: float = Field(default=300, ge=0, le=86400)
     question_timeout_seconds: float = Field(default=240, gt=0, le=3600)
-    meta_graph_min_confirmations: int = Field(default=2, ge=2, le=1000)
-    meta_graph_period_seconds: int = Field(default=600, ge=60, le=86400)
     meta_graph_limit: int = Field(default=24, ge=1, le=200)
     entity_summary_limit: int = Field(default=12, ge=1, le=100)
     document_context_characters: int = Field(default=1800, ge=400, le=8000)

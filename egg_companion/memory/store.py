@@ -40,6 +40,7 @@ def _row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 class MemoryStore:
+    NARRATIVE_SEMANTIC_CONTRACT_REVISION = 1
     """Process-safe, append-first SQLite property graph for local Egg memory."""
 
     def __init__(self, config: MemoryConfig) -> None:
@@ -834,73 +835,36 @@ class MemoryStore:
             )
         return reflection_id, created
 
-    def recurrent_entity_pairs(
-        self,
-        minimum_confirmations: int = 2,
-        limit: int = 24,
-        period_seconds: int = 600,
-    ) -> list[dict[str, Any]]:
-        """Return motifs repeated across time windows, not adjacent frames."""
-        minimum = max(2, int(minimum_confirmations))
+    def active_narrative_themes(self, limit: int = 24) -> list[dict[str, Any]]:
+        """Return only model-authored active themes for cognitive documents."""
         bounded = max(1, min(int(limit), self.config.graph_max_nodes))
-        period = max(60, min(int(period_seconds), 86400))
         with self._lock:
             rows = self._connection.execute(
-                """SELECT left_entity.entity_id AS left_id,
-                left_entity.entity_type AS left_type,
-                left_entity.display_name AS left_label,
-                right_entity.entity_id AS right_id,
-                right_entity.entity_type AS right_type,
-                right_entity.display_name AS right_label,
-                COUNT(DISTINCT CAST(strftime('%s', episode.started_at) / ? AS INTEGER))
-                  AS confirmations,
-                COUNT(DISTINCT left_episode.episode_id) AS observation_count,
-                MAX(episode.started_at) AS last_observed_at
-                FROM episode_entities left_episode
-                JOIN episode_entities right_episode
-                  ON left_episode.episode_id=right_episode.episode_id
-                 AND left_episode.entity_id < right_episode.entity_id
-                JOIN entities left_entity
-                  ON left_entity.entity_id=left_episode.entity_id
-                JOIN entities right_entity
-                  ON right_entity.entity_id=right_episode.entity_id
-                JOIN episodes episode ON episode.episode_id=left_episode.episode_id
-                WHERE left_entity.state='active' AND right_entity.state='active'
-                  AND left_entity.merged_into IS NULL
-                  AND right_entity.merged_into IS NULL
-                  AND left_entity.entity_type IN
-                    ('person','object','object_category','content','sound_event')
-                  AND right_entity.entity_type IN
-                    ('person','object','object_category','content','sound_event')
-                GROUP BY left_entity.entity_id, right_entity.entity_id
-                HAVING confirmations >= ?
-                ORDER BY confirmations DESC, last_observed_at DESC LIMIT ?""",
-                (period, minimum, bounded),
+                """SELECT entity_id, display_name, metadata_json FROM entities
+                WHERE entity_type='abstraction' AND state='active'
+                AND json_extract(metadata_json, '$.abstraction_kind')='narrative_theme'
+                ORDER BY updated_at DESC LIMIT ?""",
+                (bounded,),
             ).fetchall()
-            records = [dict(row) for row in rows]
-            for record in records:
-                episode_rows = self._connection.execute(
-                    """SELECT MIN(left_episode.episode_id) AS episode_id,
-                    CAST(strftime('%s', episode.started_at) / ? AS INTEGER) AS period_id
-                    FROM episode_entities left_episode
-                    JOIN episode_entities right_episode
-                      ON left_episode.episode_id=right_episode.episode_id
-                    JOIN episodes episode ON episode.episode_id=left_episode.episode_id
-                    WHERE left_episode.entity_id=? AND right_episode.entity_id=?
-                    GROUP BY period_id ORDER BY period_id DESC LIMIT 100""",
-                    (period, record["left_id"], record["right_id"]),
-                ).fetchall()
-                record["episode_ids"] = ",".join(
-                    str(item["episode_id"])
-                    for item in episode_rows
-                    if item["episode_id"]
-                )
-                record["support_period_ids"] = [
-                    str(item["period_id"])
-                    for item in episode_rows
-                    if item["period_id"] is not None
-                ]
-        return records
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            result.append(
+                {
+                    "abstraction_id": str(row["entity_id"]),
+                    "summary": str(
+                        metadata.get("summary")
+                        or metadata.get("theme")
+                        or row["display_name"]
+                    ),
+                    "confidence": float(metadata.get("confidence") or 0.0),
+                    "confirmations": int(metadata.get("support_count") or 1),
+                    "source_entity_ids": list(
+                        metadata.get("source_entity_ids") or []
+                    ),
+                }
+            )
+        return result
 
     def retire_inactive_meta_graph(
         self, active_abstraction_ids: list[str], at: datetime
@@ -928,6 +892,69 @@ class MemoryStore:
                       json_extract(metadata_json, '$.abstraction_id')=?
                     )""",
                     (timestamp, abstraction_id, abstraction_id, abstraction_id),
+                )
+        return len(stale)
+
+    def retire_inactive_narrative_themes(
+        self, active_theme_ids: list[str], at: datetime
+    ) -> int:
+        """Retract dialogue themes excluded by the current narrative reducer."""
+        active = set(active_theme_ids)
+        timestamp = _timestamp(at)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """SELECT entity_id FROM entities WHERE entity_type='abstraction'
+                AND state='active' AND json_extract(metadata_json,
+                '$.abstraction_kind')='narrative_theme'"""
+            ).fetchall()
+            stale = [
+                str(row["entity_id"])
+                for row in rows
+                if row["entity_id"] not in active
+            ]
+            for theme_id in stale:
+                connection.execute(
+                    "UPDATE entities SET state='superseded', updated_at=? WHERE entity_id=?",
+                    (timestamp, theme_id),
+                )
+                connection.execute(
+                    """UPDATE edges SET state='retracted', valid_to=?
+                    WHERE state='active' AND (source_id=? OR target_id=?)""",
+                    (timestamp, theme_id, theme_id),
+                )
+        return len(stale)
+
+    def retire_narrative_semantic_nodes(
+        self,
+        source_narrative_id: str,
+        active_node_ids: list[str],
+        at: datetime,
+    ) -> int:
+        """Retract superseded model-authored episode/question/context projections."""
+        active = set(active_node_ids)
+        timestamp = _timestamp(at)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """SELECT entity_id FROM entities WHERE state='active'
+                AND entity_type IN ('narrative_episode','reflection')
+                AND json_extract(metadata_json, '$.source_narrative_id')=?
+                AND json_extract(metadata_json, '$.model_semantic_projection')=1""",
+                (source_narrative_id,),
+            ).fetchall()
+            stale = [
+                str(row["entity_id"])
+                for row in rows
+                if str(row["entity_id"]) not in active
+            ]
+            for node_id in stale:
+                connection.execute(
+                    "UPDATE entities SET state='superseded', updated_at=? WHERE entity_id=?",
+                    (timestamp, node_id),
+                )
+                connection.execute(
+                    """UPDATE edges SET state='retracted', valid_to=?
+                    WHERE state='active' AND (source_id=? OR target_id=?)""",
+                    (timestamp, node_id, node_id),
                 )
         return len(stale)
 
@@ -1023,6 +1050,54 @@ class MemoryStore:
             ).fetchall()
         return [_row(row) for row in rows]
 
+    @staticmethod
+    def _model_narrative_document(
+        semantics: dict[str, Any], provenance_content: str
+    ) -> str:
+        """Render model-owned semantics without deriving or ranking their meaning."""
+        lines = [
+            "## Model-authored daily account",
+            f"- {semantics.get('narrative_summary') or 'No model summary was returned.'}",
+        ]
+        story_update = semantics.get("story_update")
+        if story_update:
+            lines.extend(["## Story update", f"- {story_update}"])
+        sections = (
+            ("Themes", "themes", "label"),
+            ("Nested episodes", "episodes", "title"),
+            ("Unresolved questions", "unresolved_questions", None),
+            ("Learned context", "learned_context", None),
+        )
+        for heading, key, label_key in sections:
+            items = semantics.get(key)
+            if not isinstance(items, list) or not items:
+                continue
+            lines.append(f"## {heading}")
+            for item in items:
+                if not isinstance(item, dict) or not item.get("summary"):
+                    continue
+                label = f"{item.get(label_key)}: " if label_key and item.get(label_key) else ""
+                significance = (
+                    f" Significance: {item.get('significance')}"
+                    if item.get("significance")
+                    else ""
+                )
+                lines.append(f"- {label}{item['summary']}{significance}")
+        policy = semantics.get("observation_policy")
+        if isinstance(policy, dict):
+            lines.extend(
+                ["## Evolving observation policy", f"- {policy.get('summary') or ''}"]
+            )
+            for key in ("attend_to", "deprioritize", "open_questions"):
+                for item in policy.get(key, []):
+                    if isinstance(item, dict) and item.get("summary"):
+                        lines.append(
+                            f"- [{item.get('action') or key}] {item['summary']}"
+                            + (f" — {item['reason']}" if item.get("reason") else "")
+                        )
+        lines.extend(["## Chronological provenance ledger", provenance_content])
+        return "\n".join(str(line) for line in lines if str(line).strip())[:12000]
+
     def upsert_daily_narrative(
         self,
         local_date: str,
@@ -1039,6 +1114,7 @@ class MemoryStore:
         reviewed_evidence_count: int | None = None,
         reviewed_episode_count: int | None = None,
         narrative_schema_revision: int = 1,
+        semantic_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create or revise an inspectable, evidence-backed chapter for one day."""
         narrative_id = f"daily-narrative:{local_date}"
@@ -1052,6 +1128,7 @@ class MemoryStore:
             len(source_evidence), int(reviewed_evidence_count or 0)
         )
         episode_count = max(len(source_episodes), int(reviewed_episode_count or 0))
+        conversation_ledger = dict(semantic_context or {})
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -1063,6 +1140,7 @@ class MemoryStore:
                     "reviewed_evidence_count": evidence_count,
                     "reviewed_episode_count": episode_count,
                     "narrative_schema_revision": narrative_schema_revision,
+                    "conversation_ledger": conversation_ledger,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -1073,6 +1151,24 @@ class MemoryStore:
                 "SELECT metadata_json FROM entities WHERE entity_id=?", (narrative_id,)
             ).fetchone()
         metadata = json.loads(existing["metadata_json"]) if existing else {}
+        model_semantics = (
+            dict(metadata.get("semantic_context") or {})
+            if metadata.get("semantic_source_fingerprint") == fingerprint
+            else {
+                "state": "pending_model_semantics",
+                "focus_terms": [],
+                "unresolved_questions": [],
+            }
+        )
+        display_summary = abstract_summary[:1200]
+        display_content = normalized
+        if model_semantics.get("state") == "model_complete" and model_semantics.get(
+            "narrative_summary"
+        ):
+            display_summary = str(model_semantics["narrative_summary"])[:1200]
+            display_content = self._model_narrative_document(
+                model_semantics, normalized
+            )
         changed = metadata.get("narrative_fingerprint") != fingerprint
         revision = int(metadata.get("revision") or 0) + int(changed)
         dream_runs = list(
@@ -1094,9 +1190,13 @@ class MemoryStore:
                 "document_kind": "daily-narrative",
                 "local_date": local_date,
                 "timezone": timezone_name,
-                "content": normalized,
-                "abstract_summary": abstract_summary[:1200],
+                "content": display_content,
+                "abstract_summary": display_summary,
+                "provenance_content": normalized,
+                "provenance_abstract_summary": abstract_summary[:1200],
                 "timeline": timeline,
+                "conversation_ledger": conversation_ledger,
+                "semantic_context": model_semantics,
                 "revision": revision,
                 "confidence": max(0.0, min(1.0, float(confidence))),
                 "source_entity_ids": source_entities,
@@ -1111,6 +1211,7 @@ class MemoryStore:
                 "last_dream_run_id": dream_run_id,
                 "last_replayed_at": at.isoformat(),
                 "narrative_fingerprint": fingerprint,
+                "semantic_input_fingerprint": fingerprint,
                 "epistemic_status": "derived_from_chronological_local_evidence",
             },
             narrative_id,
@@ -1125,7 +1226,7 @@ class MemoryStore:
             "evidence_count": evidence_count,
             "episode_count": episode_count,
             "entity_count": len(source_entities),
-            "abstract_summary": abstract_summary[:1200],
+            "abstract_summary": display_summary,
         }
 
     def recent_daily_narratives(self, limit: int = 30) -> list[dict[str, Any]]:
@@ -1138,6 +1239,55 @@ class MemoryStore:
                 (bounded,),
             ).fetchall()
         return [_row(row) for row in rows]
+
+    def refresh_model_narrative_documents(self) -> int:
+        """Materialize model summaries for completed legacy chapter displays."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT entity_id, metadata_json FROM entities
+                WHERE entity_type='daily_narrative' AND state='active'
+                AND json_extract(metadata_json, '$.semantic_context.state')='model_complete'"""
+            ).fetchall()
+        updated = 0
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            semantics = metadata.get("semantic_context")
+            if not isinstance(semantics, dict) or not semantics.get(
+                "narrative_summary"
+            ):
+                continue
+            provenance_content = str(
+                metadata.get("provenance_content")
+                or metadata.get("content")
+                or ""
+            )
+            provenance_summary = str(
+                metadata.get("provenance_abstract_summary")
+                or metadata.get("abstract_summary")
+                or ""
+            )
+            content = self._model_narrative_document(
+                semantics, provenance_content
+            )
+            summary = str(semantics["narrative_summary"])[:1200]
+            if (
+                metadata.get("content") == content
+                and metadata.get("abstract_summary") == summary
+                and metadata.get("provenance_content") == provenance_content
+            ):
+                continue
+            self.upsert_entity(
+                "daily_narrative",
+                metadata={
+                    "content": content,
+                    "abstract_summary": summary,
+                    "provenance_content": provenance_content,
+                    "provenance_abstract_summary": provenance_summary[:1200],
+                },
+                entity_id=str(row["entity_id"]),
+            )
+            updated += 1
+        return updated
 
     def daily_narrative_index(self, limit: int = 90) -> list[dict[str, Any]]:
         """Return compact newest-first chapter cards for the Narrative page."""
@@ -1154,6 +1304,13 @@ class MemoryStore:
                     "revision": int(metadata.get("revision") or 0),
                     "confidence": float(metadata.get("confidence") or 0.0),
                     "abstract_summary": str(metadata.get("abstract_summary") or ""),
+                    "focus_terms": list(metadata.get("semantic_context", {}).get("focus_terms", []))[:8]
+                    if isinstance(metadata.get("semantic_context"), dict)
+                    else [],
+                    "open_thread_count": len(metadata.get("semantic_context", {}).get("unresolved_questions", []))
+                    if isinstance(metadata.get("semantic_context"), dict)
+                    and isinstance(metadata.get("semantic_context", {}).get("unresolved_questions"), list)
+                    else 0,
                     "timeline_entries": len(metadata.get("timeline", []))
                     if isinstance(metadata.get("timeline"), list)
                     else 0,
@@ -1265,6 +1422,8 @@ class MemoryStore:
             "confidence": float(metadata.get("confidence") or 0.0),
             "abstract_summary": metadata.get("abstract_summary"),
             "content": metadata.get("content"),
+            "semantic_context": metadata.get("semantic_context", {}),
+            "conversation_ledger": metadata.get("conversation_ledger", {}),
             "timeline": timeline,
             "source_entity_ids": metadata.get("source_entity_ids", []),
             "source_evidence_count": len(evidence_map),
@@ -1278,6 +1437,248 @@ class MemoryStore:
             "dream_run_ids": metadata.get("dream_run_ids", []),
             "last_replayed_at": metadata.get("last_replayed_at"),
         }
+
+    def observational_policy(self, recent_days: int = 14) -> dict[str, Any]:
+        """Return the latest model-authored policy without lexical post-processing."""
+        detail = self.entity_detail("observation-policy:current")
+        if not isinstance(detail, dict):
+            return {
+                "revision": 0,
+                "state": "pending_model_semantics",
+                "focus_terms": [],
+                "focus_entity_ids": [],
+                "open_questions": [],
+                "theme_ids": [],
+                "directive": "",
+            }
+        entity = detail.get("entity")
+        metadata = entity.get("metadata") if isinstance(entity, dict) else None
+        policy = metadata.get("policy") if isinstance(metadata, dict) else None
+        return dict(policy) if isinstance(policy, dict) else {}
+
+    def pending_narrative_semantics(self, limit: int = 1) -> list[dict[str, Any]]:
+        """Return chronological evidence ledgers whose model synthesis is stale."""
+        bounded = max(1, min(int(limit), 10))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT entity_id, metadata_json FROM entities
+                WHERE entity_type='daily_narrative' AND state='active'
+                AND (COALESCE(json_extract(metadata_json,
+                    '$.semantic_source_fingerprint'), '') !=
+                    COALESCE(json_extract(metadata_json,
+                    '$.semantic_input_fingerprint'), '') OR
+                    COALESCE(json_extract(metadata_json,
+                    '$.semantic_contract_revision'), 0) != ?)
+                ORDER BY json_extract(metadata_json, '$.local_date') ASC LIMIT ?""",
+                (self.NARRATIVE_SEMANTIC_CONTRACT_REVISION, bounded),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            result.append(
+                {
+                    "narrative_id": str(row["entity_id"]),
+                    "local_date": str(metadata.get("local_date") or ""),
+                    "timezone": str(metadata.get("timezone") or ""),
+                    "semantic_input_fingerprint": str(
+                        metadata.get("semantic_input_fingerprint") or ""
+                    ),
+                    "abstract_summary": str(metadata.get("abstract_summary") or ""),
+                    "content": str(metadata.get("content") or ""),
+                    "timeline": metadata.get("timeline", []),
+                    "conversation_ledger": metadata.get("conversation_ledger", {}),
+                    "source_entity_ids": metadata.get("source_entity_ids", []),
+                    "source_evidence_ids": metadata.get("source_evidence_ids", []),
+                }
+            )
+        return result
+
+    def narrative_constitution(self) -> dict[str, Any]:
+        detail = self.entity_detail("narrative-constitution:current")
+        if isinstance(detail, dict) and isinstance(detail.get("entity"), dict):
+            metadata = detail["entity"].get("metadata")
+            if isinstance(metadata, dict):
+                return dict(metadata)
+        return {
+            "revision": 0,
+            "text": (
+                "Develop a coherent, revisable account of lived multimodal evidence. "
+                "Let meaning, novelty, relationships, uncertainty, and future attention emerge "
+                "from the supplied evidence and tool results. Preserve the distinction between "
+                "what was sensed, what was said, what was inferred, and what remains unknown."
+            ),
+            "history": [],
+        }
+
+    def apply_narrative_semantics(
+        self,
+        local_date: str,
+        input_fingerprint: str,
+        semantics: dict[str, Any],
+        policy: dict[str, Any],
+        constitution_text: str | None,
+        model_id: str,
+        tool_audit: list[dict[str, Any]],
+        at: datetime,
+    ) -> bool:
+        narrative_id = f"daily-narrative:{local_date}"
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT metadata_json FROM entities WHERE entity_id=? AND state='active'",
+                (narrative_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        metadata = json.loads(row["metadata_json"])
+        if metadata.get("semantic_input_fingerprint") != input_fingerprint:
+            return False
+        if not self._narrative_references_exist(semantics, policy):
+            return False
+        provenance_content = str(
+            metadata.get("provenance_content") or metadata.get("content") or ""
+        )
+        provenance_summary = str(
+            metadata.get("provenance_abstract_summary")
+            or metadata.get("abstract_summary")
+            or ""
+        )
+        self.upsert_entity(
+            "daily_narrative",
+            f"Daily story · {local_date}",
+            {
+                "semantic_context": semantics,
+                "content": self._model_narrative_document(
+                    semantics, provenance_content
+                ),
+                "abstract_summary": str(
+                    semantics.get("narrative_summary") or provenance_summary
+                )[:1200],
+                "provenance_content": provenance_content,
+                "provenance_abstract_summary": provenance_summary[:1200],
+                "semantic_source_fingerprint": input_fingerprint,
+                "semantic_contract_revision": self.NARRATIVE_SEMANTIC_CONTRACT_REVISION,
+                "semantic_model_id": model_id,
+                "semantic_completed_at": at.isoformat(),
+                "semantic_tool_audit": tool_audit,
+            },
+            narrative_id,
+            now=at,
+        )
+        policy_revision = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:20]
+        self.upsert_entity(
+            "observation_policy",
+            "Evolving observation policy",
+            {
+                "policy": {**policy, "revision": policy_revision},
+                "source_narrative_id": narrative_id,
+                "model_id": model_id,
+                "updated_at": at.isoformat(),
+                "epistemic_status": "model_synthesis_from_provenance_ledger",
+            },
+            "observation-policy:current",
+            now=at,
+        )
+        if constitution_text:
+            current = self.narrative_constitution()
+            prior_text = str(current.get("text") or "")
+            if constitution_text != prior_text:
+                history = list(current.get("history") or [])[-19:]
+                history.append(
+                    {
+                        "revision": int(current.get("revision") or 0),
+                        "text": prior_text,
+                        "revised_at": at.isoformat(),
+                        "source_narrative_id": narrative_id,
+                    }
+                )
+                self.upsert_entity(
+                    "narrative_constitution",
+                    "Evolving narrative constitution",
+                    {
+                        "revision": int(current.get("revision") or 0) + 1,
+                        "text": constitution_text,
+                        "history": history,
+                        "model_id": model_id,
+                        "source_narrative_id": narrative_id,
+                        "updated_at": at.isoformat(),
+                    },
+                    "narrative-constitution:current",
+                    now=at,
+                )
+        return True
+
+    def _narrative_references_exist(self, *values: object) -> bool:
+        """Reject model-authored links that do not resolve to retained provenance."""
+        entity_ids: set[str] = set()
+        evidence_ids: set[str] = set()
+        context_ids: set[str] = set()
+
+        def collect(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"entity_ids", "evidence_ids", "context_ids"}:
+                        if not isinstance(child, list) or not all(
+                            isinstance(item, str) and item for item in child
+                        ):
+                            raise ValueError("invalid narrative provenance reference list")
+                        target = {
+                            "entity_ids": entity_ids,
+                            "evidence_ids": evidence_ids,
+                            "context_ids": context_ids,
+                        }[key]
+                        target.update(child)
+                    else:
+                        collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        try:
+            for value in values:
+                collect(value)
+        except ValueError:
+            return False
+
+        def known_ids(table: str, column: str, requested: set[str]) -> set[str]:
+            found: set[str] = set()
+            ordered = sorted(requested)
+            for offset in range(0, len(ordered), 800):
+                batch = ordered[offset : offset + 800]
+                placeholders = ",".join("?" for _ in batch)
+                with self._lock:
+                    rows = self._connection.execute(
+                        f"SELECT {column} FROM {table} WHERE {column} IN ({placeholders})",
+                        batch,
+                    ).fetchall()
+                found.update(str(row[column]) for row in rows)
+            return found
+
+        if known_ids("entities", "entity_id", entity_ids) != entity_ids:
+            return False
+        if known_ids("evidence", "evidence_id", evidence_ids) != evidence_ids:
+            return False
+        known_contexts: set[str] = set()
+        ordered_contexts = sorted(context_ids)
+        for offset in range(0, len(ordered_contexts), 400):
+            batch = ordered_contexts[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            with self._lock:
+                rows = self._connection.execute(
+                    "SELECT DISTINCT json_extract(payload_json, '$.context_id') AS context_id, "
+                    "json_extract(payload_json, '$.utterance_id') AS utterance_id FROM evidence "
+                    f"WHERE json_extract(payload_json, '$.context_id') IN ({placeholders}) "
+                    f"OR json_extract(payload_json, '$.utterance_id') IN ({placeholders})",
+                    [*batch, *batch],
+                ).fetchall()
+            for row in rows:
+                known_contexts.update(
+                    str(row[key])
+                    for key in ("context_id", "utterance_id")
+                    if row[key] is not None and str(row[key]) in context_ids
+                )
+        return known_contexts == context_ids
 
     @staticmethod
     def _narrative_evidence_text(payload: dict[str, Any]) -> str:

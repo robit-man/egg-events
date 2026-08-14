@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from uuid import uuid4
 
 from egg_companion.config import DefaultModeConfig, EggConfig
@@ -30,8 +31,11 @@ class MemoryPipeline:
         self.default_mode = DefaultModeNetwork(
             store, default_mode_config
         )
+        self.store.refresh_model_narrative_documents()
         self.accepted_events = 0
         self.closed_episodes = 0
+        self._observation_policy_cache: dict[str, object] | None = None
+        self._observation_policy_cached_at = 0.0
 
     def ingest(self, event: PerceptualEvent) -> tuple[bool, int]:
         accepted, drafts = self.segmenter.ingest(event)
@@ -104,6 +108,74 @@ class MemoryPipeline:
 
     def graph_signals(self, entity_ids: list[str]):
         return self.store.cognitive_signals(entity_ids)
+
+    def observation_policy(self, maximum_age_seconds: float = 15.0) -> dict[str, object]:
+        now = time.monotonic()
+        if (
+            self._observation_policy_cache is None
+            or now - self._observation_policy_cached_at >= maximum_age_seconds
+        ):
+            self._observation_policy_cache = self.store.observational_policy()
+            self._observation_policy_cached_at = now
+        return dict(self._observation_policy_cache)
+
+    def pending_narrative_semantics(self) -> dict[str, object] | None:
+        records = self.store.pending_narrative_semantics(1)
+        return records[0] if records else None
+
+    def narrative_constitution(self) -> dict[str, object]:
+        return self.store.narrative_constitution()
+
+    def apply_narrative_semantics(
+        self,
+        local_date: str,
+        input_fingerprint: str,
+        semantics: dict[str, object],
+        policy: dict[str, object],
+        constitution_text: str | None,
+        model_id: str,
+        tool_audit: list[dict[str, object]],
+    ) -> bool:
+        from datetime import datetime, timezone
+
+        applied = self.store.apply_narrative_semantics(
+            local_date,
+            input_fingerprint,
+            semantics,
+            policy,
+            constitution_text,
+            model_id,
+            tool_audit,
+            datetime.now(timezone.utc),
+        )
+        if applied:
+            self.default_mode.world_model.apply_model_semantics(
+                local_date, semantics, datetime.now(timezone.utc)
+            )
+            self._observation_policy_cache = None
+            self._observation_policy_cached_at = 0.0
+        return applied
+
+    def narrative_memory_search(self, query: str) -> str:
+        return self.context_for(query, "dream semantic replay")
+
+    def narrative_graph_inspect(self, entity_ids: list[str]) -> list[dict[str, object]]:
+        return [
+            detail
+            for entity_id in entity_ids[:12]
+            for detail in [self.store.entity_detail(str(entity_id))]
+            if detail is not None
+        ]
+
+    def narrative_evidence_inspect(
+        self, evidence_ids: list[str]
+    ) -> list[dict[str, object]]:
+        return [
+            detail
+            for evidence_id in evidence_ids[:12]
+            for detail in [self.store.evidence_detail(str(evidence_id))]
+            if detail is not None
+        ]
 
     def default_mode_pass(self) -> dict[str, object]:
         return self.default_mode.run_once()

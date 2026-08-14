@@ -23,6 +23,7 @@ class CognitiveTick:
     decisions: list[tuple[AttentionTarget, AttentionDecision]]
     novelty: float
     graph_feedback: dict[str, GraphCognitiveSignal]
+    observation_policy: dict[str, object]
 
 
 class CognitiveArchitecture:
@@ -46,20 +47,25 @@ class CognitiveArchitecture:
         self.memory = memory
 
     def perceive(self, observation: Observation) -> CognitiveTick:
-        targets = self.attention.select(observation)
         entity_ids = [
             str(
-                target.detection.attributes.get("identity_id")
-                or target.detection.attributes.get("object_id")
+                detection.attributes.get("identity_id")
+                or detection.attributes.get("object_id")
             )
-            for target in targets
+            for detection in observation.detections
             if (
-                target.detection.attributes.get("identity_id")
-                or target.detection.attributes.get("object_id")
+                detection.attributes.get("identity_id")
+                or detection.attributes.get("object_id")
             )
         ]
         graph_feedback = (
             self.memory.graph_signals(entity_ids) if self.memory and entity_ids else {}
+        )
+        observation_policy = self.memory.observation_policy() if self.memory else {}
+        targets = (
+            self.attention.select(observation, graph_feedback, observation_policy)
+            if self.memory
+            else self.attention.select(observation)
         )
         decisions = []
         for target in targets:
@@ -71,8 +77,17 @@ class CognitiveArchitecture:
             decisions.append(
                 (
                     target,
-                    self.cognitive_attention.evaluate(
-                        target, observation, graph_feedback.get(entity_id)
+                    (
+                        self.cognitive_attention.evaluate(
+                            target,
+                            observation,
+                            graph_feedback.get(entity_id),
+                            observation_policy,
+                        )
+                        if self.memory
+                        else self.cognitive_attention.evaluate(
+                            target, observation, graph_feedback.get(entity_id)
+                        )
                     ),
                 )
             )
@@ -88,6 +103,7 @@ class CognitiveArchitecture:
             decisions=decisions,
             novelty=novelty,
             graph_feedback=graph_feedback,
+            observation_policy=observation_policy,
         )
 
     @staticmethod
