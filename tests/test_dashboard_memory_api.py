@@ -137,7 +137,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "loadNarrativeDetail" in dashboard.PAGE
     assert "narrative-artifacts" in dashboard.PAGE
     assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
-    assert 'src="/assets/knowledge_graph.js?v=20260814a"' in dashboard.PAGE
+    assert 'src="/assets/knowledge_graph.js?v=20260814b"' in dashboard.PAGE
     assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE
     assert "window.open(" not in dashboard.PAGE
     assert "graphDataSignature" in dashboard.PAGE
@@ -168,6 +168,10 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'id="person-inspector"' in dashboard.PAGE
     assert "loadPersonTimeline" in dashboard.PAGE
     assert "encounter periods" in dashboard.PAGE
+    assert '<option value="person">People</option>' in dashboard.PAGE
+    assert '<option value="daily_narrative">Daily stories</option>' in dashboard.PAGE
+    assert 'data-graph-kind="world_model"' in dashboard.PAGE
+    assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
 
 
 def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> None:
@@ -200,3 +204,8 @@ def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> No
     assert "arch" in graph_source
     assert "angle" in graph_source
     assert "new THREE.CatmullRomCurve3" in graph_source
+    assert "graphNodeModality" in graph_source
+    assert "graphNodeMatches" in graph_source
+    assert "controls.minDistance = 1.2" in graph_source
+    assert "controls.zoomToCursor = false" in graph_source
+    assert "Math.min(240,zoom*factor)" in graph_source

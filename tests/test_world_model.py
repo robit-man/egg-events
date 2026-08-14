@@ -307,3 +307,86 @@ def test_narrative_replay_backfills_every_unreviewed_day_oldest_first(tmp_path) 
         "2026-08-10",
     ]
     store.close()
+
+
+def test_daily_narrative_ranks_interaction_and_collapses_repeated_camera_labels(
+    tmp_path,
+) -> None:
+    store = MemoryStore(MemoryConfig(storage_dir=str(tmp_path / "memory")))
+    synthesizer = WorldModelSynthesizer(
+        store, DefaultModeConfig(narrative_timezone="UTC")
+    )
+    observed_at = datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc)
+    for index in range(10):
+        store.append_evidence(
+            EvidenceRef(
+                f"camera-{index}",
+                "vision",
+                observed_at + timedelta(seconds=index * 20),
+                "camera",
+                "camera-0",
+                quality=0.8,
+                metadata={
+                    "detections": [
+                        {"label": "computer monitor"},
+                        {"label": "pillow"},
+                    ]
+                },
+            )
+        )
+    store.append_evidence(
+        EvidenceRef(
+            "spoken-action",
+            "action",
+            observed_at + timedelta(minutes=5),
+            "interaction-policy",
+            "speech-output",
+            quality=1.0,
+            metadata={
+                "candidate_response": "What should I call you?",
+                "spoken": True,
+            },
+        )
+    )
+    store.append_evidence(
+        EvidenceRef(
+            "screen-text",
+            "ocr",
+            observed_at + timedelta(minutes=6),
+            "advanced-ocr",
+            "camera-0",
+            quality=0.9,
+            metadata={"text": "SYSTEM READY"},
+        )
+    )
+    store.append_evidence(
+        EvidenceRef(
+            "historical-silence-hallucination",
+            "speech",
+            observed_at + timedelta(minutes=7),
+            "asr",
+            "microphone",
+            quality=0.1,
+            metadata={"transcript": "Thanks for watching!", "admitted": True},
+        )
+    )
+
+    replay = synthesizer.replay_dream(
+        {"run_id": "rich-story", "requested_by": "startup", "aliases": []},
+        observed_at + timedelta(hours=1),
+    )
+    period = replay["daily_narratives"][0]
+    detail = store.daily_narrative_detail(str(period["local_date"]))
+    assert detail is not None
+    summary = detail["timeline"][0]["summary"]
+    assert 'Egg replied: “What should I call you?”' in summary
+    assert "Read: SYSTEM READY" in summary
+    assert "Across 10 retained camera updates" in summary
+    assert "computer monitor (10)" in summary
+    assert "Observed:" not in summary
+    assert "Thanks for watching" not in summary
+    assert detail["timeline"][0]["recurring_detections"] == [
+        {"label": "computer monitor", "frames": 10},
+        {"label": "pillow", "frames": 10},
+    ]
+    store.close()

@@ -372,6 +372,30 @@ function associativeLayout3D(rawNodes, rawLinks, layoutRevision = '') {
   return result;
 }
 
+function graphNodeModality(node) {
+  const kind = String(node.kind || '').toLowerCase();
+  const subtype = String(node.subtype || '').toLowerCase();
+  if (kind === 'evidence') return 'evidence';
+  if (kind === 'claim') return 'claim';
+  if (kind === 'episode') return 'episode';
+  if (subtype.includes('daily_narrative')) return 'daily_narrative';
+  if (subtype.includes('dream_replay')) return 'dream_replay';
+  if (
+    subtype.includes('cognitive_document')
+    || subtype.includes('abstraction')
+    || subtype.includes('reflection')
+  ) return 'world_model';
+  if (subtype.includes('sound')) return 'sound_event';
+  if (subtype.includes('content') || subtype.includes('ocr')) return 'ocr_content';
+  if (subtype.includes('person') || subtype.includes('face') || subtype.includes('appearance')) return 'person';
+  if (subtype.includes('object')) return 'object';
+  return kind || 'entity';
+}
+
+function graphNodeMatches(node, kind) {
+  return !kind || graphNodeModality(node) === kind;
+}
+
 function initCanvasFallback(container) {
   const canvas = document.createElement('canvas');
   canvas.setAttribute('aria-label', 'Interactive compatibility rendering of the multimodal knowledge graph');
@@ -414,7 +438,7 @@ function initCanvasFallback(container) {
   }
   function matches(node) {
     const text = `${node.label || ''} ${node.source_id || ''} ${node.subtype || ''}`.toLowerCase();
-    return (!kind || node.kind === kind) && (!query || text.includes(query));
+    return graphNodeMatches(node, kind) && (!query || text.includes(query));
   }
   function layout(payload) {
     const selectedId = selected?.id || null;
@@ -583,7 +607,7 @@ function initCanvasFallback(container) {
   canvas.addEventListener('pointerup', event => { if(!moved)select(hitTest(event));drag=null; });
   canvas.addEventListener('pointercancel', () => { drag=null; });
   canvas.addEventListener('contextmenu', event => event.preventDefault());
-  canvas.addEventListener('wheel', event => { event.preventDefault(); const bounds=canvas.getBoundingClientRect(), mx=event.clientX-bounds.left-width/2, my=event.clientY-bounds.top-height/2, factor=Math.exp(-event.deltaY*.001); panX=mx-(mx-panX)*factor;panY=my-(my-panY)*factor;zoom=Math.max(.5,Math.min(80,zoom*factor)); }, {passive:false});
+  canvas.addEventListener('wheel', event => { event.preventDefault(); const factor=Math.exp(-event.deltaY*.001);zoom=Math.max(.5,Math.min(240,zoom*factor)); }, {passive:false});
   new ResizeObserver(() => { const wasRenderable=width>50&&height>50;width=Math.max(1,container.clientWidth);height=Math.max(1,container.clientHeight);pixelRatio=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(width*pixelRatio);canvas.height=Math.round(height*pixelRatio);canvas.style.width=`${width}px`;canvas.style.height=`${height}px`; const becameRenderable=!wasRenderable&&width>50&&height>50;if(nodes.length&&(!viewInitialized||becameRenderable))reset(); }).observe(container);
   window.addEventListener('egg:graph-data', event => layout(event.detail));
   window.addEventListener('egg:graph-activations', event => fireActivations(event.detail));
@@ -625,9 +649,9 @@ if (container) {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.055;
-    controls.minDistance = 8;
+    controls.minDistance = 1.2;
     controls.maxDistance = 145;
-    controls.zoomToCursor = true;
+    controls.zoomToCursor = false;
     controls.screenSpacePanning = true;
     controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
     controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
@@ -930,7 +954,7 @@ if (container) {
       for (const mesh of meshes) {
         const node = mesh.userData.node;
         const text = `${node.label || ''} ${node.source_id || ''} ${node.subtype || ''}`.toLowerCase();
-        const match = (!kind || node.kind === kind) && (!query || text.includes(query));
+        const match = graphNodeMatches(node, kind) && (!query || text.includes(query));
         if (match) visible.add(node.id);
         mesh.material.opacity = match ? 1 : 0.075;
         mesh.userData.displayEmissiveIntensity = match ? 0.28 : 0.04;

@@ -473,7 +473,10 @@ PAGE = r"""<!doctype html>
     .graph-panel:fullscreen { width: 100vw; height: 100vh; border: 0; background: #070d19; }
     .graph-panel:fullscreen .graph-stage { height: calc(100dvh - 58px); min-height: 0; }
     .graph-panel:fullscreen #graph-fullscreen { color: #07090c; background: var(--accent); border-color: var(--accent); }
-    .legend-item { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+    .legend-item { display: flex; align-items: center; gap: 8px; padding: 0; color: var(--muted); background: none; border: 0; font: inherit; font-size: 11px; text-align: left; }
+    button.legend-item { cursor: pointer; }
+    button.legend-item:hover, button.legend-item:focus-visible, button.legend-item.active { color: var(--text); outline: none; }
+    button.legend-item:hover .legend-dot, button.legend-item:focus-visible .legend-dot, button.legend-item.active .legend-dot { box-shadow: 0 0 0 1px var(--legend), 0 0 12px var(--legend); }
     .legend-dot { width: 9px; height: 9px; flex: 0 0 auto; background: var(--legend); border-radius: 50%; box-shadow: 0 0 0 3px color-mix(in srgb, var(--legend) 18%, transparent); }
 
     .scrim { display: none; }
@@ -674,7 +677,7 @@ PAGE = r"""<!doctype html>
           <div class="page-heading"><div><h2>Multimodal knowledge graph</h2><p>Objects, faces, recognized content, evidence, claims, and episodes arranged by relationship strength and provenance.</p></div><div id="graph-ocr-status" class="badge-row"><span class="badge">OCR awaiting data</span></div></div>
           <article id="graph-panel" class="card graph-panel">
             <div class="graph-toolbar">
-              <div class="graph-toolbar-controls"><input id="graph-search" class="input" type="search" placeholder="Find an object, person, or text"><select id="graph-kind" class="select" aria-label="Filter node type"><option value="">All modalities</option><option value="entity">Entities</option><option value="evidence">Evidence</option><option value="claim">Claims</option><option value="episode">Episodes</option></select></div>
+              <div class="graph-toolbar-controls"><input id="graph-search" class="input" type="search" placeholder="Find an object, person, or text"><select id="graph-kind" class="select" aria-label="Filter graph modality"><option value="">All modalities</option><option value="person">People</option><option value="object">Objects</option><option value="sound_event">Sound events</option><option value="ocr_content">OCR content</option><option value="daily_narrative">Daily stories</option><option value="dream_replay">Dream replay</option><option value="world_model">World model</option><option value="evidence">Evidence</option><option value="claim">Claims</option><option value="episode">Episodes</option></select></div>
               <div class="graph-toolbar-actions"><button id="graph-theater" class="button" type="button" aria-pressed="false">Theater mode</button><button id="graph-fullscreen" class="button" type="button">Full screen</button><button id="graph-reset" class="button" type="button">Reset view</button></div>
             </div>
             <div class="graph-stage">
@@ -685,7 +688,7 @@ PAGE = r"""<!doctype html>
           </article>
           <div class="graph-detail-grid">
             <article class="card graph-selection-card"><div class="card-header"><div><h3 class="card-title">Selection</h3><p class="card-note">Node and immediate relationships</p></div></div><div id="graph-selection"><div class="muted">Select a node in the graph to inspect its nested awareness and provenance.</div></div></article>
-            <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#f97316"></i>Daily stories</span><span class="legend-item"><i class="legend-dot" style="--legend:#8b5cf6"></i>Dream replay</span><span class="legend-item"><i class="legend-dot" style="--legend:#06b6d4"></i>World model</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
+            <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Hover to isolate · click to lock the filter</p></div></div><div id="graph-modality-legend" class="graph-legend"><button class="legend-item" type="button" data-graph-kind="person"><i class="legend-dot" style="--legend:#60a5fa"></i>People</button><button class="legend-item" type="button" data-graph-kind="object"><i class="legend-dot" style="--legend:#34d399"></i>Objects</button><button class="legend-item" type="button" data-graph-kind="sound_event"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</button><button class="legend-item" type="button" data-graph-kind="ocr_content"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</button><button class="legend-item" type="button" data-graph-kind="daily_narrative"><i class="legend-dot" style="--legend:#f97316"></i>Daily stories</button><button class="legend-item" type="button" data-graph-kind="dream_replay"><i class="legend-dot" style="--legend:#8b5cf6"></i>Dream replay</button><button class="legend-item" type="button" data-graph-kind="world_model"><i class="legend-dot" style="--legend:#06b6d4"></i>World model</button><button class="legend-item" type="button" data-graph-kind="evidence"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</button><button class="legend-item" type="button" data-graph-kind="claim"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</button><button class="legend-item" type="button" data-graph-kind="episode"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</button></div></article>
             <article class="card"><div class="card-header"><div><h3 class="card-title">Live firings</h3><p class="card-note">Causal activity propagates across connected memories without moving your view</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#fff"></i>Vision</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Heard voice</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Memory recall</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Agent action</span></div></article>
             <article class="card"><div class="card-header"><div><h3 class="card-title">Relationship encoding</h3><p class="card-note">Spline form is evidence, not decoration</p></div></div><dl class="graph-encoding"><div><dt>Thickness</dt><dd>Association strength, confidence, and repeated confirmation.</dd></div><div><dt>Arch</dt><dd>Recurrence and associative separation; repeated links rise into stronger bridges.</dd></div><div><dt>Angle</dt><dd>Relationship family: identity, observation, co-presence, audio, temporal, or reflective.</dd></div><div><dt>Distance</dt><dd>Semantic affinity and confidence pull related memories into tighter neighborhoods.</dd></div></dl></article>
           </div>
@@ -1262,9 +1265,21 @@ PAGE = r"""<!doctype html>
       if (expanding) loadNarrativeDetail(localDate);
     });
     $('#config-search').addEventListener('input', renderConfiguration);
-    function emitGraphFilter() { window.dispatchEvent(new CustomEvent('egg:graph-filter', {detail:{query:$('#graph-search').value, kind:$('#graph-kind').value}})); }
+    function emitGraphFilter(temporaryKind = null) {
+      const selectedKind = $('#graph-kind').value, previewKind = typeof temporaryKind === 'string' ? temporaryKind : null, kind = previewKind === null ? selectedKind : previewKind;
+      window.dispatchEvent(new CustomEvent('egg:graph-filter', {detail:{query:$('#graph-search').value, kind}}));
+      if (previewKind === null) $$('#graph-modality-legend [data-graph-kind]').forEach(item => { const active = item.dataset.graphKind === selectedKind; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
+    }
     $('#graph-search').addEventListener('input', emitGraphFilter);
     $('#graph-kind').addEventListener('change', emitGraphFilter);
+    $$('#graph-modality-legend [data-graph-kind]').forEach(item => {
+      item.addEventListener('pointerenter', () => emitGraphFilter(item.dataset.graphKind));
+      item.addEventListener('pointerleave', () => emitGraphFilter());
+      item.addEventListener('focus', () => emitGraphFilter(item.dataset.graphKind));
+      item.addEventListener('blur', () => emitGraphFilter());
+      item.addEventListener('click', () => { $('#graph-kind').value = item.dataset.graphKind; emitGraphFilter(); });
+    });
+    emitGraphFilter();
     $('#graph-reset').addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:graph-reset')));
     const graphPage = document.querySelector('[data-page="/graph"]'), graphPanel = $('#graph-panel'), graphTheaterButton = $('#graph-theater'), graphFullscreenButton = $('#graph-fullscreen');
     function setGraphTheater(active) {
@@ -1382,6 +1397,6 @@ PAGE = r"""<!doctype html>
     connectLiveWaveform();
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
-  <script type="module" src="/assets/knowledge_graph.js?v=20260814a"></script>
+  <script type="module" src="/assets/knowledge_graph.js?v=20260814b"></script>
 </body>
 </html>"""

@@ -33,7 +33,7 @@ class WorldModelSynthesizer:
         "communication-strategy": "Communication strategy",
         "reflective-working-set": "Reflective working set",
     }
-    NARRATIVE_SCHEMA_REVISION = 2
+    NARRATIVE_SCHEMA_REVISION = 4
 
     def __init__(self, store: MemoryStore, config: DefaultModeConfig) -> None:
         self.store = store
@@ -538,7 +538,10 @@ class WorldModelSynthesizer:
                     "entities": {},
                     "evidence_ids": [],
                     "episode_ids": [],
-                    "observations": [],
+                    "observation_candidates": [],
+                    "observation_keys": set(),
+                    "detection_counts": Counter(),
+                    "camera_frames": 0,
                     "event_count": 0,
                 },
             )
@@ -547,7 +550,8 @@ class WorldModelSynthesizer:
             bucket["event_count"] = int(bucket["event_count"]) + 1
             modality = str(event.get("modality") or "unknown")
             bucket["modalities"].add(modality)
-            source = str(event.get("source_id") or event.get("source_type") or "local")
+            source_type = str(event.get("source_type") or "local")
+            source = str(event.get("source_id") or source_type)
             bucket["sources"].add(source[:120])
             evidence_id = str(event.get("evidence_id") or "")
             if evidence_id:
@@ -566,12 +570,9 @@ class WorldModelSynthesizer:
                 if len(bucket["episode_ids"]) < 24:
                     bucket["episode_ids"].append(episode_id)
                 summary = self._clean_text(episode.get("summary"), 240)
-                if (
-                    summary
-                    and len(bucket["observations"]) < 64
-                    and summary not in bucket["observations"]
-                ):
-                    bucket["observations"].append(summary)
+                self._add_narrative_observation(
+                    bucket, summary, modality, source_type
+                )
             for entity in event.get("entities", []):
                 if not isinstance(entity, dict) or not entity.get("entity_id"):
                     continue
@@ -584,17 +585,29 @@ class WorldModelSynthesizer:
                 ) or entity_id
                 all_entities[entity_id] = (entity_type, label)
                 bucket["entities"][entity_id] = (entity_type, label)
+            payload = event.get("payload")
+            if isinstance(payload, dict) and source_type == "camera":
+                bucket["camera_frames"] = int(bucket["camera_frames"]) + 1
+                detections = payload.get("detections")
+                if isinstance(detections, list):
+                    frame_labels = {
+                        label
+                        for item in detections
+                        if isinstance(item, dict)
+                        for label in [self._clean_text(item.get("label"), 80)]
+                        if label
+                    }
+                    bucket["detection_counts"].update(frame_labels)
             for observation in self._event_observations(event):
-                if (
-                    len(bucket["observations"]) < 64
-                    and observation not in bucket["observations"]
-                ):
-                    bucket["observations"].append(observation)
+                self._add_narrative_observation(
+                    bucket, observation, modality, source_type
+                )
 
         if not buckets:
             return None
         pair_counts: Counter[tuple[str, str]] = Counter()
         timeline: list[dict[str, object]] = []
+        previous_stable_labels: set[str] = set()
         for bucket in sorted(buckets.values(), key=lambda item: item["start"]):
             typed: dict[str, list[str]] = defaultdict(list)
             entity_ids = sorted(bucket["entities"])
@@ -610,7 +623,44 @@ class WorldModelSynthesizer:
             )
             content = self._unique(typed.get("content", []))
             sounds = self._unique(typed.get("sound_event", []))
-            observations = self._unique(list(bucket["observations"]))[:8]
+            ranked_observations = sorted(
+                bucket["observation_candidates"],
+                key=lambda item: (-int(item[0]), int(item[1])),
+            )
+            observations = [
+                str(item[2]) for item in ranked_observations if int(item[0]) >= 2
+            ][:8]
+            camera_frames = int(bucket["camera_frames"])
+            recurring_threshold = max(2, math.ceil(camera_frames * 0.08))
+            recurring_detections = [
+                (str(label), int(count))
+                for label, count in bucket["detection_counts"].most_common(12)
+                if int(count) >= recurring_threshold
+            ]
+            stable_labels = {label for label, _count in recurring_detections}
+            scene_summary = (
+                f"Across {camera_frames} retained camera updates, repeatedly visible: "
+                + ", ".join(
+                    f"{label} ({count})" for label, count in recurring_detections[:8]
+                )
+                if camera_frames and recurring_detections
+                else ""
+            )
+            changes: list[str] = []
+            if previous_stable_labels:
+                arrived = sorted(stable_labels - previous_stable_labels)[:6]
+                departed = sorted(previous_stable_labels - stable_labels)[:6]
+                if arrived:
+                    changes.append(
+                        "Newly persistent since the prior period: "
+                        + ", ".join(arrived)
+                    )
+                if departed:
+                    changes.append(
+                        "No longer repeatedly detected: " + ", ".join(departed)
+                    )
+            if stable_labels:
+                previous_stable_labels = stable_labels
             start = bucket["start"]
             end = bucket["end"]
             entry = {
@@ -628,6 +678,13 @@ class WorldModelSynthesizer:
                 "modalities": sorted(bucket["modalities"]),
                 "sources": sorted(bucket["sources"])[:12],
                 "observations": observations,
+                "scene_summary": scene_summary,
+                "changes": changes,
+                "recurring_detections": [
+                    {"label": label, "frames": count}
+                    for label, count in recurring_detections[:12]
+                ],
+                "camera_updates": camera_frames,
                 "entity_ids": entity_ids[:100],
                 "evidence_ids": list(dict.fromkeys(bucket["evidence_ids"])),
                 "episode_ids": list(dict.fromkeys(bucket["episode_ids"])),
@@ -653,9 +710,33 @@ class WorldModelSynthesizer:
             f"{count} replay periods (association, not causation)."
             for (left, right), count in recurring[:8]
         ]
+        dialogue_periods = sum(
+            any(
+                str(observation).startswith(("Heard:", "Egg replied:"))
+                for observation in entry.get("observations", [])
+            )
+            for entry in timeline
+        )
+        text_periods = sum(bool(entry.get("content")) for entry in timeline)
+        audio_periods = sum(bool(entry.get("sounds")) for entry in timeline)
+        person_periods = sum(bool(entry.get("people")) for entry in timeline)
         abstract_parts = [
-            f"Replayed {len(events)} retained evidence items across {len(timeline)} chronological periods."
+            f"Reviewed {len(events)} retained evidence items and consolidated them into {len(timeline)} chronological periods."
         ]
+        grounded_periods = [
+            label
+            for count, label in (
+                (person_periods, "person encounters"),
+                (dialogue_periods, "dialogue"),
+                (text_periods, "recognized text/content"),
+                (audio_periods, "sound context"),
+            )
+            if count
+        ]
+        if grounded_periods:
+            abstract_parts.append(
+                "The day includes " + ", ".join(grounded_periods) + "."
+            )
         if people:
             abstract_parts.append(f"People encountered: {', '.join(people[:12])}.")
         if objects:
@@ -729,7 +810,11 @@ class WorldModelSynthesizer:
             return []
         results: list[str] = []
         transcript = self._clean_text(payload.get("transcript"), 260)
-        if transcript and payload.get("admitted") is not False:
+        if (
+            transcript
+            and payload.get("admitted") is not False
+            and not self._is_known_silence_hallucination(transcript)
+        ):
             results.append(f'Heard: “{transcript}”')
         response = self._clean_text(payload.get("candidate_response"), 260)
         if response and payload.get("spoken") is not False:
@@ -761,6 +846,71 @@ class WorldModelSynthesizer:
         return self._unique(results)[:8]
 
     @staticmethod
+    def _is_known_silence_hallucination(text: str) -> bool:
+        """Keep rejected Whisper outro artifacts out of derived narratives.
+
+        Historical evidence remains authoritative and inspectable.  This mirrors
+        ingress admission for older rows that predate the live ASR guard.
+        """
+        normalized = " ".join(
+            "".join(
+                character if character.isalnum() or character.isspace() else " "
+                for character in text.casefold()
+            ).split()
+        )
+        words = normalized.split()
+        return len(words) <= 10 and any(
+            phrase in normalized
+            for phrase in (
+                "thanks for watching",
+                "thank you for watching",
+                "thank you so much for watching",
+                "ご視聴ありがとうございました",
+            )
+        )
+
+    @classmethod
+    def _add_narrative_observation(
+        cls,
+        bucket: dict[str, object],
+        value: object,
+        modality: str,
+        source_type: str,
+    ) -> None:
+        text = cls._clean_text(value, 320)
+        if not text:
+            return
+        normalized = text.casefold()
+        if normalized in bucket["observation_keys"]:
+            return
+        if normalized.startswith(("episode involving", "observed:")):
+            priority = 1
+        elif normalized.startswith(("heard:", "egg replied:", "read:")):
+            priority = 6
+        elif normalized.startswith(("text:", "audio context:")):
+            priority = 5
+        elif "temporal-person" in source_type or modality in {
+            "audio_comprehension",
+            "ocr",
+        }:
+            priority = 5
+        elif source_type.startswith("ornith"):
+            priority = 4
+        else:
+            priority = 3
+        candidates = bucket["observation_candidates"]
+        if len(candidates) >= 128:
+            weakest_index, weakest = min(
+                enumerate(candidates), key=lambda item: (int(item[1][0]), -int(item[1][1]))
+            )
+            if priority <= int(weakest[0]):
+                return
+            bucket["observation_keys"].discard(str(weakest[2]).casefold())
+            candidates.pop(weakest_index)
+        bucket["observation_keys"].add(normalized)
+        candidates.append((priority, len(candidates), text))
+
+    @staticmethod
     def _unique(values: list[str]) -> list[str]:
         return list(dict.fromkeys(value for value in values if value))
 
@@ -784,15 +934,19 @@ class WorldModelSynthesizer:
         content = entry.get("content") or []
         sounds = entry.get("sounds") or []
         if people:
-            parts.append("Encountered " + ", ".join(people))
-        if objects:
-            parts.append("observed " + ", ".join(objects))
-        if content:
-            parts.append("retained text/content " + ", ".join(content))
-        if sounds:
-            parts.append("heard " + ", ".join(sounds))
+            parts.append("People present: " + ", ".join(people))
         observations = entry.get("observations") or []
         parts.extend(str(value) for value in observations[:5])
+        if content:
+            parts.append("Recognized text/content: " + ", ".join(content))
+        if sounds:
+            parts.append("Sound context: " + ", ".join(sounds))
+        scene_summary = str(entry.get("scene_summary") or "")
+        if scene_summary:
+            parts.append(scene_summary)
+        elif objects:
+            parts.append("Remembered objects associated with the period: " + ", ".join(objects))
+        parts.extend(str(value) for value in (entry.get("changes") or [])[:2])
         if not parts:
             modalities = entry.get("modalities") or []
             parts.append(
@@ -800,7 +954,7 @@ class WorldModelSynthesizer:
                 + ", ".join(str(value) for value in modalities)
                 + " evidence"
             )
-        return "; ".join(parts)[:1200] + "."
+        return "; ".join(parts).rstrip(".")[:1199] + "."
 
     @staticmethod
     def _deduplicate_semantic_pairs(
