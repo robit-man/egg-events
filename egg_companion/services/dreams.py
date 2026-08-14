@@ -382,6 +382,25 @@ class IdentityDreamEngine:
         with self._lock:
             self._next_scheduled_at = value.isoformat() if value is not None else None
 
+    def annotate_run(self, run_id: str, supplemental: dict[str, object]) -> None:
+        """Attach post-identity replay outcomes to the durable dream audit row."""
+        with self._lock:
+            row = self._database.execute(
+                "SELECT details_json FROM dream_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                details = json.loads(str(row["details_json"] or "{}"))
+            except json.JSONDecodeError:
+                details = {}
+            details.update(supplemental)
+            self._database.execute(
+                "UPDATE dream_runs SET details_json=? WHERE run_id=?",
+                (json.dumps(details, sort_keys=True), run_id),
+            )
+            self._database.commit()
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             runs = [dict(row) for row in self._database.execute(

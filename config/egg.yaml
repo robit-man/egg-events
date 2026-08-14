@@ -288,6 +288,10 @@ default_mode:
   meta_graph_limit: 24
   entity_summary_limit: 12
   document_context_characters: 1800
+  narrative_timezone: America/Los_Angeles
+  narrative_replay_max_days: 30
+  narrative_bucket_minutes: 15
+  narrative_max_entries: 96
 
 privacy:
   persistent_identity_enabled: true

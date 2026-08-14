@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from uuid import uuid4
 
 from egg_companion.config import DefaultModeConfig, EggConfig
 from egg_companion.memory.entities import EntityResolver
@@ -106,6 +107,31 @@ class MemoryPipeline:
 
     def default_mode_pass(self) -> dict[str, object]:
         return self.default_mode.run_once()
+
+    def dream_narrative_pass(
+        self, dream_result: dict[str, object]
+    ) -> dict[str, object]:
+        return self.default_mode.world_model.replay_dream(dream_result)
+
+    def narrative_backfill_pass(
+        self, requested_by: str = "startup"
+    ) -> dict[str, object]:
+        """Replay never-narrated history without waiting for a face dream."""
+        return self.default_mode.world_model.replay_dream(
+            {
+                "run_id": f"narrative-catchup-{uuid4()}",
+                "requested_by": requested_by,
+                "profiles_examined": 0,
+                "merges": 0,
+                "aliases": [],
+            }
+        )
+
+    def daily_narratives(self, limit: int = 90) -> list[dict[str, object]]:
+        return self.store.daily_narrative_index(limit)
+
+    def daily_narrative(self, local_date: str) -> dict[str, object] | None:
+        return self.store.daily_narrative_detail(local_date)
 
     def conversation_history(self, limit: int = 5000) -> list[dict[str, object]]:
         return self.store.conversation_history(limit)

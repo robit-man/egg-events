@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections import Counter
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from egg_companion.config import DefaultModeConfig
 from egg_companion.memory.store import MemoryStore
@@ -32,6 +33,7 @@ class WorldModelSynthesizer:
         "communication-strategy": "Communication strategy",
         "reflective-working-set": "Reflective working set",
     }
+    NARRATIVE_SCHEMA_REVISION = 2
 
     def __init__(self, store: MemoryStore, config: DefaultModeConfig) -> None:
         self.store = store
@@ -67,13 +69,21 @@ class WorldModelSynthesizer:
         history = self.store.conversation_history(500)
         conflicts = self.store.conflicting_claims(20)
         episodes = self.store.recent_episodes(12)
+        daily_narratives = self.store.recent_daily_narratives(7)
         documents = self._document_contents(
-            inventory, abstractions, outcomes, history, conflicts, episodes
+            inventory,
+            abstractions,
+            outcomes,
+            history,
+            conflicts,
+            episodes,
+            daily_narratives,
         )
         source_ids = list(
             dict.fromkeys(
                 [*replayed_entity_ids, *reflection_ids]
                 + [str(item["abstraction_id"]) for item in abstractions]
+                + [str(item["entity_id"]) for item in daily_narratives]
             )
         )
         self.store.upsert_entity(
@@ -159,6 +169,638 @@ class WorldModelSynthesizer:
             "entity_summaries_updated": len(inventory),
             "documents": document_records,
         }
+
+    def replay_dream(
+        self, dream_result: dict[str, object], at: datetime | None = None
+    ) -> dict[str, object]:
+        """Turn one identity dream into dated replay, story, and graph revisions."""
+        replayed_at = at or datetime.now(timezone.utc)
+        run_id = str(dream_result.get("run_id") or f"untracked-{int(replayed_at.timestamp())}")
+        aliases = dream_result.get("aliases")
+        alias_rows = aliases if isinstance(aliases, list) else []
+        affected_entity_ids = list(
+            dict.fromkeys(
+                str(mapping.get(key))
+                for mapping in alias_rows
+                if isinstance(mapping, dict)
+                for key in ("canonical_id", "alias_id")
+                if mapping.get(key)
+            )
+        )
+        job_id = self.store.create_job(
+            "dream-chronological-replay",
+            {
+                "dream_run_id": run_id,
+                "affected_entity_ids": affected_entity_ids,
+            },
+        )
+        self.store.update_job(job_id, "running")
+        try:
+            local_timezone, timezone_name = self._narrative_timezone()
+            affected_timestamps = (
+                self.store.narrative_candidate_timestamps(affected_entity_ids)
+                if affected_entity_ids
+                else []
+            )
+            history_timestamps = self.store.narrative_history_boundaries()
+            affected_days: set[date] = set()
+            history_days: set[date] = set()
+            for value in affected_timestamps:
+                parsed = self._parse_datetime(value)
+                if parsed is not None:
+                    affected_days.add(parsed.astimezone(local_timezone).date())
+            for value in history_timestamps:
+                parsed = self._parse_datetime(value)
+                if parsed is not None:
+                    history_days.add(parsed.astimezone(local_timezone).date())
+
+            existing_days = {
+                parsed
+                for item in self.store.recent_daily_narratives(3650)
+                if isinstance(item.get("metadata"), dict)
+                and int(item["metadata"].get("narrative_schema_revision") or 0)
+                >= self.NARRATIVE_SCHEMA_REVISION
+                for parsed in [
+                    self._parse_local_date(item["metadata"].get("local_date"))
+                ]
+                if parsed is not None
+            }
+            unreviewed_days = history_days - existing_days
+            latest_day = max(history_days) if history_days else None
+            mandatory_days = set(affected_days)
+            if latest_day is not None:
+                mandatory_days.add(latest_day)
+            maximum_days = max(1, int(self.config.narrative_replay_max_days))
+            if len(mandatory_days) > maximum_days:
+                retained_mandatory = sorted(mandatory_days)[: maximum_days - 1]
+                if latest_day is not None:
+                    retained_mandatory.append(latest_day)
+                mandatory_days = set(retained_mandatory)
+            backlog_slots = max(0, maximum_days - len(mandatory_days))
+            oldest_unreviewed = sorted(unreviewed_days - mandatory_days)
+            days = sorted(
+                {
+                    *mandatory_days,
+                    *oldest_unreviewed[:backlog_slots],
+                }
+            )
+
+            self.store.upsert_entity(
+                "agent",
+                "Egg",
+                {
+                    "role": "local embodied companion",
+                    "epistemic_status": "system identity",
+                },
+                "agent:egg",
+                now=replayed_at,
+            )
+            dream_node_id = f"dream-replay:{run_id}"
+            self.store.upsert_entity(
+                "dream_replay",
+                f"Dream replay · {replayed_at.astimezone(local_timezone).strftime('%Y-%m-%d %H:%M')}",
+                {
+                    "dream_run_id": run_id,
+                    "requested_by": dream_result.get("requested_by"),
+                    "profiles_examined": int(dream_result.get("profiles_examined") or 0),
+                    "identity_merges": int(dream_result.get("merges") or 0),
+                    "affected_entity_ids": affected_entity_ids,
+                    "replayed_at": replayed_at.isoformat(),
+                    "epistemic_status": "offline_evidence_replay",
+                },
+                dream_node_id,
+                now=replayed_at,
+            )
+            self._edge(
+                "agent:egg",
+                "enters_dream_replay",
+                dream_node_id,
+                1.0,
+                1,
+                replayed_at,
+                {"derived": True, "dream_run_id": run_id},
+            )
+
+            records: list[dict[str, object]] = []
+            all_replayed_entities: list[str] = []
+            for local_day in days:
+                start_local = datetime.combine(local_day, time.min, local_timezone)
+                end_local = start_local + timedelta(days=1)
+                events = self.store.chronological_evidence(
+                    start_local.astimezone(timezone.utc),
+                    end_local.astimezone(timezone.utc),
+                    limit=50000,
+                )
+                daily = self._daily_narrative(
+                    local_day, events, local_timezone, timezone_name
+                )
+                if daily is None:
+                    continue
+                record = self.store.upsert_daily_narrative(
+                    local_day.isoformat(),
+                    str(daily["content"]),
+                    str(daily["abstract_summary"]),
+                    list(daily["timeline"]),
+                    float(daily["confidence"]),
+                    list(daily["entity_ids"]),
+                    list(daily["evidence_ids"]),
+                    list(daily["episode_ids"]),
+                    run_id,
+                    timezone_name,
+                    replayed_at,
+                    int(daily["reviewed_evidence_count"]),
+                    int(daily["reviewed_episode_count"]),
+                    self.NARRATIVE_SCHEMA_REVISION,
+                )
+                record["source_links"] = self.store.link_daily_narrative_sources(
+                    str(record["narrative_id"]),
+                    list(daily["evidence_ids"]),
+                    list(daily["episode_ids"]),
+                )
+                for entity_id, entity_type in dict(daily["entity_types"]).items():
+                    relation = {
+                        "person": "appears_in_day",
+                        "object": "observed_in_day",
+                        "object_category": "observed_in_day",
+                        "content": "read_in_day",
+                        "sound_event": "heard_in_day",
+                    }.get(str(entity_type), "participates_in_day")
+                    confirmations = sum(
+                        entity_id in entry.get("entity_ids", [])
+                        for entry in daily["timeline"]
+                        if isinstance(entry, dict)
+                    )
+                    self._edge(
+                        entity_id,
+                        relation,
+                        str(record["narrative_id"]),
+                        float(daily["confidence"]),
+                        max(1, confirmations),
+                        replayed_at,
+                        {
+                            "derived": True,
+                            "local_date": local_day.isoformat(),
+                            "source": "chronological-dream-replay",
+                        },
+                    )
+                records.append(record)
+                all_replayed_entities.extend(list(daily["entity_ids"]))
+
+            refreshed = self.update(
+                list(dict.fromkeys([*affected_entity_ids, *all_replayed_entities]))[
+                    : self.config.replay_limit
+                ],
+                [],
+                replayed_at,
+            )
+            for record in records:
+                narrative_id = str(record["narrative_id"])
+                self._edge(
+                    "agent:egg",
+                    "experienced_day",
+                    narrative_id,
+                    0.95,
+                    max(1, int(record["timeline_entries"])),
+                    replayed_at,
+                    {"derived": True, "local_date": record["local_date"]},
+                )
+                self._edge(
+                    dream_node_id,
+                    "replays_day",
+                    narrative_id,
+                    1.0,
+                    1,
+                    replayed_at,
+                    {"derived": True, "dream_run_id": run_id},
+                )
+                self._edge(
+                    narrative_id,
+                    "contributes_to_story",
+                    "cognitive-document:my-story",
+                    0.95,
+                    max(1, int(record["timeline_entries"])),
+                    replayed_at,
+                    {"derived": True, "local_date": record["local_date"]},
+                )
+            for entity_id in affected_entity_ids:
+                detail = self.store.entity_detail(entity_id)
+                canonical_id = entity_id
+                if detail is not None:
+                    entity = detail.get("entity", {})
+                    if isinstance(entity, dict) and entity.get("merged_into"):
+                        canonical_id = str(entity["merged_into"])
+                if self.store.entity_detail(canonical_id) is not None:
+                    self._edge(
+                        dream_node_id,
+                        "consolidates_identity",
+                        canonical_id,
+                        0.95,
+                        1,
+                        replayed_at,
+                        {"derived": True, "dream_run_id": run_id},
+                    )
+            ordered = list(reversed(self.store.recent_daily_narratives(3650)))
+            for left, right in zip(ordered, ordered[1:]):
+                self._edge(
+                    str(left["entity_id"]),
+                    "precedes_day",
+                    str(right["entity_id"]),
+                    1.0,
+                    1,
+                    replayed_at,
+                    {"derived": True, "temporal_order": "local-calendar"},
+                )
+            result = {
+                "job_id": job_id,
+                "dream_run_id": run_id,
+                "replayed_at": replayed_at.isoformat(),
+                "timezone": timezone_name,
+                "history_days_discovered": len(history_days),
+                "backlog_before": len(unreviewed_days),
+                "backfilled_days": [
+                    str(record["local_date"])
+                    for record in records
+                    if self._parse_local_date(record.get("local_date"))
+                    in unreviewed_days
+                ],
+                "backlog_remaining": len(
+                    history_days
+                    - {
+                        parsed
+                        for item in self.store.recent_daily_narratives(3650)
+                        if isinstance(item.get("metadata"), dict)
+                        and int(
+                            item["metadata"].get("narrative_schema_revision") or 0
+                        )
+                        >= self.NARRATIVE_SCHEMA_REVISION
+                        for parsed in [
+                            self._parse_local_date(
+                                item["metadata"].get("local_date")
+                            )
+                        ]
+                        if parsed is not None
+                    }
+                ),
+                "days_considered": len(days),
+                "days_replayed": len(records),
+                "daily_narratives": records,
+                "affected_entity_ids": affected_entity_ids,
+                "story_revision": next(
+                    (
+                        item.get("revision")
+                        for item in refreshed.get("documents", [])
+                        if isinstance(item, dict) and item.get("kind") == "my-story"
+                    ),
+                    None,
+                ),
+                "meta_graph": {
+                    "abstractions_projected": refreshed.get(
+                        "abstractions_projected", 0
+                    ),
+                    "documents_revised": sum(
+                        bool(item.get("changed"))
+                        for item in refreshed.get("documents", [])
+                        if isinstance(item, dict)
+                    ),
+                },
+            }
+            self.store.update_job(job_id, "complete")
+            return result
+        except Exception as error:
+            self.store.update_job(job_id, "failed", str(error))
+            raise
+
+    def _narrative_timezone(self):
+        configured = str(self.config.narrative_timezone or "local").strip()
+        if configured.casefold() == "local":
+            local = datetime.now().astimezone().tzinfo or timezone.utc
+            return local, getattr(local, "key", None) or str(local)
+        try:
+            local = ZoneInfo(configured)
+        except ZoneInfoNotFoundError:
+            local = datetime.now().astimezone().tzinfo or timezone.utc
+            return local, getattr(local, "key", None) or str(local)
+        return local, configured
+
+    @staticmethod
+    def _parse_datetime(value: object) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    @staticmethod
+    def _parse_local_date(value: object) -> date | None:
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    def _daily_narrative(
+        self,
+        local_day: date,
+        events: list[dict[str, object]],
+        local_timezone,
+        timezone_name: str,
+    ) -> dict[str, object] | None:
+        """Coalesce frame-level evidence into a readable ordered day ledger."""
+        bucket_seconds = max(60, self.config.narrative_bucket_minutes * 60)
+        buckets: dict[int, dict[str, object]] = {}
+        all_entities: dict[str, tuple[str, str]] = {}
+        evidence_ids: list[str] = []
+        episode_ids: list[str] = []
+        qualities: list[float] = []
+        ignored_types = {
+            "appearance_track",
+            "abstraction",
+            "reflection",
+            "cognitive_document",
+            "daily_narrative",
+            "dream_replay",
+            "agent",
+        }
+        for event in events:
+            occurred = self._parse_datetime(event.get("captured_at"))
+            if occurred is None:
+                continue
+            local_at = occurred.astimezone(local_timezone)
+            key = int(local_at.timestamp()) // bucket_seconds
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "start": local_at,
+                    "end": local_at,
+                    "modalities": set(),
+                    "sources": set(),
+                    "entities": {},
+                    "evidence_ids": [],
+                    "episode_ids": [],
+                    "observations": [],
+                    "event_count": 0,
+                },
+            )
+            bucket["start"] = min(bucket["start"], local_at)
+            bucket["end"] = max(bucket["end"], local_at)
+            bucket["event_count"] = int(bucket["event_count"]) + 1
+            modality = str(event.get("modality") or "unknown")
+            bucket["modalities"].add(modality)
+            source = str(event.get("source_id") or event.get("source_type") or "local")
+            bucket["sources"].add(source[:120])
+            evidence_id = str(event.get("evidence_id") or "")
+            if evidence_id:
+                evidence_ids.append(evidence_id)
+                if len(bucket["evidence_ids"]) < 24:
+                    bucket["evidence_ids"].append(evidence_id)
+            try:
+                qualities.append(max(0.0, min(1.0, float(event.get("quality") or 0.0))))
+            except (TypeError, ValueError):
+                pass
+            for episode in event.get("episodes", []):
+                if not isinstance(episode, dict) or not episode.get("episode_id"):
+                    continue
+                episode_id = str(episode["episode_id"])
+                episode_ids.append(episode_id)
+                if len(bucket["episode_ids"]) < 24:
+                    bucket["episode_ids"].append(episode_id)
+                summary = self._clean_text(episode.get("summary"), 240)
+                if (
+                    summary
+                    and len(bucket["observations"]) < 64
+                    and summary not in bucket["observations"]
+                ):
+                    bucket["observations"].append(summary)
+            for entity in event.get("entities", []):
+                if not isinstance(entity, dict) or not entity.get("entity_id"):
+                    continue
+                entity_type = str(entity.get("entity_type") or "unknown")
+                if entity_type in ignored_types:
+                    continue
+                entity_id = str(entity["entity_id"])
+                label = self._clean_text(
+                    entity.get("display_name") or entity_id, 120
+                ) or entity_id
+                all_entities[entity_id] = (entity_type, label)
+                bucket["entities"][entity_id] = (entity_type, label)
+            for observation in self._event_observations(event):
+                if (
+                    len(bucket["observations"]) < 64
+                    and observation not in bucket["observations"]
+                ):
+                    bucket["observations"].append(observation)
+
+        if not buckets:
+            return None
+        pair_counts: Counter[tuple[str, str]] = Counter()
+        timeline: list[dict[str, object]] = []
+        for bucket in sorted(buckets.values(), key=lambda item: item["start"]):
+            typed: dict[str, list[str]] = defaultdict(list)
+            entity_ids = sorted(bucket["entities"])
+            for entity_id in entity_ids:
+                entity_type, label = bucket["entities"][entity_id]
+                typed[entity_type].append(label)
+            for left_index, left_id in enumerate(entity_ids):
+                for right_id in entity_ids[left_index + 1 :]:
+                    pair_counts[tuple(sorted((left_id, right_id)))] += 1
+            people = self._unique(typed.get("person", []))
+            objects = self._unique(
+                [*typed.get("object", []), *typed.get("object_category", [])]
+            )
+            content = self._unique(typed.get("content", []))
+            sounds = self._unique(typed.get("sound_event", []))
+            observations = self._unique(list(bucket["observations"]))[:8]
+            start = bucket["start"]
+            end = bucket["end"]
+            entry = {
+                "started_at": start.isoformat(),
+                "ended_at": end.isoformat(),
+                "local_time": (
+                    start.strftime("%H:%M")
+                    if start.strftime("%H:%M") == end.strftime("%H:%M")
+                    else f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
+                ),
+                "people": people[:12],
+                "objects": objects[:16],
+                "content": content[:12],
+                "sounds": sounds[:12],
+                "modalities": sorted(bucket["modalities"]),
+                "sources": sorted(bucket["sources"])[:12],
+                "observations": observations,
+                "entity_ids": entity_ids[:100],
+                "evidence_ids": list(dict.fromkeys(bucket["evidence_ids"])),
+                "episode_ids": list(dict.fromkeys(bucket["episode_ids"])),
+                "event_count": int(bucket["event_count"]),
+            }
+            entry["summary"] = self._timeline_summary(entry)
+            timeline.append(entry)
+        timeline = timeline[: self.config.narrative_max_entries]
+
+        people = self._labels_by_type(all_entities, {"person"})
+        objects = self._labels_by_type(
+            all_entities, {"object", "object_category"}
+        )
+        content = self._labels_by_type(all_entities, {"content"})
+        sounds = self._labels_by_type(all_entities, {"sound_event"})
+        recurring = [
+            (pair, count)
+            for pair, count in pair_counts.most_common(12)
+            if count >= 2 and pair[0] in all_entities and pair[1] in all_entities
+        ]
+        recurring_lines = [
+            f"{all_entities[left][1]} and {all_entities[right][1]} co-occurred in "
+            f"{count} replay periods (association, not causation)."
+            for (left, right), count in recurring[:8]
+        ]
+        abstract_parts = [
+            f"Replayed {len(events)} retained evidence items across {len(timeline)} chronological periods."
+        ]
+        if people:
+            abstract_parts.append(f"People encountered: {', '.join(people[:12])}.")
+        if objects:
+            abstract_parts.append(f"Objects observed: {', '.join(objects[:16])}.")
+        if content:
+            abstract_parts.append(f"Text or content retained: {', '.join(content[:12])}.")
+        if sounds:
+            abstract_parts.append(f"Sounds retained: {', '.join(sounds[:12])}.")
+        if recurring_lines:
+            abstract_parts.append(recurring_lines[0])
+        abstract_summary = " ".join(abstract_parts)[:1200]
+        content_lines = [
+            "## Day",
+            f"- {local_day.strftime('%A, %B %d, %Y')} ({timezone_name}).",
+            f"- {abstract_summary}",
+            "## Chronological replay",
+        ]
+        content_lines.extend(
+            f"- {entry['local_time']} — {entry['summary']}"
+            for entry in timeline
+        )
+        content_lines.extend(
+            [
+                "## Consolidated understanding",
+                *(
+                    [f"- {line}" for line in recurring_lines]
+                    if recurring_lines
+                    else [
+                        "- No within-day association repeated enough to support a higher-order motif."
+                    ]
+                ),
+                "## Provenance",
+                f"- {len(set(evidence_ids))} retained evidence items and {len(set(episode_ids))} source episodes.",
+                "- This chapter is a revisable synthesis; source artifacts remain authoritative.",
+            ]
+        )
+        average_quality = sum(qualities) / max(1, len(qualities))
+        confidence = min(
+            0.98,
+            0.42
+            + 0.12 * math.log1p(len(timeline))
+            + 0.28 * average_quality,
+        )
+        unique_evidence_ids = list(dict.fromkeys(evidence_ids))
+        unique_episode_ids = list(dict.fromkeys(episode_ids))
+        return {
+            "content": "\n".join(content_lines),
+            "abstract_summary": abstract_summary,
+            "timeline": timeline,
+            "confidence": round(confidence, 4),
+            "entity_ids": sorted(all_entities),
+            "entity_types": {
+                entity_id: entity_type
+                for entity_id, (entity_type, _label) in all_entities.items()
+            },
+            "evidence_ids": unique_evidence_ids[:2000],
+            "episode_ids": unique_episode_ids[:2000],
+            "reviewed_evidence_count": len(unique_evidence_ids),
+            "reviewed_episode_count": len(unique_episode_ids),
+        }
+
+    @staticmethod
+    def _clean_text(value: object, maximum: int) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())[:maximum]
+
+    def _event_observations(self, event: dict[str, object]) -> list[str]:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return []
+        results: list[str] = []
+        transcript = self._clean_text(payload.get("transcript"), 260)
+        if transcript and payload.get("admitted") is not False:
+            results.append(f'Heard: “{transcript}”')
+        response = self._clean_text(payload.get("candidate_response"), 260)
+        if response and payload.get("spoken") is not False:
+            results.append(f'Egg replied: “{response}”')
+        text_value = self._clean_text(payload.get("text"), 260)
+        if text_value:
+            prefix = "Read" if str(event.get("modality")) == "ocr" else "Text"
+            results.append(f"{prefix}: {text_value}")
+        for key in ("summary", "analysis", "corrected_label"):
+            value = self._clean_text(payload.get(key), 260)
+            if value:
+                results.append(value)
+        labels = payload.get("labels")
+        if isinstance(labels, list):
+            normalized = [self._clean_text(value, 80) for value in labels]
+            normalized = [value for value in normalized if value]
+            if normalized:
+                results.append("Observed labels: " + ", ".join(normalized[:12]))
+        classifications = payload.get("classifications")
+        if isinstance(classifications, list):
+            labels = [
+                self._clean_text(item.get("label"), 80)
+                for item in classifications
+                if isinstance(item, dict)
+            ]
+            labels = [value for value in labels if value]
+            if labels:
+                results.append("Audio context: " + ", ".join(labels[:8]))
+        return self._unique(results)[:8]
+
+    @staticmethod
+    def _unique(values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value for value in values if value))
+
+    @staticmethod
+    def _labels_by_type(
+        entities: dict[str, tuple[str, str]], accepted: set[str]
+    ) -> list[str]:
+        return list(
+            dict.fromkeys(
+                label
+                for entity_type, label in entities.values()
+                if entity_type in accepted
+            )
+        )
+
+    @staticmethod
+    def _timeline_summary(entry: dict[str, object]) -> str:
+        parts: list[str] = []
+        people = entry.get("people") or []
+        objects = entry.get("objects") or []
+        content = entry.get("content") or []
+        sounds = entry.get("sounds") or []
+        if people:
+            parts.append("Encountered " + ", ".join(people))
+        if objects:
+            parts.append("observed " + ", ".join(objects))
+        if content:
+            parts.append("retained text/content " + ", ".join(content))
+        if sounds:
+            parts.append("heard " + ", ".join(sounds))
+        observations = entry.get("observations") or []
+        parts.extend(str(value) for value in observations[:5])
+        if not parts:
+            modalities = entry.get("modalities") or []
+            parts.append(
+                "Retained "
+                + ", ".join(str(value) for value in modalities)
+                + " evidence"
+            )
+        return "; ".join(parts)[:1200] + "."
 
     @staticmethod
     def _deduplicate_semantic_pairs(
@@ -268,6 +910,7 @@ class WorldModelSynthesizer:
         history: list[dict[str, object]],
         conflicts: list[dict[str, object]],
         episodes: list[dict[str, object]],
+        daily_narratives: list[dict[str, object]],
     ) -> dict[str, str]:
         entity_counts = Counter(str(item["entity_type"]) for item in inventory)
         named_people = [
@@ -288,6 +931,15 @@ class WorldModelSynthesizer:
             if isinstance(claim, dict)
         ][:12]
         pattern_lines = [str(item["summary"]) for item in abstractions[:10]]
+        daily_chapters = [
+            (
+                f"{metadata.get('local_date')}: "
+                f"{metadata.get('abstract_summary') or 'chronological replay retained'}"
+            )
+            for item in daily_narratives
+            if isinstance((metadata := item.get("metadata")), dict)
+            and metadata.get("local_date")
+        ][:7]
         world_model = self._sectioned(
             "Grounding",
             [
@@ -304,6 +956,9 @@ class WorldModelSynthesizer:
             active_claims or ["No active source-backed semantic claims in this replay set."],
             "Higher-order associations",
             pattern_lines or ["No recurrent multi-episode motif has crossed the support threshold."],
+            "Chronological world chapters",
+            daily_chapters
+            or ["No dated dream replay has generated a daily chapter yet."],
         )
 
         episode_summaries = [
@@ -324,6 +979,9 @@ class WorldModelSynthesizer:
             ],
             "Recent retained episodes",
             episode_summaries or ["No closed episode summary is currently available."],
+            "Dated chapters consolidated during dreams",
+            daily_chapters
+            or ["No daily story chapter has been consolidated yet."],
         )
 
         spoken = sum(

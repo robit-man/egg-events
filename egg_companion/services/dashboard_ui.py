@@ -424,6 +424,36 @@ PAGE = r"""<!doctype html>
     .graph-property:last-child { border-bottom: 0; }
     .graph-property dt { color: var(--muted); }
     .graph-property dd { margin: 0; overflow-wrap: anywhere; }
+    .graph-narrative { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+    .graph-narrative-summary { margin: 8px 0 12px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
+    .graph-timeline { display: grid; gap: 8px; max-height: 420px; overflow: auto; }
+    .graph-timeline-entry { padding: 8px 10px; background: var(--surface); border-left: 2px solid var(--accent); }
+    .graph-timeline-time { color: var(--accent); font-size: 10px; letter-spacing: .08em; }
+    .graph-timeline-summary { margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+    .narrative-timeline { position: relative; display: grid; gap: 0; }
+    .narrative-day { display: grid; grid-template-columns: 130px 28px minmax(0, 1fr); min-width: 0; }
+    .narrative-day-time { padding: 18px 16px 24px 0; color: var(--muted); font-size: 11px; text-align: right; }
+    .narrative-day-time strong { display: block; color: var(--text); font-size: 13px; }
+    .narrative-rail { position: relative; }
+    .narrative-rail::before { position: absolute; top: 0; bottom: 0; left: 13px; width: 1px; background: var(--line); content: ''; }
+    .narrative-marker { position: absolute; z-index: 1; top: 23px; left: 8px; width: 11px; height: 11px; background: var(--accent); border: 2px solid var(--bg); box-shadow: 0 0 14px rgb(255 174 0 / .55); }
+    .narrative-card { min-width: 0; margin-bottom: 18px; background: var(--panel); border: 1px solid var(--line); }
+    .narrative-card-button { display: block; width: 100%; padding: 16px; color: inherit; background: transparent; border: 0; text-align: left; cursor: pointer; }
+    .narrative-card-button:hover { background: var(--surface); }
+    .narrative-card-title { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+    .narrative-card-summary { margin-top: 9px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+    .narrative-detail { padding: 0 16px 16px; border-top: 1px solid var(--line); }
+    .narrative-periods { display: grid; gap: 10px; padding-top: 14px; }
+    .narrative-period { background: var(--surface); border-left: 2px solid var(--accent); }
+    .narrative-period > summary { padding: 12px; color: var(--text); cursor: pointer; }
+    .narrative-period-body { padding: 0 12px 12px; }
+    .narrative-artifacts { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1px; margin-top: 10px; background: var(--line); border: 1px solid var(--line); }
+    .narrative-artifact { min-width: 0; padding: 10px; background: var(--panel); }
+    .narrative-artifact img { display: block; width: 100%; max-height: 260px; margin-top: 8px; object-fit: contain; background: #05070a; }
+    .narrative-artifact audio { display: block; width: 100%; margin-top: 8px; border-radius: 0; }
+    .narrative-artifact-text { margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+    .narrative-episodes { display: grid; gap: 5px; margin-top: 10px; }
+    .narrative-episode { padding: 8px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); font-size: 10px; }
     .graph-legend { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; }
     .graph-evidence-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }
     .graph-evidence-item { min-width: 0; padding: 13px; background: var(--surface); }
@@ -488,6 +518,10 @@ PAGE = r"""<!doctype html>
       .graph-toolbar .input { flex: 1; }
       .graph-stage { height: 68dvh; min-height: 460px; }
       .graph-detail-grid { grid-template-columns: 1fr; }
+      .narrative-day { grid-template-columns: 18px minmax(0, 1fr); }
+      .narrative-day-time { grid-column: 2; padding: 14px 0 8px; text-align: left; }
+      .narrative-rail { grid-column: 1; grid-row: 1 / span 2; }
+      .narrative-card { grid-column: 2; }
       .graph-page.graph-theater { margin-top: -20px; }
       .graph-page.graph-theater .graph-stage { height: calc(100dvh - 168px); min-height: 460px; }
       .graph-panel:fullscreen .graph-stage { height: calc(100dvh - 104px); min-height: 0; }
@@ -527,6 +561,7 @@ PAGE = r"""<!doctype html>
         <a class="nav-link" href="/cognition" data-route="/cognition" data-title="Cognition"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 4a3 3 0 0 0-5 2.2A3.5 3.5 0 0 0 5 13a4 4 0 0 0 4 6M15 4a3 3 0 0 1 5 2.2A3.5 3.5 0 0 1 19 13a4 4 0 0 1-4 6M9 4v16M15 4v16M9 8h3M12 16h3"/></svg><span>Cognition</span></a>
         <a class="nav-link" href="/graph" data-route="/graph" data-title="Knowledge graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="6" cy="7" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="m8.3 7 7.2-.7M7.4 9l3.5 6.8M16.6 8.2l-3.5 7.6"/></svg><span>Knowledge graph</span></a>
         <a class="nav-link" href="/dreams" data-route="/dreams" data-title="Dreams"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 15.5A8 8 0 0 1 8.5 4 8 8 0 1 0 20 15.5Z"/><path d="M15.5 5.5h3M17 4v3M5 14h3M6.5 12.5v3"/></svg><span>Dreams</span></a>
+        <a class="nav-link" href="/narrative" data-route="/narrative" data-title="Narrative"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 3v18M6 6h12M6 12h9M6 18h12"/><circle cx="6" cy="6" r="2"/><circle cx="6" cy="12" r="2"/><circle cx="6" cy="18" r="2"/></svg><span>Narrative</span></a>
         <a class="nav-link" href="/system" data-route="/system" data-title="System"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg><span>System</span></a>
       </nav>
       <div class="nav-label" style="margin-top:22px">Manage</div>
@@ -616,7 +651,7 @@ PAGE = r"""<!doctype html>
         </section>
 
         <section class="page" data-page="/dreams">
-          <div class="page-heading"><div><h2>Dreams</h2><p>Idle-time identity discovery across retained face angles, with reversible evidence coalescing.</p></div><div class="button-row"><button id="dream-run" class="button primary" type="button">Dream now</button><span id="dream-result" class="result"></span></div></div>
+          <div class="page-heading"><div><h2>Dreams</h2><p>Idle-time identity discovery, chronological replay, daily narrative consolidation, and story/meta-graph revision.</p></div><div class="button-row"><button id="dream-run" class="button primary" type="button">Dream now</button><span id="dream-result" class="result"></span></div></div>
           <div class="grid">
             <article class="card metric-card span-3"><div class="metric-label">State</div><div id="dream-state" class="metric-value">Idle</div><div id="dream-next" class="metric-detail">Schedule pending</div></article>
             <article class="card metric-card span-3"><div class="metric-label">Canonical people</div><div id="dream-people" class="metric-value">0</div><div id="dream-fragments" class="metric-detail">No profile data</div></article>
@@ -625,8 +660,14 @@ PAGE = r"""<!doctype html>
             <article class="card span-6"><div class="card-header"><div><h3 class="card-title">Identity model</h3><p class="card-note">Pinned local weights; no runtime network dependency</p></div><span id="dream-model-ready" class="badge">Checking</span></div><div id="dream-model" class="pre">Loading model provenance.</div></article>
             <article class="card span-6"><div class="card-header"><div><h3 class="card-title">Merge policy</h3><p class="card-note">Every automatic merge must clear all gates</p></div></div><div id="dream-policy" class="badge-row"></div><p id="dream-policy-detail" class="card-note" style="margin-top:12px"></p></article>
             <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Automatic consolidation outcomes</h3><p class="card-note">Completed cluster changes and genuine safety vetoes; weak audit comparisons require no dashboard action</p></div></div><div id="dream-candidates" class="dream-ledger"><div class="empty">No dream outcomes yet.</div></div></article>
-            <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Dream history</h3><p class="card-note">Persisted runs, model revision, scope, duration, and consolidation outcome</p></div></div><div id="dream-history" class="table-wrap"></div></article>
+            <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Latest chronological replay</h3><p class="card-note">Daily chapters rebuilt from ordered multimodal evidence and folded into My story</p></div><button class="button" data-route-button="/narrative">Explore narrative</button></div><div id="dream-replay"><div class="empty">No chronological dream replay yet.</div></div></article>
+            <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Dream history</h3><p class="card-note">Persisted runs, identity outcome, dated chapters replayed, story revision, and duration</p></div></div><div id="dream-history" class="table-wrap"></div></article>
           </div>
+        </section>
+
+        <section class="page" data-page="/narrative">
+          <div class="page-heading"><div><h2>Narrative</h2><p>Dream-consolidated daily story, newest first, with nested encounter periods and source artifacts.</p></div><div id="narrative-status" class="badge-row"><span class="badge">Loading chapters</span></div></div>
+          <article class="card"><div class="card-header"><div><h3 class="card-title">Chronological story</h3><p class="card-note">Select a day, then expand a period to inspect its summarized episodes, people, objects, speech, OCR, audio, and retained media.</p></div><button id="narrative-refresh" class="button" type="button">Replay view</button></div><div id="narrative-timeline" class="narrative-timeline"><div class="empty">Loading daily narratives…</div></div></article>
         </section>
 
         <section class="page graph-page" data-page="/graph">
@@ -644,7 +685,7 @@ PAGE = r"""<!doctype html>
           </article>
           <div class="graph-detail-grid">
             <article class="card graph-selection-card"><div class="card-header"><div><h3 class="card-title">Selection</h3><p class="card-note">Node and immediate relationships</p></div></div><div id="graph-selection"><div class="muted">Select a node in the graph to inspect its nested awareness and provenance.</div></div></article>
-            <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
+            <article class="card"><div class="card-header"><div><h3 class="card-title">Modalities</h3><p class="card-note">Color identifies source and memory role</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#60a5fa"></i>People</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Objects</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Sound events</span><span class="legend-item"><i class="legend-dot" style="--legend:#fbbf24"></i>OCR content</span><span class="legend-item"><i class="legend-dot" style="--legend:#f97316"></i>Daily stories</span><span class="legend-item"><i class="legend-dot" style="--legend:#8b5cf6"></i>Dream replay</span><span class="legend-item"><i class="legend-dot" style="--legend:#06b6d4"></i>World model</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Evidence</span><span class="legend-item"><i class="legend-dot" style="--legend:#fb7185"></i>Claims</span><span class="legend-item"><i class="legend-dot" style="--legend:#94a3b8"></i>Episodes</span></div></article>
             <article class="card"><div class="card-header"><div><h3 class="card-title">Live firings</h3><p class="card-note">Causal activity propagates across connected memories without moving your view</p></div></div><div class="graph-legend"><span class="legend-item"><i class="legend-dot" style="--legend:#fff"></i>Vision</span><span class="legend-item"><i class="legend-dot" style="--legend:#ffae00"></i>Heard voice</span><span class="legend-item"><i class="legend-dot" style="--legend:#c084fc"></i>Memory recall</span><span class="legend-item"><i class="legend-dot" style="--legend:#34d399"></i>Agent action</span></div></article>
             <article class="card"><div class="card-header"><div><h3 class="card-title">Relationship encoding</h3><p class="card-note">Spline form is evidence, not decoration</p></div></div><dl class="graph-encoding"><div><dt>Thickness</dt><dd>Association strength, confidence, and repeated confirmation.</dd></div><div><dt>Arch</dt><dd>Recurrence and associative separation; repeated links rise into stronger bridges.</dd></div><div><dt>Angle</dt><dd>Relationship family: identity, observation, co-presence, audio, temporal, or reflective.</dd></div><div><dt>Distance</dt><dd>Semantic affinity and confidence pull related memories into tighter neighborhoods.</dd></div></dl></article>
           </div>
@@ -674,7 +715,7 @@ PAGE = r"""<!doctype html>
     const $ = (selector, root = document) => root.querySelector(selector);
     const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
     const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
-    const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/system':'System','/configuration':'Configuration'};
+    const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/narrative':'Narrative','/system':'System','/configuration':'Configuration'};
     let currentState = null;
     let effectiveConfig = null;
     let catalog = null;
@@ -693,6 +734,11 @@ PAGE = r"""<!doctype html>
     let graphDataSignature = '';
     let graphActivationSequence = 0;
     let graphSelectionRevision = 0;
+    let narrativeLoadedAt = 0;
+    let narrativeSignature = '';
+    let narrativeIndex = [];
+    let narrativeDetailRevision = 0;
+    const narrativeDetails = new Map();
     const cameraViews = new Map();
 
     function normalizedRoute(pathname) {
@@ -716,6 +762,7 @@ PAGE = r"""<!doctype html>
       if (route === '/vision' && currentState) renderCameras(currentState.telemetry?.cameras || []);
       if (route === '/voice' && !catalog) loadCatalog();
       if (route === '/graph') loadGraph();
+      if (route === '/narrative') loadNarratives();
       if (currentState) renderActivePage(currentState, route);
       if (priorRoute !== route) window.scrollTo({top: 0, behavior: 'instant'});
     }
@@ -981,14 +1028,15 @@ PAGE = r"""<!doctype html>
     function renderDreams(dreams, identity) {
       dreams = dreams || {}; identity = identity || {};
       const runs = dreams.runs || [], candidates = dreams.candidates || [], last = runs[0] || {}, model = dreams.model || {}, policy = dreams.policy || {};
+      const lastReplay = dreams.narrative_replay || last.details?.chronological_replay || {};
       $('#dream-state').textContent = stateLabel(dreams.state || (dreams.enabled ? 'idle' : 'disabled'));
       $('#dream-next').textContent = dreams.next_scheduled_at ? `Next idle window ${new Date(dreams.next_scheduled_at).toLocaleString()}` : 'Schedule pending';
       $('#dream-people').textContent = identity.canonical_people || 0;
       $('#dream-fragments').textContent = `${identity.coalesced_aliases || 0} aliases · ${identity.provisional_face_profiles || 0} provisional · ${identity.quarantined_face_samples || 0} invalid crops quarantined`;
       $('#dream-last-profiles').textContent = last.profiles_examined ?? '—';
-      $('#dream-last-detail').textContent = last.started_at ? `${last.samples_embedded || 0} evidence crops · ${Number(last.duration_seconds || 0).toFixed(2)} s` : 'No completed dreams';
+      $('#dream-last-detail').textContent = last.started_at || lastReplay.replayed_at ? `${last.samples_embedded || 0} face crops · ${lastReplay.days_replayed || 0} day chapters · story r${lastReplay.story_revision ?? '—'} · ${Number(last.duration_seconds || 0).toFixed(2)} s` : 'No completed dreams';
       $('#dream-merges').textContent = identity.coalesced_aliases || 0;
-      $('#dream-conflicts').textContent = `Last pass: ${last.merges || 0} merged · ${last.conflicts_blocked || 0} co-observation blocks`;
+      $('#dream-conflicts').textContent = `Last pass: ${last.merges || 0} merged · ${lastReplay.days_replayed || 0} days replayed · ${last.conflicts_blocked || 0} safety vetoes`;
       $('#dream-model-ready').className = `badge ${model.ready ? 'good' : 'bad'}`;
       $('#dream-model-ready').textContent = model.ready ? `${esc(model.configured_device || model.device || 'local')} ready` : 'Weights unavailable';
       $('#dream-model').textContent = `${model.architecture || 'AdaFace IR18'}\n${model.id || 'model unavailable'}\nrevision ${model.revision || '—'}\nconfigured ${model.configured_device || '—'} · runtime ${model.device || 'unloaded'}\n${model.path || '—'}\n\ncomparison ${model.comparison?.id || 'not configured'} · ${model.comparison?.ready ? (model.comparison?.device || 'ready') : 'unavailable'}\n${model.comparison?.path || '—'}\n\n${model.usage_notice || ''}`;
@@ -1000,7 +1048,56 @@ PAGE = r"""<!doctype html>
         const tone = ['merged','consolidated'].includes(item.decision) ? 'good' : item.decision === 'blocked' ? 'bad' : 'warn';
         return `<article class="dream-candidate"><div class="dream-pair"><div class="dream-face"><img loading="lazy" src="/api/identities/${encodeURIComponent(item.left_id)}/face.jpg" alt="Evidence for ${esc(item.left_id)}"><div><strong>${esc(item.left_id)}</strong><div class="muted">AdaFace ${Number(item.modern_similarity || 0).toFixed(3)}</div></div></div><div class="dream-link">↔</div><div class="dream-face"><img loading="lazy" src="/api/identities/${encodeURIComponent(item.right_id)}/face.jpg" alt="Evidence for ${esc(item.right_id)}"><div><strong>${esc(item.right_id)}</strong><div class="muted">SFace ${Number(item.legacy_similarity || 0).toFixed(3)} · MobileFaceNet ${item.comparison_similarity == null ? '—' : Number(item.comparison_similarity).toFixed(3)}</div></div></div></div><div class="badge-row" style="margin-top:10px"><span class="badge ${tone}">${esc(item.decision)}</span><span class="badge">${esc(item.reason || 'evaluated')}</span><span class="badge">margins ${Number(item.left_margin || 0).toFixed(3)} / ${Number(item.right_margin || 0).toFixed(3)}</span>${item.canonical_id ? `<span class="badge good">canonical ${esc(item.canonical_id)}</span>` : ''}</div></article>`;
       }).join('') + (auditOnly ? `<div class="empty">${esc(auditOnly)} weak comparisons retained in the audit database; they are not stalled work and require no review.</div>` : '') || '<div class="empty">No identity changes or safety vetoes in the latest dream.</div>';
-      $('#dream-history').innerHTML = table(['Started','State','Device','Profiles / samples','Proposals','Merges','Duration'], runs.map(run => [esc(new Date(run.started_at).toLocaleString()), statusBadge(run.state), esc(run.device || '—'), `${esc(run.profiles_examined || 0)} / ${esc(run.samples_embedded || 0)}`, esc(run.proposals || 0), esc(run.merges || 0), `${Number(run.duration_seconds || 0).toFixed(2)} s`]), 'No dream runs recorded');
+      if (lastReplay.state === 'failed') {
+        $('#dream-replay').innerHTML = `<div class="empty">Chronological replay failed: ${esc(lastReplay.error || 'unknown error')}</div>`;
+      } else if (lastReplay.days_replayed) {
+        const chapters = Array.isArray(lastReplay.daily_narratives) ? lastReplay.daily_narratives : [];
+        $('#dream-replay').innerHTML = `<div class="badge-row"><span class="badge good">${esc(lastReplay.days_replayed)} days replayed</span><span class="badge">${esc(lastReplay.backfilled_days?.length || 0)} backdated</span><span class="badge ${lastReplay.backlog_remaining ? 'warn' : 'good'}">${esc(lastReplay.backlog_remaining || 0)} awaiting narrative</span><span class="badge">My story r${esc(lastReplay.story_revision ?? '—')}</span><span class="badge">${esc(lastReplay.meta_graph?.documents_revised || 0)} documents revised</span><span class="badge">${esc(lastReplay.meta_graph?.abstractions_projected || 0)} abstractions active</span></div><div class="dream-ledger" style="margin-top:12px">${chapters.map(chapter => `<article class="dream-candidate"><strong>${esc(chapter.local_date || 'dated chapter')}</strong><div class="card-note" style="margin-top:6px">${esc(chapter.abstract_summary || 'Chronological evidence replayed.')}</div><div class="badge-row" style="margin-top:8px"><span class="badge">r${esc(chapter.revision || 0)}</span><span class="badge">${esc(chapter.timeline_entries || 0)} periods</span><span class="badge">${esc(chapter.evidence_count || 0)} artifacts</span><span class="badge">${esc(chapter.episode_count || 0)} episodes</span></div></article>`).join('')}</div>`;
+      } else {
+        $('#dream-replay').innerHTML = '<div class="empty">No retained day was available for chronological replay.</div>';
+      }
+      $('#dream-history').innerHTML = table(['Started','State','Device','Profiles / samples','Proposals','Merges','Day chapters / story','Duration'], runs.map(run => { const replay = run.details?.chronological_replay || {}; return [esc(new Date(run.started_at).toLocaleString()), statusBadge(run.state), esc(run.device || '—'), `${esc(run.profiles_examined || 0)} / ${esc(run.samples_embedded || 0)}`, esc(run.proposals || 0), esc(run.merges || 0), replay.state === 'failed' ? '<span class="badge bad">replay failed</span>' : `${esc(replay.days_replayed || 0)} / r${esc(replay.story_revision ?? '—')}`, `${Number(run.duration_seconds || 0).toFixed(2)} s`]; }), 'No dream runs recorded');
+    }
+    function renderNarrativeIndex(chapters) {
+      narrativeIndex = chapters;
+      const replay = currentState?.dreams?.narrative_replay || {}, remaining = Number(replay.backlog_remaining || 0);
+      $('#narrative-status').innerHTML = `<span class="badge good">${esc(chapters.length)} daily chapters</span><span class="badge ${remaining ? 'warn' : 'good'}">${esc(remaining)} awaiting narrative</span><span class="badge">newest first</span><span class="badge">${esc(chapters.reduce((sum,item) => sum + Number(item.evidence_count || 0), 0))} artifacts indexed</span>`;
+      if (!chapters.length) { $('#narrative-timeline').innerHTML = '<div class="empty">No daily chapter exists yet. Startup catch-up is reviewing retained history oldest-first.</div>'; return; }
+      $('#narrative-timeline').innerHTML = chapters.map((chapter, index) => {
+        const parsed = new Date(`${chapter.local_date}T12:00:00`), day = Number.isNaN(parsed.valueOf()) ? chapter.local_date : parsed.toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'}), year = Number.isNaN(parsed.valueOf()) ? '' : parsed.getFullYear();
+        return `<article class="narrative-day" data-narrative-date="${esc(chapter.local_date)}"><div class="narrative-day-time"><strong>${esc(day)}</strong>${esc(year)}</div><div class="narrative-rail"><span class="narrative-marker"></span></div><div class="narrative-card"><button class="narrative-card-button" type="button" aria-expanded="false"><div class="narrative-card-title"><strong>Daily story · ${esc(chapter.local_date)}</strong><span class="badge">r${esc(chapter.revision || 0)}</span></div><div class="narrative-card-summary">${esc(chapter.abstract_summary || 'Chronological evidence retained.')}</div><div class="badge-row" style="margin-top:10px"><span class="badge">${esc(chapter.timeline_entries || 0)} periods</span><span class="badge">${esc(chapter.episode_count || 0)} episodes</span><span class="badge">${esc(chapter.evidence_count || 0)} artifacts</span><span class="badge">${Math.round(Number(chapter.confidence || 0) * 100)}% grounded</span></div></button><div id="narrative-detail-${esc(chapter.local_date)}" class="narrative-detail" hidden><div class="empty">Loading nested episodes and artifacts…</div></div></div></article>`;
+      }).join('');
+      requestAnimationFrame(() => $('#narrative-timeline .narrative-card-button')?.click());
+    }
+    function narrativeArtifact(item) {
+      const modality = String(item.modality || 'evidence'), artifact = item.artifact_url || '', isAudio = ['audio','speech','audio_semantics'].includes(modality), isImage = ['vision','image','ocr'].includes(modality);
+      const media = artifact && isAudio ? `<audio controls preload="metadata" src="${esc(artifact)}"></audio>` : artifact && isImage ? `<img loading="lazy" src="${esc(artifact)}" alt="Retained ${esc(modality)} artifact">` : '';
+      return `<article class="narrative-artifact"><div class="badge-row"><span class="badge">${esc(modality)}</span><span class="badge">${Math.round(Number(item.quality || 0) * 100)}%</span></div>${media}${item.text ? `<div class="narrative-artifact-text">${esc(item.text)}</div>` : ''}<div class="muted mono" style="margin-top:7px">${esc(item.captured_at ? new Date(item.captured_at).toLocaleString() : item.evidence_id)}</div></article>`;
+    }
+    function renderNarrativeDetail(localDate, detail) {
+      const target = $(`#narrative-detail-${localDate}`); if (!target) return;
+      const periods = [...(detail.timeline || [])].reverse();
+      target.innerHTML = `<div class="badge-row" style="margin-top:14px"><span class="badge good">${esc(detail.timezone || 'local time')}</span><span class="badge">${esc(detail.source_episode_count || 0)} source episodes</span><span class="badge">${esc(detail.source_evidence_count || 0)} evidence items</span><span class="badge">dreams ×${esc((detail.dream_run_ids || []).length)}</span></div><div class="narrative-periods">${periods.map((period, index) => {
+        const episodes = period.episodes || [], artifacts = period.artifacts || [], associations = [...(period.people || []).map(value => `person: ${value}`), ...(period.objects || []).map(value => `object: ${value}`), ...(period.content || []).map(value => `content: ${value}`), ...(period.sounds || []).map(value => `sound: ${value}`)];
+        return `<details class="narrative-period" ${index === 0 ? 'open' : ''}><summary><strong>${esc(period.local_time || 'encounter')}</strong> · ${esc(period.summary || 'Retained encounter period')}</summary><div class="narrative-period-body"><div class="badge-row">${associations.slice(0,20).map(value => `<span class="badge">${esc(value)}</span>`).join('')}${(period.modalities || []).map(value => `<span class="badge good">${esc(value)}</span>`).join('')}</div>${episodes.length ? `<div class="narrative-episodes">${episodes.map(episode => `<div class="narrative-episode"><span class="mono">${esc(episode.episode_id)}</span> · ${esc(episode.summary || episode.state || 'episode')} · ${esc(episode.started_at ? new Date(episode.started_at).toLocaleTimeString() : '')}</div>`).join('')}</div>` : ''}${artifacts.length ? `<div class="narrative-artifacts">${artifacts.map(narrativeArtifact).join('')}</div>` : '<div class="empty">No retained media artifact in this period.</div>'}</div></details>`;
+      }).join('') || '<div class="empty">No replay periods retained for this day.</div>'}</div>`;
+    }
+    async function loadNarrativeDetail(localDate) {
+      if (narrativeDetails.has(localDate)) { renderNarrativeDetail(localDate, narrativeDetails.get(localDate)); return; }
+      const target = $(`#narrative-detail-${localDate}`); if (target) target.innerHTML = '<div class="empty">Loading nested episodes and artifacts…</div>';
+      try {
+        const response = await fetch(`/api/memory/narratives/${encodeURIComponent(localDate)}`, {cache:'no-store'}); if (!response.ok) throw new Error(await response.text());
+        const detail = await response.json(); narrativeDetails.set(localDate, detail); renderNarrativeDetail(localDate, detail);
+      } catch (error) { if (target) target.innerHTML = `<div class="empty">Narrative unavailable: ${esc(error.message)}</div>`; }
+    }
+    async function loadNarratives(force = false) {
+      if (!force && Date.now() - narrativeLoadedAt < 5000) return;
+      narrativeLoadedAt = Date.now();
+      try {
+        const response = await fetch('/api/memory/narratives?limit=365', {cache:'no-store'}); if (!response.ok) throw new Error(await response.text());
+        const chapters = await response.json(), signature = JSON.stringify(chapters.map(item => [item.local_date,item.revision,item.last_replayed_at,item.evidence_count]));
+        if (signature !== narrativeSignature) { narrativeSignature = signature; narrativeDetails.clear(); renderNarrativeIndex(chapters); }
+      } catch (error) { narrativeLoadedAt = 0; $('#narrative-status').innerHTML = '<span class="badge bad">Narrative unavailable</span>'; $('#narrative-timeline').innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
     }
     function renderSystem(state) {
       const telemetry = state.telemetry || {}, checks = state.checks || [], errors = telemetry.runtime_errors || [], gpu = telemetry.gpu || {};
@@ -1019,6 +1116,7 @@ PAGE = r"""<!doctype html>
       else if (route === '/memory') renderMemory(state.memory);
       else if (route === '/cognition') renderCognition(telemetry);
       else if (route === '/dreams') renderDreams(state.dreams, state.identity_summary);
+      else if (route === '/narrative') loadNarratives();
       else if (route === '/system') renderSystem(state);
     }
     function render(state) {
@@ -1149,10 +1247,19 @@ PAGE = r"""<!doctype html>
         const response = await fetch('/api/dreams/run', {method:'POST', headers:{'Content-Type':'application/json'}});
         if (!response.ok) throw new Error(await response.text());
         const payload = await response.json();
-        result.className = 'result success'; result.textContent = `${payload.merges || 0} identities consolidated from ${payload.profiles_examined || 0} profiles`;
+        const replay = payload.chronological_replay || {};
+        result.className = 'result success'; result.textContent = `${payload.merges || 0} identities consolidated · ${replay.days_replayed || 0} daily chapters replayed · My story r${replay.story_revision ?? '—'}`;
         await refresh();
       } catch (error) { result.className = 'result error'; result.textContent = error.message; }
       finally { button.disabled = false; button.textContent = 'Dream now'; }
+    });
+    $('#narrative-refresh').addEventListener('click', () => { narrativeLoadedAt = 0; loadNarratives(true); });
+    $('#narrative-timeline').addEventListener('click', event => {
+      const button = event.target.closest('.narrative-card-button'); if (!button) return;
+      const day = button.closest('[data-narrative-date]'), localDate = day?.dataset.narrativeDate, detail = localDate ? $(`#narrative-detail-${localDate}`) : null;
+      if (!localDate || !detail) return;
+      const expanding = detail.hidden; detail.hidden = !expanding; button.setAttribute('aria-expanded', String(expanding));
+      if (expanding) loadNarrativeDetail(localDate);
     });
     $('#config-search').addEventListener('input', renderConfiguration);
     function emitGraphFilter() { window.dispatchEvent(new CustomEvent('egg:graph-filter', {detail:{query:$('#graph-search').value, kind:$('#graph-kind').value}})); }
@@ -1198,14 +1305,26 @@ PAGE = r"""<!doctype html>
       return [...found.values()];
     }
     function renderGraphEvidence(detail) {
-      const evidence = relatedEvidence(detail);
+      const allEvidence = relatedEvidence(detail), evidence = allEvidence.slice(0, 120);
       if (!evidence.length) { $('#graph-evidence').innerHTML = '<div class="empty">This node has no retained evidence artifact yet.</div>'; return; }
       $('#graph-evidence').innerHTML = `<div class="graph-evidence-grid">${evidence.map(item => {
         const payload = item.payload || {}, modality = String(item.modality || 'evidence'), artifact = item.artifact_url || (item.media_key ? `/api/memory/evidence/${encodeURIComponent(item.evidence_id)}/media` : '');
         const text = payload.transcript || payload.text || payload.summary || (payload.analysis ? `${payload.analysis}${payload.displacement_analysis ? `\n${payload.displacement_analysis}` : ''}` : '') || (payload.detections ? JSON.stringify(payload.detections, null, 2) : '');
         const media = artifact && ['speech','audio'].includes(modality) ? `<audio controls preload="metadata" src="${esc(artifact)}"></audio>` : artifact && ['vision','image','ocr'].includes(modality) ? `<img loading="lazy" src="${esc(artifact)}" alt="Retained ${esc(modality)} evidence">` : '';
         return `<article class="graph-evidence-item"><div class="badge-row"><span class="badge">${esc(modality)}</span><span class="badge">${esc(item.role || item.source_type || 'evidence')}</span></div><div class="card-note" style="margin-top:8px">${esc(new Date(item.captured_at).toLocaleString())} · ${Math.round(Number(item.quality || 0) * 100)}%</div>${media}${text ? `<div class="graph-evidence-text">${esc(text)}</div>` : ''}<div class="muted mono" style="margin-top:8px">${esc(item.evidence_id)}</div></article>`;
-      }).join('')}</div>`;
+      }).join('')}</div>${allEvidence.length > evidence.length ? `<div class="empty">Showing ${esc(evidence.length)} of ${esc(allEvidence.length)} retained artifacts; the full source ledger remains attached to this node.</div>` : ''}`;
+    }
+    function renderGraphDerivedDetail(detail) {
+      const entity = detail?.entity || {}, metadata = entity.metadata || {}, kind = String(metadata.document_kind || '');
+      if (kind === 'daily-narrative') {
+        const timeline = Array.isArray(metadata.timeline) ? metadata.timeline : [];
+        const entries = timeline.map(entry => `<article class="graph-timeline-entry"><div class="graph-timeline-time">${esc(entry.local_time || new Date(entry.started_at).toLocaleTimeString())}</div><div class="graph-timeline-summary">${esc(entry.summary || 'Retained encounter period')}</div><div class="badge-row" style="margin-top:7px"><span class="badge">${esc(entry.event_count || 0)} events</span>${(entry.modalities || []).map(value => `<span class="badge">${esc(value)}</span>`).join('')}</div></article>`).join('');
+        $('#graph-selection').insertAdjacentHTML('beforeend', `<section class="graph-narrative"><div class="badge-row"><span class="badge good">story r${esc(metadata.revision || 0)}</span><span class="badge">${esc(metadata.local_date || 'dated replay')}</span><span class="badge">${esc(timeline.length)} periods</span></div><div class="graph-narrative-summary">${esc(metadata.abstract_summary || metadata.content || '')}</div><div class="graph-timeline">${entries || '<div class="empty">No chronological entries retained.</div>'}</div></section>`);
+      } else if (kind && metadata.content) {
+        $('#graph-selection').insertAdjacentHTML('beforeend', `<section class="graph-narrative"><div class="badge-row"><span class="badge good">${esc(kind)} r${esc(metadata.revision || 0)}</span></div><div class="graph-narrative-summary">${esc(metadata.content)}</div></section>`);
+      } else if (entity.entity_type === 'dream_replay') {
+        $('#graph-selection').insertAdjacentHTML('beforeend', `<section class="graph-narrative"><div class="graph-narrative-summary">Offline replay ${esc(metadata.dream_run_id || '')} consolidated ${esc(metadata.identity_merges || 0)} identities after examining ${esc(metadata.profiles_examined || 0)} profiles.</div></section>`);
+      }
     }
     window.addEventListener('egg:graph-selection', async event => {
       const detail = event.detail || {}, node = detail.node || {}, neighbors = detail.neighbors || [];
@@ -1221,7 +1340,7 @@ PAGE = r"""<!doctype html>
         const response = await fetch(`/api/graph/node?${query}`, {cache:'no-store'});
         if (!response.ok) throw new Error(await response.text());
         const record = await response.json();
-        if (revision === graphSelectionRevision) renderGraphEvidence(record);
+        if (revision === graphSelectionRevision) { renderGraphEvidence(record); renderGraphDerivedDetail(record); }
       } catch (error) {
         if (revision === graphSelectionRevision) $('#graph-evidence').innerHTML = `<div class="empty">Evidence unavailable: ${esc(error.message)}</div>`;
       }

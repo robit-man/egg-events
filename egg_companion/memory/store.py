@@ -539,6 +539,154 @@ class MemoryStore:
             ).fetchall()
         return [_row(row) for row in rows]
 
+    def narrative_candidate_timestamps(
+        self, entity_ids: list[str], limit: int = 10000
+    ) -> list[str]:
+        """Return evidence times that may need a dated narrative rebuild.
+
+        Identity aliases identify dates whose already-built chapters need a
+        revision. Never-narrated history is discovered separately from compact
+        store-wide boundaries, so backlog admission does not depend on a merge.
+        """
+        normalized = list(dict.fromkeys(str(value) for value in entity_ids if value))
+        bounded = max(1, min(int(limit), 50000))
+        with self._lock:
+            if normalized:
+                rows: list[sqlite3.Row] = []
+                for offset in range(0, len(normalized), 800):
+                    batch = normalized[offset : offset + 800]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows.extend(
+                        self._connection.execute(
+                            f"""SELECT DISTINCT evidence.captured_at
+                            FROM evidence JOIN entity_evidence
+                              ON evidence.evidence_id=entity_evidence.evidence_id
+                            WHERE entity_evidence.entity_id IN ({placeholders})
+                            ORDER BY evidence.captured_at DESC LIMIT ?""",
+                            (*batch, bounded),
+                        ).fetchall()
+                    )
+                values = sorted(
+                    {str(row["captured_at"]) for row in rows}, reverse=True
+                )[:bounded]
+                if values:
+                    return values
+            row = self._connection.execute(
+                "SELECT captured_at FROM evidence ORDER BY captured_at DESC LIMIT 1"
+            ).fetchone()
+        return [str(row["captured_at"])] if row is not None else []
+
+    def narrative_history_boundaries(self) -> list[str]:
+        """Return compact time boundaries spanning every retained evidence day.
+
+        Grouping in UTC keeps this query small even for a large evidence store.
+        The narrative synthesizer converts both edges of each UTC bucket into
+        its configured local timezone, which also discovers days crossing a
+        timezone boundary without loading every evidence timestamp into Python.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT MIN(captured_at) AS first_at,
+                MAX(captured_at) AS last_at
+                FROM evidence
+                GROUP BY substr(captured_at, 1, 10)
+                ORDER BY first_at ASC"""
+            ).fetchall()
+        return list(
+            dict.fromkeys(
+                str(value)
+                for row in rows
+                for value in (row["first_at"], row["last_at"])
+                if value
+            )
+        )
+
+    def chronological_evidence(
+        self, start_at: datetime, end_at: datetime, limit: int = 50000
+    ) -> list[dict[str, Any]]:
+        """Return one local-day evidence ledger with canonical associations."""
+        bounded = max(1, min(int(limit), 50000))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT evidence.*,
+                GROUP_CONCAT(DISTINCT entity_evidence.entity_id) AS entity_ids_csv,
+                GROUP_CONCAT(DISTINCT episode_evidence.episode_id) AS episode_ids_csv
+                FROM evidence
+                LEFT JOIN entity_evidence
+                  ON entity_evidence.evidence_id=evidence.evidence_id
+                LEFT JOIN entities
+                  ON entities.entity_id=entity_evidence.entity_id
+                LEFT JOIN episode_evidence
+                  ON episode_evidence.evidence_id=evidence.evidence_id
+                WHERE julianday(evidence.captured_at) >= julianday(?)
+                  AND julianday(evidence.captured_at) < julianday(?)
+                  AND (
+                    entity_evidence.entity_id IS NULL
+                    OR (entities.state='active' AND entities.merged_into IS NULL)
+                  )
+                GROUP BY evidence.evidence_id
+                ORDER BY evidence.captured_at ASC LIMIT ?""",
+                (_timestamp(start_at), _timestamp(end_at), bounded),
+            ).fetchall()
+            records = [_row(row) for row in rows]
+            entity_ids = sorted(
+                {
+                    entity_id
+                    for record in records
+                    for entity_id in str(record.get("entity_ids_csv", "") or "").split(",")
+                    if entity_id
+                }
+            )
+            episode_ids = sorted(
+                {
+                    episode_id
+                    for record in records
+                    for episode_id in str(record.get("episode_ids_csv", "") or "").split(",")
+                    if episode_id
+                }
+            )
+            entity_map: dict[str, dict[str, Any]] = {}
+            for offset in range(0, len(entity_ids), 800):
+                batch = entity_ids[offset : offset + 800]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._connection.execute(
+                    f"""SELECT entity_id, entity_type, display_name, metadata_json
+                    FROM entities WHERE entity_id IN ({placeholders})""",
+                    batch,
+                ).fetchall():
+                    item = _row(row)
+                    entity_map[str(item["entity_id"])] = item
+            episode_map: dict[str, dict[str, Any]] = {}
+            for offset in range(0, len(episode_ids), 800):
+                batch = episode_ids[offset : offset + 800]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._connection.execute(
+                    f"""SELECT episode_id, started_at, ended_at, state, novelty, summary
+                    FROM episodes WHERE episode_id IN ({placeholders})""",
+                    batch,
+                ).fetchall():
+                    episode_map[str(row["episode_id"])] = dict(row)
+        for record in records:
+            linked_ids = [
+                value
+                for value in str(record.pop("entity_ids_csv", "") or "").split(",")
+                if value
+            ]
+            linked_episode_ids = [
+                value
+                for value in str(record.pop("episode_ids_csv", "") or "").split(",")
+                if value
+            ]
+            record["entities"] = [
+                entity_map[value] for value in linked_ids if value in entity_map
+            ]
+            record["episodes"] = [
+                episode_map[value]
+                for value in linked_episode_ids
+                if value in episode_map
+            ]
+        return records
+
     def list_entities(
         self, entity_type: str | None = None, state: str = "active", limit: int | None = None
     ) -> list[dict[str, Any]]:
@@ -874,6 +1022,320 @@ class MemoryStore:
                 AND state='active' ORDER BY updated_at DESC"""
             ).fetchall()
         return [_row(row) for row in rows]
+
+    def upsert_daily_narrative(
+        self,
+        local_date: str,
+        content: str,
+        abstract_summary: str,
+        timeline: list[dict[str, Any]],
+        confidence: float,
+        source_entity_ids: list[str],
+        source_evidence_ids: list[str],
+        source_episode_ids: list[str],
+        dream_run_id: str,
+        timezone_name: str,
+        at: datetime,
+        reviewed_evidence_count: int | None = None,
+        reviewed_episode_count: int | None = None,
+        narrative_schema_revision: int = 1,
+    ) -> dict[str, Any]:
+        """Create or revise an inspectable, evidence-backed chapter for one day."""
+        narrative_id = f"daily-narrative:{local_date}"
+        normalized = "\n".join(
+            line.rstrip() for line in content.splitlines() if line.strip()
+        )[:12000]
+        source_entities = list(dict.fromkeys(source_entity_ids))[:1000]
+        source_evidence = list(dict.fromkeys(source_evidence_ids))[:2000]
+        source_episodes = list(dict.fromkeys(source_episode_ids))[:2000]
+        evidence_count = max(
+            len(source_evidence), int(reviewed_evidence_count or 0)
+        )
+        episode_count = max(len(source_episodes), int(reviewed_episode_count or 0))
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "content": normalized,
+                    "timeline": timeline,
+                    "entities": source_entities,
+                    "evidence": source_evidence,
+                    "episodes": source_episodes,
+                    "reviewed_evidence_count": evidence_count,
+                    "reviewed_episode_count": episode_count,
+                    "narrative_schema_revision": narrative_schema_revision,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT metadata_json FROM entities WHERE entity_id=?", (narrative_id,)
+            ).fetchone()
+        metadata = json.loads(existing["metadata_json"]) if existing else {}
+        changed = metadata.get("narrative_fingerprint") != fingerprint
+        revision = int(metadata.get("revision") or 0) + int(changed)
+        dream_runs = list(
+            dict.fromkeys(
+                [
+                    *(
+                        metadata.get("dream_run_ids", [])
+                        if isinstance(metadata.get("dream_run_ids"), list)
+                        else []
+                    ),
+                    dream_run_id,
+                ]
+            )
+        )[-20:]
+        self.upsert_entity(
+            "daily_narrative",
+            f"Daily story · {local_date}",
+            {
+                "document_kind": "daily-narrative",
+                "local_date": local_date,
+                "timezone": timezone_name,
+                "content": normalized,
+                "abstract_summary": abstract_summary[:1200],
+                "timeline": timeline,
+                "revision": revision,
+                "confidence": max(0.0, min(1.0, float(confidence))),
+                "source_entity_ids": source_entities,
+                "source_evidence_ids": source_evidence,
+                "source_episode_ids": source_episodes,
+                "reviewed_evidence_count": evidence_count,
+                "reviewed_episode_count": episode_count,
+                "narrative_schema_revision": max(
+                    1, int(narrative_schema_revision)
+                ),
+                "dream_run_ids": dream_runs,
+                "last_dream_run_id": dream_run_id,
+                "last_replayed_at": at.isoformat(),
+                "narrative_fingerprint": fingerprint,
+                "epistemic_status": "derived_from_chronological_local_evidence",
+            },
+            narrative_id,
+            now=at,
+        )
+        return {
+            "narrative_id": narrative_id,
+            "local_date": local_date,
+            "revision": revision,
+            "changed": changed,
+            "timeline_entries": len(timeline),
+            "evidence_count": evidence_count,
+            "episode_count": episode_count,
+            "entity_count": len(source_entities),
+            "abstract_summary": abstract_summary[:1200],
+        }
+
+    def recent_daily_narratives(self, limit: int = 30) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 3650))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT entity_id, display_name, updated_at, metadata_json
+                FROM entities WHERE entity_type='daily_narrative' AND state='active'
+                ORDER BY json_extract(metadata_json, '$.local_date') DESC LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+        return [_row(row) for row in rows]
+
+    def daily_narrative_index(self, limit: int = 90) -> list[dict[str, Any]]:
+        """Return compact newest-first chapter cards for the Narrative page."""
+        records: list[dict[str, Any]] = []
+        for item in self.recent_daily_narratives(limit):
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            records.append(
+                {
+                    "narrative_id": str(item["entity_id"]),
+                    "local_date": metadata.get("local_date"),
+                    "timezone": metadata.get("timezone"),
+                    "revision": int(metadata.get("revision") or 0),
+                    "confidence": float(metadata.get("confidence") or 0.0),
+                    "abstract_summary": str(metadata.get("abstract_summary") or ""),
+                    "timeline_entries": len(metadata.get("timeline", []))
+                    if isinstance(metadata.get("timeline"), list)
+                    else 0,
+                    "evidence_count": int(
+                        metadata.get("reviewed_evidence_count")
+                        or (
+                            len(metadata.get("source_evidence_ids", []))
+                            if isinstance(metadata.get("source_evidence_ids"), list)
+                            else 0
+                        )
+                    ),
+                    "episode_count": int(
+                        metadata.get("reviewed_episode_count")
+                        or (
+                            len(metadata.get("source_episode_ids", []))
+                            if isinstance(metadata.get("source_episode_ids"), list)
+                            else 0
+                        )
+                    ),
+                    "entity_count": len(metadata.get("source_entity_ids", []))
+                    if isinstance(metadata.get("source_entity_ids"), list)
+                    else 0,
+                    "last_dream_run_id": metadata.get("last_dream_run_id"),
+                    "last_replayed_at": metadata.get("last_replayed_at"),
+                    "updated_at": item.get("updated_at"),
+                }
+            )
+        return records
+
+    def daily_narrative_detail(self, local_date: str) -> dict[str, Any] | None:
+        """Return one chapter with nested periods, episodes, and artifact cards."""
+        narrative_id = f"daily-narrative:{local_date}"
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT entity_id, display_name, updated_at, metadata_json
+                FROM entities WHERE entity_id=? AND entity_type='daily_narrative'
+                AND state='active'""",
+                (narrative_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            narrative = _row(row)
+            metadata = narrative.get("metadata")
+            if not isinstance(metadata, dict):
+                return None
+            evidence_ids = [
+                str(value)
+                for value in metadata.get("source_evidence_ids", [])
+                if value
+            ]
+            episode_ids = [
+                str(value)
+                for value in metadata.get("source_episode_ids", [])
+                if value
+            ]
+            evidence_map: dict[str, dict[str, Any]] = {}
+            for offset in range(0, len(evidence_ids), 800):
+                batch = evidence_ids[offset : offset + 800]
+                placeholders = ",".join("?" for _ in batch)
+                for evidence_row in self._connection.execute(
+                    f"""SELECT evidence_id, modality, captured_at, source_type,
+                    source_id, media_key, quality, payload_json FROM evidence
+                    WHERE evidence_id IN ({placeholders})""",
+                    batch,
+                ).fetchall():
+                    item = _row(evidence_row)
+                    payload = item.pop("payload", {})
+                    item["text"] = self._narrative_evidence_text(
+                        payload if isinstance(payload, dict) else {}
+                    )
+                    if item.get("media_key"):
+                        item["artifact_url"] = (
+                            f"/api/memory/evidence/{item['evidence_id']}/media"
+                        )
+                    evidence_map[str(item["evidence_id"])] = item
+            episode_map: dict[str, dict[str, Any]] = {}
+            for offset in range(0, len(episode_ids), 800):
+                batch = episode_ids[offset : offset + 800]
+                placeholders = ",".join("?" for _ in batch)
+                for episode_row in self._connection.execute(
+                    f"""SELECT episode_id, started_at, ended_at, state, novelty,
+                    summary FROM episodes WHERE episode_id IN ({placeholders})""",
+                    batch,
+                ).fetchall():
+                    episode_map[str(episode_row["episode_id"])] = dict(episode_row)
+        timeline: list[dict[str, Any]] = []
+        for raw_entry in metadata.get("timeline", []):
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            entry["artifacts"] = [
+                evidence_map[evidence_id]
+                for evidence_id in entry.get("evidence_ids", [])
+                if evidence_id in evidence_map
+            ]
+            entry["episodes"] = [
+                episode_map[episode_id]
+                for episode_id in entry.get("episode_ids", [])
+                if episode_id in episode_map
+            ]
+            timeline.append(entry)
+        return {
+            "narrative_id": narrative_id,
+            "display_name": narrative.get("display_name"),
+            "updated_at": narrative.get("updated_at"),
+            "local_date": metadata.get("local_date"),
+            "timezone": metadata.get("timezone"),
+            "revision": int(metadata.get("revision") or 0),
+            "confidence": float(metadata.get("confidence") or 0.0),
+            "abstract_summary": metadata.get("abstract_summary"),
+            "content": metadata.get("content"),
+            "timeline": timeline,
+            "source_entity_ids": metadata.get("source_entity_ids", []),
+            "source_evidence_count": len(evidence_map),
+            "source_episode_count": len(episode_map),
+            "reviewed_evidence_count": int(
+                metadata.get("reviewed_evidence_count") or len(evidence_map)
+            ),
+            "reviewed_episode_count": int(
+                metadata.get("reviewed_episode_count") or len(episode_map)
+            ),
+            "dream_run_ids": metadata.get("dream_run_ids", []),
+            "last_replayed_at": metadata.get("last_replayed_at"),
+        }
+
+    @staticmethod
+    def _narrative_evidence_text(payload: dict[str, Any]) -> str:
+        for key in (
+            "transcript",
+            "text",
+            "summary",
+            "analysis",
+            "candidate_response",
+            "corrected_label",
+        ):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return " ".join(value.split())[:1200]
+        classifications = payload.get("classifications")
+        if isinstance(classifications, list):
+            labels = [
+                str(item.get("label"))
+                for item in classifications
+                if isinstance(item, dict) and item.get("label")
+            ]
+            if labels:
+                return "Audio context: " + ", ".join(labels[:12])
+        labels = payload.get("labels")
+        if isinstance(labels, list) and labels:
+            return "Observed labels: " + ", ".join(map(str, labels[:16]))
+        return ""
+
+    def link_daily_narrative_sources(
+        self,
+        narrative_id: str,
+        evidence_ids: list[str],
+        episode_ids: list[str],
+    ) -> dict[str, int]:
+        """Attach a chapter to its retained artifacts and source episodes in bulk."""
+        evidence = list(dict.fromkeys(str(value) for value in evidence_ids if value))[:2000]
+        episodes = list(dict.fromkeys(str(value) for value in episode_ids if value))[:2000]
+        with self._transaction() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                "INSERT OR IGNORE INTO entity_evidence (entity_id, evidence_id, role) VALUES (?, ?, 'daily-story-source')",
+                [(narrative_id, evidence_id) for evidence_id in evidence],
+            )
+            evidence_links = connection.total_changes - before
+            before = connection.total_changes
+            connection.executemany(
+                """INSERT INTO episode_entities
+                (episode_id, entity_id, role, confidence)
+                VALUES (?, ?, 'chronological-entry', 0.9)
+                ON CONFLICT(episode_id, entity_id, role) DO UPDATE SET
+                confidence=MAX(episode_entities.confidence, excluded.confidence)""",
+                [(episode_id, narrative_id) for episode_id in episodes],
+            )
+            episode_links = connection.total_changes - before
+        return {
+            "evidence_links": evidence_links,
+            "episode_links": episode_links,
+        }
 
     def upsert_derived_edge(
         self,

@@ -336,6 +336,10 @@ class DefaultModeConfig(BaseModel):
     meta_graph_limit: int = Field(default=24, ge=1, le=200)
     entity_summary_limit: int = Field(default=12, ge=1, le=100)
     document_context_characters: int = Field(default=1800, ge=400, le=8000)
+    narrative_timezone: str = "local"
+    narrative_replay_max_days: int = Field(default=30, ge=1, le=3650)
+    narrative_bucket_minutes: int = Field(default=15, ge=1, le=180)
+    narrative_max_entries: int = Field(default=96, ge=8, le=288)
 
 
 class PrivacyConfig(BaseModel):

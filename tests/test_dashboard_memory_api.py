@@ -104,6 +104,8 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
                 "/api/voice/conversation",
                 "/api/dreams",
                 "/api/dreams/run",
+                "/api/memory/narratives",
+                "/api/memory/narratives/{local_date}",
                 "/api/identities/{profile_id}/timeline",
                 "/api/identities/{profile_id}/samples/{sample_id}.jpg",
                 "/api/memory/episodes",
@@ -129,6 +131,11 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'data-page="/graph"' in dashboard.PAGE
     assert 'href="/dreams" data-route="/dreams"' in dashboard.PAGE
     assert 'data-page="/dreams"' in dashboard.PAGE
+    assert 'href="/narrative" data-route="/narrative"' in dashboard.PAGE
+    assert 'data-page="/narrative"' in dashboard.PAGE
+    assert "Latest chronological replay" in dashboard.PAGE
+    assert "loadNarrativeDetail" in dashboard.PAGE
+    assert "narrative-artifacts" in dashboard.PAGE
     assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
     assert 'src="/assets/knowledge_graph.js?v=20260814a"' in dashboard.PAGE
     assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE

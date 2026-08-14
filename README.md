@@ -84,6 +84,8 @@ Quiet-period replay now projects a graph over the graph. Canonical entity pairs 
 
 Four revisioned `cognitive_document` nodes compound over this meta-graph: **World model**, **My story**, **Communication strategy**, and **Reflective working set**. `agent:egg → maintains/guides_communication → document`, `reflection → informs_working_set → document`, and `abstraction → informs_world_model → document` edges keep their provenance visible and clickable. “My story” uses first-person language but explicitly remains a source-grounded, revisable account rather than a claim of subjective experience. The working set is inspectable reflective state, not private chain-of-thought. A bounded slice feeds normal dialogue, fresh visual questions, and proactive visual communication; subsequent spoken, suppressed, corrected, interrupted, modality, and tool outcomes become new evidence for later revisions.
 
+Identity dreams also drive chronological consolidation, even when a pass performs zero identity merges. A lightweight startup replay independently discovers every retained local-calendar day and backdates never-narrated history oldest-first in bounded passes, always refreshing the latest observed day; it repeats until the reported backlog reaches zero. Identity merges additionally rebuild every affected canonical/alias day. Frame-level evidence is coalesced into ordered, configurable time windows carrying people, objects, OCR content, sound events, admitted speech, agent replies, source modalities, episode IDs, and artifact IDs. Each day becomes a revisioned `daily_narrative` node with an evidence-grounded abstract synopsis and explicit `appears_in_day`, `observed_in_day`, `read_in_day`, `heard_in_day`, `precedes_day`, `replays_day`, and `contributes_to_story` synapses. Recurrent within-day co-occurrence is described only as non-causal association. The Dreams audit reports discovered history, chapters backdated, backlog remaining, and the resulting **My story** revision. The in-page Narrative workspace presents days newest-first as a vertical timeline; expanding a day reveals its latest-to-oldest encounter periods, nested episode summaries, people/objects/content/sound tags, and retained image/audio/OCR artifacts. Selecting an orange daily-story node in the graph exposes the same grounded chapter from its associative context.
+
 The architecture draws on four complementary research patterns: observation/retrieval/reflection feedback from [Generative Agents](https://arxiv.org/abs/2304.03442); structural relational generalization from the [Tolman–Eichenbaum Machine](https://doi.org/10.1016/j.cell.2020.10.024); episodic knowledge organized under a working self from the [Self-Memory System](https://doi.org/10.1037/0033-295X.107.2.261); and partner-sensitive terminology from [Lexical Entrainment for Conversational Systems](https://aclanthology.org/2023.findings-emnlp.22/). These are design inspirations, not a claim that Egg implements a biological mind.
 
 ## Temporal person continuity
@@ -97,7 +99,9 @@ Strong mask continuity queues two transparent masked crops for local `robit/orni
 Identity dreams use pinned AdaFace IR18/WebFace4M and InsightFace MobileFaceNet
 checkpoints locally and offline. Bootstrap them explicitly on a new installation; the randomized idle
 scheduler then consolidates profiles and projects their complete evidence history
-without dashboard interaction. The Dreams page is an audit/status view with a
+without dashboard interaction. Every completed pass then performs the dated
+chronological replay and story/meta-graph revision described above, whether or
+not a new alias was created. The Dreams page is an audit/status view with a
 manual trigger only as an optional override:
 
 ```bash

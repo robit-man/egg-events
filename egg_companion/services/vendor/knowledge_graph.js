@@ -12,6 +12,14 @@ const ASSOCIATIVE_RELATIONS = {
   participant: 0.7,
   heard_with: 0.67,
   co_observed_with: 0.62,
+  appears_in_day: 0.91,
+  observed_in_day: 0.86,
+  read_in_day: 0.88,
+  heard_in_day: 0.88,
+  experienced_day: 0.94,
+  replays_day: 0.96,
+  contributes_to_story: 0.93,
+  precedes_day: 0.82,
 };
 const RELATION_GEOMETRY = {
   identity: { angle:0.04, arch:0.14 },
@@ -56,7 +64,7 @@ function relationFamily(relation) {
   if (/alias|label|identity|named|same_as/.test(relation)) return 'identity';
   if (/heard|audio|speech|voice|sound/.test(relation)) return 'audio';
   if (/co[_-]?(observed|present|occur)|shared_context/.test(relation)) return 'co_presence';
-  if (/episode|participant|temporal|before|after|during/.test(relation)) return 'temporal';
+  if (/episode|participant|temporal|before|after|during|day|dream|replay|story|precedes/.test(relation)) return 'temporal';
   if (/reflection|claim|used_for|caused|supports|contradicts/.test(relation)) return 'reflective';
   if (/sighting|observation|evidence|appearance|ocr|content|detected/.test(relation)) return 'observation';
   return 'associative';
@@ -369,7 +377,7 @@ function initCanvasFallback(container) {
   canvas.setAttribute('aria-label', 'Interactive compatibility rendering of the multimodal knowledge graph');
   container.replaceChildren(canvas);
   const context = canvas.getContext('2d', { alpha: false });
-  const colors = { person:'#60a5fa', appearance:'#38bdf8', object:'#34d399', object_category:'#2dd4bf', sound_event:'#ffae00', content:'#ffae00', evidence:'#c084fc', claim:'#fb7185', episode:'#94a3b8', entity:'#22d3ee' };
+  const colors = { person:'#60a5fa', appearance:'#38bdf8', object:'#34d399', object_category:'#2dd4bf', sound_event:'#ffae00', content:'#ffae00', daily_narrative:'#f97316', dream_replay:'#8b5cf6', cognitive:'#06b6d4', evidence:'#c084fc', claim:'#fb7185', episode:'#94a3b8', entity:'#22d3ee' };
   let data = { nodes: [], links: [] }, nodes = [], links = [], selected = null, hovered = null;
   let query = '', kind = '', pixelRatio = 1, width = 1, height = 1;
   let zoom = 1, panX = 0, panY = 0, yaw = 0.22, pitch = -0.12;
@@ -391,6 +399,9 @@ function initCanvasFallback(container) {
     if (subtype.includes('person') || subtype.includes('face')) return colors.person;
     if (subtype.includes('appearance')) return colors.appearance;
     if (subtype.includes('sound')) return colors.sound_event;
+    if (subtype.includes('daily_narrative')) return colors.daily_narrative;
+    if (subtype.includes('dream_replay')) return colors.dream_replay;
+    if (subtype.includes('cognitive_document') || subtype.includes('abstraction') || subtype.includes('reflection')) return colors.cognitive;
     if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
     if (subtype.includes('object')) return colors.object;
     return colors[node.kind] || colors.entity;
@@ -662,6 +673,9 @@ if (container) {
       object_category: 0x2dd4bf,
       sound_event: 0xffae00,
       content: 0xfbbf24,
+      daily_narrative: 0xf97316,
+      dream_replay: 0x8b5cf6,
+      cognitive: 0x06b6d4,
       evidence: 0xc084fc,
       claim: 0xfb7185,
       episode: 0x94a3b8,
@@ -693,6 +707,9 @@ if (container) {
       if (subtype.includes('person') || subtype.includes('face')) return colors.person;
       if (subtype.includes('appearance')) return colors.appearance;
       if (subtype.includes('sound')) return colors.sound_event;
+      if (subtype.includes('daily_narrative')) return colors.daily_narrative;
+      if (subtype.includes('dream_replay')) return colors.dream_replay;
+      if (subtype.includes('cognitive_document') || subtype.includes('abstraction') || subtype.includes('reflection')) return colors.cognitive;
       if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
       if (subtype.includes('object')) return colors.object;
       return colors[node.kind] || colors.entity;

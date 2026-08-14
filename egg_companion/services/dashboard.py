@@ -411,6 +411,27 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             raise web.HTTPConflict(text=str(error)) from error
         return web.json_response(result, headers={"Cache-Control": "no-store"})
 
+    async def narratives_handler(request: web.Request) -> web.Response:
+        try:
+            limit = max(1, min(3650, int(request.query.get("limit", "90"))))
+        except ValueError as error:
+            raise web.HTTPBadRequest(text="limit must be an integer") from error
+        return web.json_response(
+            await asyncio.to_thread(companion().daily_narratives, limit),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def narrative_detail_handler(request: web.Request) -> web.Response:
+        local_date = request.match_info["local_date"]
+        try:
+            datetime.strptime(local_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise web.HTTPBadRequest(text="local_date must be YYYY-MM-DD") from error
+        result = await asyncio.to_thread(companion().daily_narrative, local_date)
+        if result is None:
+            raise web.HTTPNotFound(text="daily narrative not found")
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
     async def memory_entity_handler(request: web.Request) -> web.Response:
         detail = await asyncio.to_thread(
             companion().inspect_memory_entity, request.match_info["entity_id"]
@@ -545,6 +566,10 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app.router.add_post("/api/voice/action", voice_action_handler)
     app.router.add_get("/api/dreams", dreams_handler)
     app.router.add_post("/api/dreams/run", dreams_run_handler)
+    app.router.add_get("/api/memory/narratives", narratives_handler)
+    app.router.add_get(
+        "/api/memory/narratives/{local_date}", narrative_detail_handler
+    )
     app.router.add_get("/api/memory", memory_handler)
     app.router.add_get("/api/memory/episodes", memory_episodes_handler)
     app.router.add_get("/api/memory/claims", memory_claims_handler)

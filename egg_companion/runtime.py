@@ -211,6 +211,7 @@ class CompanionRuntime:
                 logger.exception("cognitive memory unavailable; live sensing remains active")
                 self.telemetry.record_runtime_error("cognitive-memory", error)
         self.dreams = IdentityDreamEngine(config.dreams, self.identities)
+        self._latest_narrative_replay: dict[str, object] | None = None
         self._brain = CognitiveArchitecture(self._attention, self._cognitive_attention, self._memory)
         self._last_greeting: datetime | None = None
         self._latest_observation: Observation | None = None
@@ -380,6 +381,22 @@ class CompanionRuntime:
             ),
             None,
         )
+        latest_details = latest_run.get("details") if latest_run else None
+        run_replay = (
+            latest_details.get("chronological_replay")
+            if isinstance(latest_details, dict)
+            else None
+        )
+        replay = (
+            self._latest_narrative_replay
+            if isinstance(self._latest_narrative_replay, dict)
+            else run_replay
+        )
+        replay_run_id = (
+            str(replay.get("dream_run_id"))
+            if isinstance(replay, dict) and replay.get("dream_run_id")
+            else str(latest_run.get("run_id")) if latest_run else None
+        )
         touched: set[str] = set()
         if latest_run is not None:
             alias_map = {
@@ -400,14 +417,37 @@ class CompanionRuntime:
                 for key in ("left_id", "right_id", "canonical_id", "alias_id"):
                     if candidate.get(key):
                         touched.add(f"entity:{canonical(str(candidate[key]))}")
+        if isinstance(replay, dict):
+            if replay_run_id:
+                touched.add(f"entity:dream-replay:{replay_run_id}")
+            touched.add("entity:cognitive-document:my-story")
+            for chapter in replay.get("daily_narratives", []):
+                if isinstance(chapter, dict) and chapter.get("narrative_id"):
+                    touched.add(f"entity:{chapter['narrative_id']}")
         graph["dream"] = {
             "revision": (
-                f"{latest_run.get('run_id')}:{latest_run.get('completed_at')}"
-                if latest_run else None
+                f"{replay_run_id}:{replay.get('replayed_at')}:"
+                f"{replay.get('story_revision', 0)}:"
+                f"{replay.get('days_replayed', 0)}"
+                if isinstance(replay, dict) else None
             ),
-            "run_id": latest_run.get("run_id") if latest_run else None,
-            "completed_at": latest_run.get("completed_at") if latest_run else None,
+            "run_id": replay_run_id,
+            "completed_at": (
+                replay.get("replayed_at")
+                if isinstance(replay, dict)
+                else latest_run.get("completed_at") if latest_run else None
+            ),
             "merges": int(latest_run.get("merges") or 0) if latest_run else 0,
+            "days_replayed": (
+                int(replay.get("days_replayed", 0))
+                if isinstance(replay, dict)
+                else 0
+            ),
+            "backlog_remaining": (
+                int(replay.get("backlog_remaining", 0))
+                if isinstance(replay, dict)
+                else 0
+            ),
             "touched_node_ids": sorted(touched),
         }
         graph["activations"] = self.telemetry.graph_activation_snapshot()
@@ -416,6 +456,12 @@ class CompanionRuntime:
 
     def graph_node_detail(self, kind: str, source_id: str) -> dict[str, object] | None:
         return self._memory.graph_node_detail(kind, source_id) if self._memory else None
+
+    def daily_narratives(self, limit: int = 90) -> list[dict[str, object]]:
+        return self._memory.daily_narratives(limit) if self._memory else []
+
+    def daily_narrative(self, local_date: str) -> dict[str, object] | None:
+        return self._memory.daily_narrative(local_date) if self._memory else None
 
     def evidence_media(self, evidence_id: str) -> tuple[bytes, str] | None:
         return self._memory.evidence_media(evidence_id) if self._memory else None
@@ -618,6 +664,7 @@ class CompanionRuntime:
             ("ornith-object-labeler", self._auto_label_objects),
             ("advanced-ocr", self._process_ocr_candidates),
             ("object-review-scheduler", self._object_review_scheduler),
+            ("narrative-backfill", self._narrative_backfill_scheduler),
             ("identity-dream-scheduler", self._identity_dream_scheduler),
             ("default-mode-network", self._default_mode_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
@@ -1988,7 +2035,9 @@ class CompanionRuntime:
                 self.telemetry.record_runtime_error("memory-consolidation", error)
 
     def dreams_snapshot(self) -> dict[str, object]:
-        return self.dreams.snapshot()
+        snapshot = self.dreams.snapshot()
+        snapshot["narrative_replay"] = self._latest_narrative_replay
+        return snapshot
 
     async def run_identity_dream(self, requested_by: str = "manual") -> dict[str, object]:
         face_validation: dict[str, int] | None = None
@@ -2025,6 +2074,7 @@ class CompanionRuntime:
         result = await asyncio.to_thread(
             self.dreams.run, conflicts, requested_by
         )
+        result["requested_by"] = requested_by
         if face_validation is not None:
             result["face_validation"] = face_validation
         if self._memory is not None and result.get("aliases"):
@@ -2032,7 +2082,57 @@ class CompanionRuntime:
                 self._memory.store.coalesce_identity_evidence,
                 list(result["aliases"]),
             )
+        if self._memory is not None:
+            try:
+                result["chronological_replay"] = await asyncio.to_thread(
+                    self._memory.dream_narrative_pass, result
+                )
+                self._latest_narrative_replay = result["chronological_replay"]
+            except Exception as error:
+                await asyncio.to_thread(
+                    self.dreams.annotate_run,
+                    str(result.get("run_id") or ""),
+                    {
+                        "chronological_replay": {
+                            "state": "failed",
+                            "error": f"{type(error).__name__}: {error}",
+                        }
+                    },
+                )
+                raise
+            await asyncio.to_thread(
+                self.dreams.annotate_run,
+                str(result.get("run_id") or ""),
+                {"chronological_replay": result["chronological_replay"]},
+            )
         return result
+
+    async def _narrative_backfill_scheduler(self) -> None:
+        """Catch up every retained, never-narrated day independently of faces."""
+        if self._memory is None:
+            await asyncio.Event().wait()
+        await asyncio.sleep(3.0)
+        previous_remaining: int | None = None
+        while True:
+            result = await asyncio.to_thread(
+                self._memory.narrative_backfill_pass, "startup"
+            )
+            self._latest_narrative_replay = result
+            remaining = int(result.get("backlog_remaining") or 0)
+            logger.info(
+                "narrative catch-up replayed %s day(s); %s historical day(s) remain",
+                result.get("days_replayed", 0),
+                remaining,
+            )
+            if remaining <= 0:
+                await asyncio.Event().wait()
+            made_progress = (
+                previous_remaining is None
+                or remaining < previous_remaining
+                or bool(result.get("backfilled_days"))
+            )
+            previous_remaining = remaining
+            await asyncio.sleep(2.0 if made_progress else 300.0)
 
     async def _identity_dream_scheduler(self) -> None:
         if not self.config.dreams.enabled:
