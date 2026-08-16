@@ -4990,14 +4990,17 @@ class CompanionRuntime:
         language = None
         if self.config.omnius.dialogue_router_enabled:
             try:
-                model_language = await self._omnius.reason_about_utterance(
-                    transcript, live_context
+                model_language = await asyncio.wait_for(
+                    self._omnius.reason_about_utterance(transcript, live_context),
+                    timeout=5,
                 )
                 if model_language is not None:
                     language = model_language
-            except Exception as error:
+            except (asyncio.TimeoutError, Exception) as error:
                 logger.warning(
-                    "dialogue routing model unavailable; using local routing: %s", error
+                    "dialogue routing model unavailable (%.1fs); using local routing: %s",
+                    5.0,
+                    error,
                 )
         web_query = self._web_search_query(transcript, language)
         if not self._conversation_turns.can_publish(turn.revision):

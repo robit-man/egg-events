@@ -48,7 +48,17 @@ class OmniusClient:
         self.config = config
         self._conversation: list[dict[str, str]] = []
         self._system_prompt: str = self._DEFAULT_SYSTEM_PROMPT
-        self._model_gate = asyncio.Lock()
+        # Conversational gate: used by chat/reply calls. Background VLM calls
+        # never hold this gate, so a human turn is never blocked by object
+        # classification or person comparison.
+        self._conversational_gate = asyncio.Lock()
+        # Background gate: used by VLM calls (object classification, person
+        # comparison, visual questions). These run when the conversational gate
+        # is free. If speech starts, background tasks cancel via
+        # _background_visual_tasks and release this gate.
+        self._background_gate = asyncio.Lock()
+        # Legacy alias kept for callers not yet migrated.
+        self._model_gate = self._conversational_gate
         # ASR must stay responsive while conversational inference is running;
         # its own gate preserves one-at-a-time transcription ordering without
         # letting an obsolete reply hold ingress behind the chat model.
@@ -2181,7 +2191,7 @@ class OmniusClient:
             "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._model_gate:
+        async with self._background_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat", json=payload
@@ -2240,7 +2250,7 @@ class OmniusClient:
             "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._model_gate:
+        async with self._background_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -2316,7 +2326,7 @@ class OmniusClient:
             "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._model_gate:
+        async with self._background_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -2431,7 +2441,7 @@ class OmniusClient:
             "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._model_gate:
+        async with self._conversational_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat", json=payload
