@@ -397,7 +397,7 @@ class OmniusClient:
             },
             {"role": "system", "content": context},
         ]
-        for turn in (history or [])[-12:]:
+        for turn in (history or [])[-8:]:
             role = "assistant" if turn.get("role") == "agent" else "user"
             text = str(turn.get("text") or "")
             status = str(turn.get("status") or "")
@@ -2843,7 +2843,7 @@ class OmniusClient:
             "tools": False,
             "think": self.config.reasoning_enabled,
             "realtime": True,
-            "realtime_options": {"max_history_messages": 12, "max_tokens": 160},
+            "realtime_options": {"max_history_messages": 8, "max_tokens": 160},
         }
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -2868,5 +2868,5 @@ class OmniusClient:
             if last_user and last_user.get("role") == "user":
                 self._conversation.append(last_user)
             self._conversation.append({"role": "assistant", "content": response})
-            self._conversation = self._conversation[-12:]
+            self._conversation = self._conversation[-8:]
         return response

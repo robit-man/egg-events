@@ -109,7 +109,7 @@ omnius:
   voice_model: supertonic
   voice_name: F4
   bearer_token_env: EGG_OMNIUS_TOKEN
-  timeout_seconds: 120
+  timeout_seconds: 30
   reasoning_enabled: false
   # The realtime model owns tool selection. This is required for visual
   # references to route to ASR-boundary camera evidence without phrase lists.
@@ -267,7 +267,7 @@ memory:
   retrieval_limit: 12
   graph_max_hops: 2
   graph_max_nodes: 80
-  context_max_characters: 5000
+  context_max_characters: 3000
   consolidation_interval_seconds: 300
   consolidation_batch_size: 20
 

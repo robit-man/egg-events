@@ -6441,17 +6441,14 @@ class CompanionRuntime:
             if entity_id
         )
         vision = self._vision
-        query_embedding = (
-            await asyncio.to_thread(vision.embed_text, transcript) if vision is not None else None
-        )
-        graph_signals = await asyncio.to_thread(
-            self._memory.graph_signals, list(entity_ids)
-        )
-        interaction_strategy = await asyncio.to_thread(
-            self._memory.interaction_strategy
-        )
-        social_profiles = await asyncio.to_thread(
-            self._memory.social_profiles, list(entity_ids)
+        query_embedding, graph_signals, interaction_strategy, social_profiles, obs_policy = (
+            await asyncio.gather(
+                asyncio.to_thread(vision.embed_text, transcript) if vision is not None else asyncio.sleep(0, result=None),
+                asyncio.to_thread(self._memory.graph_signals, list(entity_ids)),
+                asyncio.to_thread(self._memory.interaction_strategy),
+                asyncio.to_thread(self._memory.social_profiles, list(entity_ids)),
+                asyncio.to_thread(self._memory.observation_policy),
+            )
         )
         cognitive_state = {
             "visible_graph_signals": {
@@ -6461,9 +6458,7 @@ class CompanionRuntime:
             "default_mode": self.telemetry.snapshot(self.config).get(
                 "default_mode", {}
             ),
-            "observation_policy": await asyncio.to_thread(
-                self._memory.observation_policy
-            ),
+            "observation_policy": obs_policy,
             "interaction_strategy": interaction_strategy,
             "relevant_social_profiles": social_profiles,
         }
