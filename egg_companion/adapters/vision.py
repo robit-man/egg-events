@@ -96,6 +96,8 @@ class VisionEngine:
                 if include_pose
                 else ()
             )
+            all_pose = self._pose_keypoints(pose_results) if include_pose else []
+            all_pose_conf = self._pose_confidence(pose_results) if include_pose else []
             behaviors = self._person_behaviors(pose_results) if include_pose else []
             detections: list[Detection] = []
             for result in results:
@@ -107,6 +109,18 @@ class VisionEngine:
                     attributes = {"frame_shape": [frame_height, frame_width]}
                     if label == "person" and index < len(behaviors) and behaviors[index]:
                         attributes["behavior"] = behaviors[index]
+                    if label == "person" and index < len(all_pose):
+                        pose_kps = all_pose[index]
+                        pose_cf = all_pose_conf[index] if index < len(all_pose_conf) else []
+                        merged = []
+                        for kp_i, kp in enumerate(pose_kps):
+                            conf = pose_cf[kp_i] if kp_i < len(pose_cf) else 0.0
+                            merged.append([
+                                round(kp[0], 4),
+                                round(kp[1], 4),
+                                round(conf, 3),
+                            ])
+                        attributes["pose_keypoints"] = merged
                     if index < len(polygons) and polygons[index] is not None and len(polygons[index]) >= 3:
                         attributes["mask_polygon"] = [
                             [round(float(x), 1), round(float(y), 1)] for x, y in polygons[index].tolist()
@@ -494,6 +508,18 @@ class VisionEngine:
             for person_keypoints in data.cpu().tolist():
                 people.append(person_keypoints)
         return people
+
+    @staticmethod
+    def _pose_confidence(results: Sequence[object]) -> list[list[float]]:
+        people_conf: list[list[float]] = []
+        for result in results:
+            keypoints = getattr(result, "keypoints", None)
+            conf = getattr(keypoints, "conf", None)
+            if conf is None:
+                continue
+            for person_conf in conf.cpu().tolist():
+                people_conf.append(person_conf)
+        return people_conf
 
     def _semantic_labels(self, frame: np.ndarray) -> tuple[str, ...]:
         import cv2

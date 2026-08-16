@@ -660,6 +660,7 @@ class RuntimeTelemetry:
                 "confidence": round(detection.confidence, 3),
                 "bbox": [round(value, 1) for value in (detection.bbox.x1, detection.bbox.y1, detection.bbox.x2, detection.bbox.y2)],
                 "mask_polygon": detection.attributes.get("mask_polygon"),
+                "pose_keypoints": detection.attributes.get("pose_keypoints"),
                 "behavior": detection.attributes.get("behavior"),
                 "identity": detection.attributes.get("identity"),
                 "identity_id": detection.attributes.get("identity_id"),

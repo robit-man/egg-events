@@ -213,6 +213,9 @@ PAGE = r"""<!doctype html>
     .mask-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
     .mask { fill: rgb(37 99 235 / .23); stroke: #7dd3fc; stroke-width: 2; vector-effect: non-scaling-stroke; }
     .mask-label { fill: #fff; font-size: 17px; font-weight: 700; paint-order: stroke; stroke: #101828; stroke-width: 5; stroke-linejoin: round; }
+    .pose-bone { stroke: rgb(250 204 21 / .7); stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linecap: round; }
+    .pose-joint { fill: rgb(239 68 68 / .85); }
+    .pose-joint-label { fill: #fbbf24; font-size: 11px; font-weight: 600; paint-order: stroke; stroke: #0f172a; stroke-width: 3; stroke-linejoin: round; }
     .camera-meta { min-height: 44px; flex-wrap: wrap; color: #d0d5dd; background: #101828; }
 
     .wave { display: block; width: 100%; height: 180px; background: #0b1220; border-radius: 10px; }
@@ -890,15 +893,44 @@ PAGE = r"""<!doctype html>
     function maskSvg(detections, width, height) {
       const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
       svg.setAttribute('class', 'mask-layer'); svg.setAttribute('viewBox', `0 0 ${width} ${height}`); svg.setAttribute('preserveAspectRatio', 'none');
+      const COCO_SKELETON = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+      const COCO_NAMES = ['nose','left_eye','right_eye','left_ear','right_ear','left_shoulder','right_shoulder','left_elbow','right_elbow','left_wrist','right_wrist','left_hip','right_hip','left_knee','right_knee','left_ankle','right_ankle'];
       for (const detection of detections) {
         const polygon = detection.mask_polygon;
-        if (!Array.isArray(polygon) || polygon.length < 3) continue;
-        const points = polygon.map(point => [Number(point[0]), Number(point[1])]).filter(point => point.every(Number.isFinite));
-        if (points.length < 3) continue;
-        const path = document.createElementNS(svg.namespaceURI, 'path'); path.setAttribute('class', 'mask'); path.setAttribute('d', `M ${points.map(point => point.join(' ')).join(' L ')} Z`); svg.append(path);
-        const anchor = points.reduce((current, point) => point[1] < current[1] ? point : current, points[0]);
-        const text = document.createElementNS(svg.namespaceURI, 'text'); text.setAttribute('class', 'mask-label'); text.setAttribute('x', String(anchor[0])); text.setAttribute('y', String(Math.max(18, anchor[1] - 6)));
-        text.textContent = `${detection.identity || detection.label || 'object'} ${Math.round(Number(detection.identity_confidence ?? detection.confidence ?? 0) * 100)}%${detection.behavior ? ` · ${detection.behavior}` : ''}`; svg.append(text);
+        if (Array.isArray(polygon) && polygon.length >= 3) {
+          const points = polygon.map(point => [Number(point[0]), Number(point[1])]).filter(point => point.every(Number.isFinite));
+          if (points.length >= 3) {
+            const path = document.createElementNS(svg.namespaceURI, 'path'); path.setAttribute('class', 'mask'); path.setAttribute('d', `M ${points.map(point => point.join(' ')).join(' L ')} Z`); svg.append(path);
+            const anchor = points.reduce((current, point) => point[1] < current[1] ? point : current, points[0]);
+            const text = document.createElementNS(svg.namespaceURI, 'text'); text.setAttribute('class', 'mask-label'); text.setAttribute('x', String(anchor[0])); text.setAttribute('y', String(Math.max(18, anchor[1] - 6)));
+            text.textContent = `${detection.identity || detection.label || 'object'} ${Math.round(Number(detection.identity_confidence ?? detection.confidence ?? 0) * 100)}%${detection.behavior ? ` · ${detection.behavior}` : ''}`; svg.append(text);
+          }
+        }
+        const kps = detection.pose_keypoints;
+        if (!Array.isArray(kps) || kps.length < 17) continue;
+        const valid = kps.map(kp => kp && kp.length >= 3 && kp[0] > 0 && kp[1] > 0 && kp[2] > 0.25);
+        for (const [a, b] of COCO_SKELETON) {
+          if (!valid[a] || !valid[b]) continue;
+          const line = document.createElementNS(svg.namespaceURI, 'line');
+          line.setAttribute('class', 'pose-bone');
+          line.setAttribute('x1', String(kps[a][0] * width)); line.setAttribute('y1', String(kps[a][1] * height));
+          line.setAttribute('x2', String(kps[b][0] * width)); line.setAttribute('y2', String(kps[b][1] * height));
+          svg.append(line);
+        }
+        for (let i = 0; i < 17; i++) {
+          if (!valid[i]) continue;
+          const cx = kps[i][0] * width, cy = kps[i][1] * height;
+          const r = (i === 0 || i === 9 || i === 10) ? 6 : 4;
+          const circle = document.createElementNS(svg.namespaceURI, 'circle');
+          circle.setAttribute('class', 'pose-joint'); circle.setAttribute('cx', String(cx)); circle.setAttribute('cy', String(cy)); circle.setAttribute('r', String(r));
+          svg.append(circle);
+          if (i === 0 || i === 9 || i === 10) {
+            const label = document.createElementNS(svg.namespaceURI, 'text');
+            label.setAttribute('class', 'pose-joint-label');
+            label.setAttribute('x', String(cx + 8)); label.setAttribute('y', String(cy - 6));
+            label.textContent = COCO_NAMES[i]; svg.append(label);
+          }
+        }
       }
       return svg;
     }
