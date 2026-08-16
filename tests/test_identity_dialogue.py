@@ -49,6 +49,27 @@ def test_stable_unnamed_face_is_asked_once_only_after_audible_publication() -> N
         runtime = CompanionRuntime(_config())
         spoken: list[str] = []
 
+        runtime.identities = SimpleNamespace(
+            profile_record=lambda profile_id: {
+                "profile_id": profile_id,
+                "first_seen": datetime.now(timezone.utc),
+                "last_seen": datetime.now(timezone.utc),
+                "sightings": 3,
+                "samples": 3,
+                "last_camera": "front",
+            }
+        )
+
+        async def compose(*args, **kwargs):
+            return {
+                "speak": True,
+                "question": "Hi—what would you like me to call you?",
+                "reason": "A natural introduction is appropriate.",
+                "confidence": 0.9,
+            }
+
+        runtime._omnius.compose_identity_question = compose  # type: ignore[method-assign]
+
         async def speak(text: str, expected_revision: int | None = None) -> bool:
             spoken.append(text)
             return True
@@ -57,7 +78,7 @@ def test_stable_unnamed_face_is_asked_once_only_after_audible_publication() -> N
 
         assert await runtime._maybe_ask_identity_name(_unnamed_target())
         assert not await runtime._maybe_ask_identity_name(_unnamed_target())
-        assert spoken == ["I don't think we've met yet. What should I call you?"]
+        assert spoken == ["Hi—what would you like me to call you?"]
         snapshot = runtime.telemetry.snapshot(runtime.config)
         assert snapshot["identity_dialogue"]["state"] == "awaiting_name"
         assert snapshot["identity_dialogue"]["profile_id"] == "person-specific"
@@ -68,6 +89,27 @@ def test_stable_unnamed_face_is_asked_once_only_after_audible_publication() -> N
 def test_failed_question_publication_does_not_consume_the_profile() -> None:
     async def scenario() -> None:
         runtime = CompanionRuntime(_config())
+
+        runtime.identities = SimpleNamespace(
+            profile_record=lambda profile_id: {
+                "profile_id": profile_id,
+                "first_seen": datetime.now(timezone.utc),
+                "last_seen": datetime.now(timezone.utc),
+                "sightings": 3,
+                "samples": 3,
+                "last_camera": "front",
+            }
+        )
+
+        async def compose(*args, **kwargs):
+            return {
+                "speak": True,
+                "question": "Would you tell me what you prefer to be called?",
+                "reason": "A grounded introduction is appropriate.",
+                "confidence": 0.9,
+            }
+
+        runtime._omnius.compose_identity_question = compose  # type: ignore[method-assign]
 
         async def cannot_speak(text: str, expected_revision: int | None = None) -> bool:
             return False
@@ -138,8 +180,12 @@ def test_name_binding_uses_exact_profile_and_acknowledges_with_name() -> None:
             spoken.append((text, expected_revision))
             return True
 
+        async def acknowledge(*args, **kwargs) -> str:
+            return "Got it, Troy—I'll remember that."
+
         runtime.identities = Identities()  # type: ignore[assignment]
         runtime._speak = speak  # type: ignore[method-assign]
+        runtime._omnius.compose_identity_acknowledgement = acknowledge  # type: ignore[method-assign]
         runtime._pending_identity_name = _PendingIdentityQuestion(
             "person-prompted", "front", datetime.now(timezone.utc), float("inf")
         )
@@ -148,7 +194,7 @@ def test_name_binding_uses_exact_profile_and_acknowledges_with_name() -> None:
             "person-prompted", "Troy", "Troy", 7, "front"
         )
         assert named == [("person-prompted", "Troy")]
-        assert spoken == [("Nice to meet you, Troy.", 7)]
+        assert spoken == [("Got it, Troy—I'll remember that.", 7)]
         assert runtime._pending_identity_name is None
         identity_state = runtime.telemetry.snapshot(runtime.config)["identity_dialogue"]
         assert identity_state["state"] == "named"
@@ -157,23 +203,74 @@ def test_name_binding_uses_exact_profile_and_acknowledges_with_name() -> None:
     asyncio.run(scenario())
 
 
-def test_explicit_web_search_phrase_has_deterministic_tool_fallback() -> None:
+def test_web_search_requires_model_authored_tool_route() -> None:
     assert CompanionRuntime._web_search_query(
         "Please search the web for the latest Jetson release", None
-    ) == "Please search the web for the latest Jetson release"
+    ) is None
     assert CompanionRuntime._web_search_query("How are you?", None) is None
     assert CompanionRuntime._web_search_query(
         "anything", {"tool": "web_search", "tool_query": "current local weather"}
     ) == "current local weather"
 
 
-def test_local_realtime_router_and_deictic_vision_intent_need_no_llm() -> None:
-    route = CompanionRuntime._local_language_route("Where am I holding?")
-    assert route["directed"] is True
-    assert route["tool"] == "none"
-    assert CompanionRuntime._is_visual_question("Where am I holding?")
-    assert CompanionRuntime._is_visual_question("What is this in my hand?")
-    assert not CompanionRuntime._is_visual_question("Tell me the current weather")
+def test_visual_turn_uses_frames_frozen_at_utterance_boundary() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_config())
+        runtime.config.omnius.dialogue_router_enabled = True
+        frozen = np.full((64, 64, 3), 40, dtype=np.uint8)
+        replacement = np.full((64, 64, 3), 220, dtype=np.uint8)
+        boundary = time.monotonic()
+        runtime._latest_frames = {"front": (frozen, boundary)}
+        snapshot = runtime._capture_turn_visual_snapshot("heard-vision", boundary)
+        runtime._latest_frames["front"] = (replacement, time.monotonic())
+        received: list[tuple[str, bytes, str]] = []
+        spoken: list[str] = []
+
+        async def route(utterance: str, context: str):
+            assert "ASR-boundary=" in context
+            return {
+                "directed": True,
+                "act": "question",
+                "confidence": 0.99,
+                "tool": "vision",
+                "tool_query": utterance,
+            }
+
+        async def answer(frames, utterance: str, scene: str):
+            received.extend(frames)
+            return {
+                "answer": "You are holding a dark object.",
+                "grounded": True,
+                "confidence": 0.9,
+                "supporting_camera_ids": ["front"],
+                "observations": ["A dark object is visible."],
+                "uncertainty": None,
+            }
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.reason_about_utterance = route  # type: ignore[method-assign]
+        runtime._omnius.answer_visual_question_analysis = answer  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "What am I holding?",
+            utterance_id="heard-vision",
+            started_at=boundary - 0.5,
+            ended_at=boundary,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert snapshot.frames[0].frame.mean() == 40
+        assert [item[0] for item in received] == ["front"]
+        assert spoken == ["You are holding a dark object."]
+
+    import time
+    import numpy as np
+
+    asyncio.run(scenario())
 
 
 def test_model_authored_question_requires_and_addresses_named_visible_person() -> None:
@@ -188,6 +285,16 @@ def test_model_authored_question_requires_and_addresses_named_visible_person() -
             return True
 
         runtime._speak = speak  # type: ignore[method-assign]
+
+        async def compose_curiosity(candidate, visible_people, scene, history, strategy):
+            return {
+                "speak": True,
+                "question": "Cole, what do you use that keyboard for?",
+                "reason": "The grounded unresolved relationship is relevant now.",
+                "confidence": 0.9,
+            }
+
+        runtime._omnius.compose_curiosity_question = compose_curiosity  # type: ignore[method-assign]
         now = datetime.now(timezone.utc)
         object_detection = Detection(
             "keyboard", 0.95, BoundingBox(0, 0, 50, 50), {"object_id": "object-1"}
@@ -228,7 +335,7 @@ def test_model_authored_question_requires_and_addresses_named_visible_person() -
         )
         assert await runtime._maybe_ask_default_mode_question(result)
         assert spoken == [
-            "Cole, I've seen the keyboard a few times. What do you use it for?"
+            "Cole, what do you use that keyboard for?"
         ]
 
     asyncio.run(scenario())

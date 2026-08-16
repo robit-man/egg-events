@@ -16,7 +16,7 @@ class MemoryGovernance:
     def snapshot(self) -> dict[str, object]:
         return {
             "stats": self.store.memory_stats(),
-            "entities": self.store.list_entities(limit=24),
+            "entities": self.store.list_entity_summaries(limit=24),
             "episodes": self.store.recent_episodes(limit=12),
             "jobs": self.store.list_jobs(limit=12),
             "claim_conflicts": self.store.conflicting_claims(limit=12),

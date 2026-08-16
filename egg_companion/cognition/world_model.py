@@ -1108,7 +1108,7 @@ class WorldModelSynthesizer:
         heard = self._clean_text(
             payload.get("transcript") or payload.get("input_transcript"), 800
         )
-        if heard and self._is_known_silence_hallucination(heard):
+        if payload.get("admitted") is False:
             heard = ""
         response = self._clean_text(payload.get("candidate_response"), 800)
         spoken = payload.get("spoken") is not False
@@ -1249,11 +1249,7 @@ class WorldModelSynthesizer:
             return []
         results: list[str] = []
         transcript = self._clean_text(payload.get("transcript"), 260)
-        if (
-            transcript
-            and payload.get("admitted") is not False
-            and not self._is_known_silence_hallucination(transcript)
-        ):
+        if transcript and payload.get("admitted") is not False:
             results.append(f'Heard: “{transcript}”')
         response = self._clean_text(payload.get("candidate_response"), 260)
         if response and payload.get("spoken") is not False:
@@ -1283,30 +1279,6 @@ class WorldModelSynthesizer:
             if labels:
                 results.append("Audio context: " + ", ".join(labels[:8]))
         return self._unique(results)[:8]
-
-    @staticmethod
-    def _is_known_silence_hallucination(text: str) -> bool:
-        """Keep rejected Whisper outro artifacts out of derived narratives.
-
-        Historical evidence remains authoritative and inspectable.  This mirrors
-        ingress admission for older rows that predate the live ASR guard.
-        """
-        normalized = " ".join(
-            "".join(
-                character if character.isalnum() or character.isspace() else " "
-                for character in text.casefold()
-            ).split()
-        )
-        words = normalized.split()
-        return len(words) <= 10 and any(
-            phrase in normalized
-            for phrase in (
-                "thanks for watching",
-                "thank you for watching",
-                "thank you so much for watching",
-                "ご視聴ありがとうございました",
-            )
-        )
 
     @classmethod
     def _add_narrative_observation(

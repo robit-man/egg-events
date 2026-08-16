@@ -28,7 +28,8 @@ class EntityResolver:
             entity_type = descriptor.get("type")
             if not isinstance(entity_id, str) or not entity_id or entity_type not in {
                 "person", "face_observation", "appearance_track", "object", "object_category",
-                "content", "sound_event"
+                "content", "sound_event", "interaction_state", "interaction_strategy",
+                "social_profile",
             }:
                 continue
             confidence = self._bounded_confidence(descriptor.get("confidence"))
@@ -37,7 +38,7 @@ class EntityResolver:
                 display_name = None
             metadata = {
                 key: value for key, value in descriptor.items()
-                if key not in {"id", "type", "label", "confidence"} and self._json_scalar(value)
+                if key not in {"id", "type", "label", "confidence"} and self._json_value(value)
             }
             self.store.upsert_entity(entity_type, display_name, metadata, entity_id, now=event.occurred_at)
             if display_name:
@@ -105,8 +106,20 @@ class EntityResolver:
             "review_state": str(profile.get("review_state") or "pending"),
             "label_provenance": profile.get("label_provenance")
             if isinstance(profile.get("label_provenance"), dict) else {},
+            "appearance_description": profile.get("appearance_description"),
+            "adjudication_history": profile.get("adjudication_history")
+            if isinstance(profile.get("adjudication_history"), list) else [],
+            "merged_into": profile.get("merged_into"),
         }
-        self.store.upsert_entity("object", label, metadata, profile_id, now=last_seen)
+        rejected = metadata["review_state"] == "rejected"
+        self.store.upsert_entity(
+            "object",
+            label,
+            metadata,
+            profile_id,
+            state="retracted" if rejected else "active",
+            now=last_seen,
+        )
         history = profile.get("label_history")
         if isinstance(history, list):
             for index, previous in enumerate(history):
@@ -124,6 +137,15 @@ class EntityResolver:
             profile_id, state="active", limit=self.configured_claim_limit()
         ):
             predicate = claim["predicate"]
+            if rejected and predicate in {"has_label", "has_alias", "has_appearance"}:
+                self.store.revise_claim(
+                    str(claim["claim_id"]),
+                    "retract",
+                    "ornith-vlm",
+                    evidence_id=evidence_id,
+                    at=last_seen,
+                )
+                continue
             stale_automatic_alias = (
                 predicate == "has_alias" and claim.get("source") != "user"
             )
@@ -135,12 +157,26 @@ class EntityResolver:
                     str(claim["claim_id"]), "correct", label_source, label,
                     evidence_id, last_seen,
                 )
+        if rejected:
+            return profile_id
         self.store.assert_claim_once(
             profile_id, "has_label", label,
             self._bounded_confidence(profile.get("label_confidence")), last_seen,
             source=label_source, evidence_id=evidence_id,
             metadata={"review_state": metadata["review_state"]},
         )
+        appearance = profile.get("appearance_description")
+        if isinstance(appearance, str) and appearance.strip():
+            self.store.assert_claim_once(
+                profile_id,
+                "has_appearance",
+                " ".join(appearance.split())[:600],
+                self._bounded_confidence(profile.get("label_confidence")),
+                last_seen,
+                source=label_source,
+                evidence_id=evidence_id,
+                metadata={"pixel_grounded": label_source == "ornith-vlm"},
+            )
         embedding = profile.get("embedding")
         if isinstance(embedding, np.ndarray):
             self.store.add_embedding(
@@ -173,5 +209,19 @@ class EntityResolver:
         raise TypeError(f"expected datetime, received {type(value).__name__}")
 
     @staticmethod
-    def _json_scalar(value: Any) -> bool:
-        return value is None or isinstance(value, (str, int, float, bool))
+    def _json_value(value: Any, depth: int = 0) -> bool:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return True
+        if depth >= 4:
+            return False
+        if isinstance(value, (list, tuple)):
+            return len(value) <= 32 and all(
+                EntityResolver._json_value(item, depth + 1) for item in value
+            )
+        if isinstance(value, dict):
+            return len(value) <= 32 and all(
+                isinstance(key, str)
+                and EntityResolver._json_value(item, depth + 1)
+                for key, item in value.items()
+            )
+        return False

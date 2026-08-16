@@ -39,6 +39,49 @@ def _row(row: sqlite3.Row) -> dict[str, Any]:
     return result
 
 
+class _ThreadLocalReadPool:
+    """One query-only WAL reader per worker thread.
+
+    A single read connection still serializes a long historical replay query
+    with tiny dashboard lookups. Thread-local readers preserve SQLite's
+    snapshot isolation without creating that application-level queue.
+    """
+
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
+
+    def __enter__(self) -> _ThreadLocalReadPool:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def _reader(self) -> sqlite3.Connection:
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                self.database_path, check_same_thread=False, timeout=2
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            self._local.connection = connection
+            with self._connections_lock:
+                self._connections.append(connection)
+        return connection
+
+    def execute(self, *args: object, **kwargs: object) -> sqlite3.Cursor:
+        return self._reader().execute(*args, **kwargs)
+
+    def close(self) -> None:
+        with self._connections_lock:
+            connections, self._connections = self._connections, []
+        for connection in connections:
+            connection.close()
+
+
 class MemoryStore:
     NARRATIVE_SEMANTIC_CONTRACT_REVISION = 1
     """Process-safe, append-first SQLite property graph for local Egg memory."""
@@ -50,11 +93,21 @@ class MemoryStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.root / "memory.sqlite3", check_same_thread=False)
+        database_path = self.root / "memory.sqlite3"
+        self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         migrate(self._connection)
+        # Dashboard/retrieval reads must not queue behind the high-rate
+        # append-first perceptual writer. WAL gives this query-only connection
+        # a consistent snapshot while the writer continues committing.
+        self._read_connection = _ThreadLocalReadPool(database_path)
+        # Existing read sections use this context manager to make their
+        # connection lifetime explicit; the pool itself supplies isolation.
+        self._read_lock = self._read_connection
 
     def close(self) -> None:
+        with self._read_lock:
+            self._read_connection.close()
         with self._lock:
             self._connection.close()
 
@@ -386,6 +439,99 @@ class MemoryStore:
             "episode_links_copied": copied_episodes,
         }
 
+    def coalesce_object_evidence(
+        self, aliases: list[dict[str, object]]
+    ) -> dict[str, int]:
+        """Project VLA-confirmed physical-object aliases into the graph."""
+
+        linked = copied_evidence = copied_episodes = 0
+        now = _timestamp(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            for mapping in aliases:
+                alias_id = str(mapping.get("alias_id") or "")
+                canonical_id = str(mapping.get("canonical_id") or "")
+                if not alias_id or not canonical_id or alias_id == canonical_id:
+                    continue
+                entities = connection.execute(
+                    "SELECT entity_id, entity_type FROM entities WHERE entity_id IN (?, ?)",
+                    (alias_id, canonical_id),
+                ).fetchall()
+                if len(entities) != 2 or any(
+                    str(row["entity_type"]) != "object" for row in entities
+                ):
+                    continue
+                try:
+                    similarity = max(
+                        0.0, min(1.0, float(mapping.get("similarity") or 0.0))
+                    )
+                except (TypeError, ValueError):
+                    similarity = 0.0
+                reason = str(
+                    mapping.get("reason") or "ornith_same_physical_object"
+                )
+                alias_row = connection.execute(
+                    "SELECT metadata_json FROM entities WHERE entity_id=?",
+                    (alias_id,),
+                ).fetchone()
+                metadata = json.loads(alias_row["metadata_json"]) if alias_row else {}
+                metadata.update(
+                    {
+                        "canonical_object_id": canonical_id,
+                        "coalesced_similarity": round(similarity, 6),
+                        "coalescing_reason": reason,
+                        "adjudication": mapping.get("adjudication"),
+                    }
+                )
+                connection.execute(
+                    "UPDATE entities SET merged_into=?, updated_at=?, metadata_json=? WHERE entity_id=?",
+                    (canonical_id, now, json.dumps(metadata, sort_keys=True), alias_id),
+                )
+                edge_id = f"object-alias:{alias_id}:{canonical_id}"
+                connection.execute(
+                    """INSERT INTO edges
+                    (edge_id, source_id, relation, target_id, confidence, valid_from, state, metadata_json)
+                    VALUES (?, ?, 'same_object_as', ?, ?, ?, 'active', ?)
+                    ON CONFLICT(edge_id) DO UPDATE SET confidence=excluded.confidence,
+                    state='active', metadata_json=excluded.metadata_json""",
+                    (
+                        edge_id,
+                        alias_id,
+                        canonical_id,
+                        similarity,
+                        now,
+                        json.dumps(
+                            {
+                                "reason": reason,
+                                "reversible": True,
+                                "adjudication": mapping.get("adjudication"),
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                before = connection.total_changes
+                connection.execute(
+                    """INSERT OR IGNORE INTO entity_evidence (entity_id, evidence_id, role)
+                    SELECT ?, evidence_id, role FROM entity_evidence WHERE entity_id=?""",
+                    (canonical_id, alias_id),
+                )
+                copied_evidence += connection.total_changes - before
+                before = connection.total_changes
+                connection.execute(
+                    """INSERT INTO episode_entities (episode_id, entity_id, role, confidence)
+                    SELECT episode_id, ?, role, confidence FROM episode_entities WHERE entity_id=?
+                    ON CONFLICT(episode_id, entity_id, role) DO UPDATE SET
+                    confidence=MAX(episode_entities.confidence, excluded.confidence)""",
+                    (canonical_id, alias_id),
+                )
+                copied_episodes += connection.total_changes - before
+                linked += 1
+        return {
+            "aliases": linked,
+            "evidence_links_copied": copied_evidence,
+            "episode_links_copied": copied_episodes,
+        }
+
     def link_entities(
         self, source_id: str, relation: str, target_id: str, confidence: float, valid_from: datetime,
         metadata: dict[str, Any] | None = None, edge_id: str | None = None, evidence_id: str | None = None,
@@ -534,8 +680,8 @@ class MemoryStore:
 
     def recent_episodes(self, limit: int | None = None) -> list[dict[str, Any]]:
         limit = limit or self.config.retrieval_limit
-        with self._lock:
-            rows = self._connection.execute(
+        with self._read_lock:
+            rows = self._read_connection.execute(
                 "SELECT * FROM episodes ORDER BY started_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [_row(row) for row in rows]
@@ -585,8 +731,8 @@ class MemoryStore:
         its configured local timezone, which also discovers days crossing a
         timezone boundary without loading every evidence timestamp into Python.
         """
-        with self._lock:
-            rows = self._connection.execute(
+        with self._read_lock:
+            rows = self._read_connection.execute(
                 """SELECT MIN(captured_at) AS first_at,
                 MAX(captured_at) AS last_at
                 FROM evidence
@@ -703,6 +849,49 @@ class MemoryStore:
                 f"SELECT * FROM entities WHERE {' AND '.join(where)} ORDER BY updated_at DESC LIMIT ?", values
             ).fetchall()
         return [_row(row) for row in rows]
+
+    def list_entity_summaries(
+        self, entity_type: str | None = None, state: str = "active", limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return dashboard rows without embedding full narrative documents.
+
+        Entity details remain available from the inspector endpoint. A daily
+        narrative can carry hundreds of kilobytes of source provenance, and
+        repeating that document in the one-second state feed made ordinary UI
+        refreshes contend with live perception.
+        """
+        limit = min(limit or self.config.retrieval_limit, self.config.graph_max_nodes)
+        where = ["state=?"]
+        values: list[Any] = [state]
+        if entity_type:
+            where.append("entity_type=?")
+            values.append(entity_type)
+        values.append(limit)
+        with self._read_lock:
+            rows = self._read_connection.execute(
+                f"""SELECT entity_id, entity_type, display_name, state, created_at,
+                updated_at, merged_into FROM entities WHERE {' AND '.join(where)}
+                ORDER BY updated_at DESC LIMIT ?""",
+                values,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def entity_metadata(self, entity_id: str) -> dict[str, Any] | None:
+        """Read one entity's compact metadata without contending with ingestion."""
+        with self._read_lock:
+            row = self._read_connection.execute(
+                """SELECT entity_id, entity_type, display_name, state, updated_at,
+                metadata_json FROM entities WHERE entity_id=?""",
+                (entity_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["metadata"] = json.loads(str(result.pop("metadata_json") or "{}"))
+        except json.JSONDecodeError:
+            result["metadata"] = {}
+        return result
 
     def cognitive_signals(
         self, entity_ids: list[str]
@@ -1891,40 +2080,40 @@ class MemoryStore:
         claim_limit = min(500, max(50, entity_limit // 3))
         episode_limit = min(200, max(25, entity_limit // 8))
         link_limit = min(6000, entity_limit * 6)
-        with self._lock:
-            entities = self._connection.execute(
+        with self._read_lock:
+            entities = self._read_connection.execute(
                 """SELECT * FROM entities WHERE state='active' AND merged_into IS NULL
                 ORDER BY updated_at DESC LIMIT ?""",
                 (entity_limit,),
             ).fetchall()
-            evidence = self._connection.execute(
+            evidence = self._read_connection.execute(
                 "SELECT * FROM evidence ORDER BY captured_at DESC LIMIT ?",
                 (evidence_limit,),
             ).fetchall()
-            claims = self._connection.execute(
+            claims = self._read_connection.execute(
                 "SELECT * FROM claims WHERE state='active' ORDER BY created_at DESC LIMIT ?",
                 (claim_limit,),
             ).fetchall()
-            episodes = self._connection.execute(
+            episodes = self._read_connection.execute(
                 "SELECT * FROM episodes ORDER BY started_at DESC LIMIT ?",
                 (episode_limit,),
             ).fetchall()
-            edges = self._connection.execute(
+            edges = self._read_connection.execute(
                 "SELECT * FROM edges WHERE state='active' ORDER BY confidence DESC LIMIT ?",
                 (link_limit,),
             ).fetchall()
-            entity_evidence = self._connection.execute(
+            entity_evidence = self._read_connection.execute(
                 """SELECT ee.entity_id, ee.evidence_id, ee.role
                 FROM entity_evidence ee JOIN evidence ev ON ev.evidence_id=ee.evidence_id
                 ORDER BY ev.captured_at DESC LIMIT ?""",
                 (link_limit,),
             ).fetchall()
-            episode_entities = self._connection.execute(
+            episode_entities = self._read_connection.execute(
                 """SELECT episode_id, entity_id, role, confidence
                 FROM episode_entities ORDER BY rowid DESC LIMIT ?""",
                 (link_limit,),
             ).fetchall()
-            episode_evidence = self._connection.execute(
+            episode_evidence = self._read_connection.execute(
                 """SELECT episode_id, evidence_id, role
                 FROM episode_evidence ORDER BY rowid DESC LIMIT ?""",
                 (link_limit,),
@@ -1952,7 +2141,9 @@ class MemoryStore:
                     "subtype": item["entity_type"],
                     "label": label,
                     "updated_at": item.get("updated_at"),
-                    "metadata": item.get("metadata", {}),
+                    "metadata": self._graph_entity_metadata(
+                        item.get("metadata", {})
+                    ),
                 }
             )
         for item in evidence_records:
@@ -1970,7 +2161,7 @@ class MemoryStore:
                     "label": str(label)[:120],
                     "confidence": item.get("quality", 0.0),
                     "updated_at": item.get("captured_at"),
-                    "metadata": payload,
+                    "metadata": self._graph_evidence_metadata(payload),
                 }
             )
         for item in claim_records:
@@ -2076,6 +2267,49 @@ class MemoryStore:
             "node_limit": entity_limit,
         }
 
+    @staticmethod
+    def _graph_entity_metadata(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        # Layout and labels need compact semantic identity, not the complete
+        # document. Clicking a node retrieves the authoritative full record.
+        keys = (
+            "document_kind", "revision", "local_date", "abstract_summary",
+            "confidence", "epistemic_status", "source", "source_system",
+            "source_profile_id", "identity_kind", "review_state", "label_source",
+            "context_id", "time_local", "revisable", "canonical_identity_id",
+            "canonical_object_id", "merged_into",
+        )
+        result: dict[str, object] = {}
+        for key in keys:
+            if key not in value:
+                continue
+            item = value.get(key)
+            if isinstance(item, str):
+                result[key] = item[:500]
+            elif isinstance(item, (int, float, bool)) or item is None:
+                result[key] = item
+        return result
+
+    @staticmethod
+    def _graph_evidence_metadata(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        keys = (
+            "context_id", "utterance_id", "camera_id", "model_id", "grounded",
+            "spoken", "admitted", "review_state", "label_state", "source_type",
+        )
+        result: dict[str, object] = {}
+        for key in keys:
+            if key not in value:
+                continue
+            item = value.get(key)
+            if isinstance(item, str):
+                result[key] = item[:300]
+            elif isinstance(item, (int, float, bool)) or item is None:
+                result[key] = item
+        return result
+
     def search_evidence(self, terms: list[str], limit: int | None = None) -> list[dict[str, Any]]:
         normalized = [term.casefold().strip() for term in terms if term.strip()]
         if not normalized:
@@ -2083,8 +2317,8 @@ class MemoryStore:
         clauses = ["LOWER(payload_json) LIKE ?" for _ in normalized]
         values: list[Any] = [f"%{term}%" for term in normalized]
         values.append(limit or self.config.retrieval_limit)
-        with self._lock:
-            rows = self._connection.execute(
+        with self._read_lock:
+            rows = self._read_connection.execute(
                 f"SELECT * FROM evidence WHERE {' OR '.join(clauses)} ORDER BY captured_at DESC LIMIT ?", values
             ).fetchall()
         return [_row(row) for row in rows]
@@ -2097,8 +2331,8 @@ class MemoryStore:
         enrich an existing turn instead of manufacturing duplicate messages.
         """
         bounded_limit = max(1, min(int(limit), 20000))
-        with self._lock:
-            rows = self._connection.execute(
+        with self._read_lock:
+            rows = self._read_connection.execute(
                 """SELECT * FROM (
                     SELECT evidence_id, modality, captured_at, payload_json
                     FROM evidence
@@ -2119,7 +2353,7 @@ class MemoryStore:
                 for offset in range(0, len(evidence_ids), 800):
                     batch = evidence_ids[offset : offset + 800]
                     placeholders = ",".join("?" for _ in batch)
-                    linked = self._connection.execute(
+                    linked = self._read_connection.execute(
                         f"""SELECT entity_evidence.evidence_id, entity_evidence.role,
                         entities.entity_id, entities.entity_type, entities.display_name
                         FROM entity_evidence JOIN entities
@@ -2395,8 +2629,8 @@ class MemoryStore:
             )
 
     def conflicting_claims(self, limit: int = 20) -> list[dict[str, Any]]:
-        with self._lock:
-            groups = self._connection.execute(
+        with self._read_lock:
+            groups = self._read_connection.execute(
                 """SELECT subject_id, predicate, COUNT(DISTINCT object_id_or_text) AS values_count
                 FROM claims WHERE state='active' GROUP BY subject_id, predicate
                 HAVING values_count > 1 ORDER BY values_count DESC LIMIT ?""", (limit,)
@@ -2431,9 +2665,9 @@ class MemoryStore:
         return len(evidence_ids)
 
     def memory_stats(self) -> dict[str, int]:
-        with self._lock:
+        with self._read_lock:
             return {
-                table: int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                table: int(self._read_connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in (
                     "entities", "episodes", "claims", "edges", "evidence", "embeddings", "revisions", "jobs"
                 )
@@ -2526,8 +2760,8 @@ class MemoryStore:
             where = "WHERE state=?"
             values.append(state)
         values.append(limit)
-        with self._lock:
-            rows = self._connection.execute(
+        with self._read_lock:
+            rows = self._read_connection.execute(
                 f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ?", values
             ).fetchall()
         return [_row(row) for row in rows]

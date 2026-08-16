@@ -45,9 +45,13 @@ def test_ornith_correction_and_clip_recall_survive_restart(tmp_path: Path) -> No
     assert recalled[0].label_source == "ornith-vlm"
     assert recalled[1] >= config.similarity_threshold
     assert reopened.snapshot()[0]["label_history"][0]["label"] == "wrong base label"
+    summary = reopened.summary_snapshot()[0]
+    assert summary["appearance_description"] == ""
+    assert summary["label_history_count"] == 1
+    assert "adjudication_history" not in summary
 
 
-def test_clip_recall_bypasses_ornith_vlm() -> None:
+def test_clip_recall_is_only_a_proposal_until_ornith_confirms_pixels() -> None:
     async def scenario() -> None:
         config = EggConfig.model_validate(
             {
@@ -61,25 +65,59 @@ def test_clip_recall_bypasses_ornith_vlm() -> None:
             label_source="ornith-vlm",
             samples=3,
             label_provenance={"model_id": "ornith-test"},
+            appearance_description="a ceramic mug with a dark handle",
         )
 
         class RecallOnlyLibrary:
+            confirmed = 0
+
             @staticmethod
             def match(candidate, vision):
                 return profile, 0.96
 
-        class ForbiddenVlm:
+            @staticmethod
+            def thumbnail(profile_id):
+                return b"prior-png"
+
+            @staticmethod
+            def profile_record(profile_id):
+                return {
+                    "profile_id": profile_id,
+                    "label": "ceramic mug",
+                    "appearance_description": "a ceramic mug with a dark handle",
+                    "samples": 3,
+                    "review_state": "vlm_verified",
+                }
+
+            @classmethod
+            def confirm_match(cls, profile_id, label, candidate, vision, confidence, **kwargs):
+                cls.confirmed += 1
+                return profile
+
+        class ConfirmingVlm:
             calls = 0
 
-            async def classify_masked_object(self, image, label, confidence):
+            async def compare_masked_object_candidate(self, *args):
                 self.calls += 1
-                raise AssertionError("Ornith must not run after local CLIP recall")
+                return {
+                    "object_present": True,
+                    "same_instance": True,
+                    "confidence": 0.95,
+                    "label": "ceramic mug",
+                    "appearance_description": "a ceramic mug with a dark handle",
+                    "detector_supported": True,
+                    "analysis": "The distinctive handle and body agree.",
+                    "visible_correspondences": ["dark handle"],
+                    "visible_conflicts": [],
+                    "visible_text": False,
+                    "text_regions": [],
+                }
 
         runtime = CompanionRuntime.__new__(CompanionRuntime)
         runtime.config = config
         runtime.objects = RecallOnlyLibrary()
         runtime._vision = object()
-        runtime._omnius = ForbiddenVlm()
+        runtime._omnius = ConfirmingVlm()
         runtime.telemetry = RuntimeTelemetry(config)
         runtime._brain = CognitiveArchitecture(
             AttentionManager(track_ttl_seconds=10, min_priority=0.1),
@@ -91,13 +129,21 @@ def test_clip_recall_bypasses_ornith_vlm() -> None:
         runtime._object_recalls = {}
         runtime._last_vlm_at = 0.0
         runtime._last_valid_speech_at = 0.0
+        runtime._memory = None
+        runtime._background_visual_tasks = set()
+        runtime._sync_object_profile = lambda profile_id: asyncio.sleep(0)  # type: ignore[method-assign]
+        runtime._queue_object_adjudication_memory = lambda *args: None  # type: ignore[method-assign]
+        runtime._run_advanced_ocr = lambda image: asyncio.sleep(0, result=None)  # type: ignore[method-assign]
+        runtime._vision = SimpleNamespace(
+            encode_segmented_object=lambda candidate, max_size: b"current-png"
+        )
         detection = Detection("cup", 0.55, BoundingBox(0, 0, 40, 40))
         await runtime._object_candidates.put(("camera-0", detection, segmented(), "fingerprint", 0))
 
         task = asyncio.create_task(runtime._auto_label_objects())
         try:
             async def recalled() -> None:
-                while runtime.telemetry.snapshot(config)["object_learning"]["clip_recalls"] < 1:
+                while RecallOnlyLibrary.confirmed < 1:
                     await asyncio.sleep(0.01)
 
             await asyncio.wait_for(recalled(), timeout=1)
@@ -105,7 +151,8 @@ def test_clip_recall_bypasses_ornith_vlm() -> None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-        assert runtime._omnius.calls == 0
+        assert runtime._omnius.calls == 1
+        assert RecallOnlyLibrary.confirmed == 1
         assert runtime._object_recalls["camera-0"][0]["profile_id"] == "object-001"
 
     asyncio.run(scenario())
@@ -154,7 +201,7 @@ class _SweepLibrary:
     def mark_audited(self, profile_id: str, audit_state: str, notes: str | None) -> None:
         self.audited.append((profile_id, audit_state, notes))
 
-    def relabel(self, profile_id, label, confidence, source, model_id, provenance=None):
+    def relabel(self, profile_id, label, confidence, source, model_id, provenance=None, **kwargs):
         self.relabeled.append((profile_id, label, confidence))
         return SimpleNamespace(profile_id=profile_id, label=label)
 
@@ -178,7 +225,7 @@ def _sweep_runtime(config: EggConfig, library: _SweepLibrary, omnius) -> Compani
     return runtime
 
 
-def test_sweep_skips_vlm_when_audit_reports_consistent() -> None:
+def test_sweep_never_lets_text_only_audit_skip_pixel_review() -> None:
     async def scenario() -> None:
         config = EggConfig.model_validate(
             {
@@ -192,17 +239,17 @@ def test_sweep_skips_vlm_when_audit_reports_consistent() -> None:
                 return {"consistent": True, "confidence": 0.9, "reason": "history is stable"}
 
             async def classify_masked_object(self, image, label, confidence):
-                raise AssertionError("VLM must not run when the audit reports consistent")
+                return "ceramic mug", 0.95
 
         library = _SweepLibrary(due=[("object-001", "mug", 0.5)])
         runtime = _sweep_runtime(config, library, ConsistentAuditOmnius())
 
         await runtime._sweep_object_reviews()
 
-        assert library.audited == [("object-001", "consistent", "history is stable")]
-        assert library.relabeled == []
+        assert library.audited == []
+        assert library.relabeled == [("object-001", "ceramic mug", 0.95)]
         snapshot = runtime.telemetry.snapshot(config)["object_learning"]
-        assert snapshot["audit_consistent"] == 1
+        assert snapshot["audit_consistent"] == 0
         assert snapshot["audit_flagged"] == 0
         assert snapshot["review_queue_depth"] == 1
 
@@ -236,7 +283,7 @@ def test_sweep_falls_back_to_vlm_when_audit_flags_or_fails() -> None:
         assert library.audited == []
         assert library.relabeled == [("object-001", "ceramic mug", 0.95)]
         snapshot = runtime.telemetry.snapshot(config)["object_learning"]
-        assert snapshot["audit_flagged"] == 1
+        assert snapshot["audit_flagged"] == 0
         assert snapshot["audit_consistent"] == 0
 
     asyncio.run(scenario())

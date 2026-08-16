@@ -48,7 +48,7 @@ def test_dual_whisper_rejects_weak_disagreement() -> None:
     assert agreement < 0.22
 
 
-def test_fast_silence_hallucination_is_rejected() -> None:
+def test_legitimately_spoken_phrase_is_not_semantically_blacklisted() -> None:
     assert SERVER.rejection_reason(
         _result("Thanks for watching!", -0.1, 0.01)
-    ) == "known silence hallucination"
+    ) is None

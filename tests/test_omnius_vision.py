@@ -381,6 +381,149 @@ def test_dialogue_router_preserves_web_search_tool_contract() -> None:
     asyncio.run(scenario())
 
 
+def test_dialogue_router_can_select_live_vision_without_phrase_rules() -> None:
+    async def scenario() -> None:
+        client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+        async def structured(prompt: str, **kwargs) -> str:
+            return (
+                '{"directed":true,"act":"question","confidence":0.99,'
+                '"tool":"vision","tool_query":"inspect the presently indicated item"}'
+            )
+
+        client._structured_chat = structured  # type: ignore[method-assign]
+        result = await client.reason_about_utterance("Could you check this?", "scene")
+        assert result is not None
+        assert result["tool"] == "vision"
+        assert result["tool_query"] == "inspect the presently indicated item"
+
+    asyncio.run(scenario())
+
+
+def test_visual_question_packs_all_frozen_views_into_one_labeled_contact_sheet(
+    monkeypatch,
+) -> None:
+    from io import BytesIO
+    from PIL import Image
+
+    requests = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "answer": "A current object is visible.",
+                            "grounded": True,
+                            "confidence": 0.9,
+                            "supporting_camera_ids": ["front"],
+                            "observations": ["The front tile contains the object."],
+                            "uncertainty": None,
+                        }
+                    )
+                }
+            }
+
+    class Session:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return Response()
+
+    image = BytesIO()
+    Image.new("RGB", (640, 480), "orange").save(image, format="JPEG")
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    result = asyncio.run(
+        client.answer_visual_question_analysis(
+            [
+                ("front", image.getvalue(), "2026-01-01T00:00:00+00:00"),
+                ("side", image.getvalue(), "2026-01-01T00:00:00+00:00"),
+            ],
+            "What is here?",
+            "two current views",
+        )
+    )
+
+    assert result is not None and result["supporting_camera_ids"] == ["front"]
+    content = requests[0][1]["json"]["messages"][0]["content"]
+    assert "row 1, column 1" in content and "row 1, column 2" in content
+    assert len(requests[0][1]["json"]["messages"][0]["images"]) == 1
+
+
+def test_social_reflection_requires_revisable_evidence_bound_contract() -> None:
+    payload = json.dumps(
+        {
+            "momentary_affect": {
+                "label": "frustrated but engaged",
+                "valence": -0.45,
+                "arousal": 0.72,
+                "confidence": 0.78,
+                "evidence": "The speaker directly criticizes the delayed reply.",
+            },
+            "communicative_behavior": {
+                "summary": "The speaker gives direct corrective feedback.",
+                "confidence": 0.91,
+                "evidence": "The utterance names the failure and requests a change.",
+            },
+            "relationship_update": {
+                "summary": "This turn supplies a preference for rapid grounded answers.",
+                "confidence": 0.8,
+                "evidence": "The correction explicitly contrasts delay with the desired behavior.",
+            },
+            "response_feedback": {
+                "summary": "The prior response was too slow and insufficiently visual.",
+                "confidence": 0.88,
+                "evidence": "The speaker reports both defects in the current turn.",
+            },
+            "strategy_revision": {
+                "directive": "Prioritize current sensor evidence and answer directly before elaborating.",
+                "rationale": "Explicit feedback favored fast grounded replies.",
+                "confidence": 0.86,
+            },
+            "profile_updates": [
+                {
+                    "subject_id": "person-001",
+                    "summary": "Directly communicates desired system behavior.",
+                    "sentiment_trajectory": "Frustration in this turn remains engagement with the task.",
+                    "communication_patterns": ["Provides concrete corrective feedback."],
+                    "interaction_preferences": ["Explicitly requested rapid grounded answers."],
+                    "uncertainties": ["No evidence yet that this preference generalizes."],
+                    "confidence": 0.81,
+                    "evidence": "The current utterance explicitly requests the change.",
+                }
+            ],
+        }
+    )
+
+    parsed = OmniusClient.parse_social_reflection(payload)
+
+    assert parsed is not None
+    assert parsed["strategy_revision"]["directive"].startswith("Prioritize")
+    assert parsed["profile_updates"][0]["subject_id"] == "person-001"
+    assert OmniusClient.parse_social_reflection(
+        payload.replace('"confidence": 0.78', '"confidence": 1.8', 1)
+    ) is None
+
+
 def test_narrative_dream_contracts_are_strict_and_model_owned() -> None:
     async def scenario() -> None:
         client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
@@ -609,35 +752,33 @@ def test_asr_grounding_falls_back_to_text_repetition_when_engine_omits_quality_m
     assert OmniusClient.transcription_rejection_reason(real_sentence) is None
 
 
-def test_asr_grounding_rejects_backend_silence_artifact_without_quality_metadata() -> None:
-    artifact = {
+def test_asr_grounding_does_not_blacklist_legitimately_spoken_phrases() -> None:
+    spoken = {
         "text": "Thank you for watching!",
-        "segments": [{"id": 0, "start": 0, "end": 2, "text": "Thank you for watching!"}],
+        "segments": [
+            {
+                "id": 0,
+                "start": 0,
+                "end": 2,
+                "text": "Thank you for watching!",
+                "avg_logprob": -0.1,
+                "no_speech_prob": 0.01,
+                "compression_ratio": 1.1,
+            }
+        ],
     }
 
-    assert OmniusClient.transcription_rejection_reason(artifact) == "known silence hallucination"
+    assert OmniusClient.transcription_rejection_reason(spoken) is None
 
-    no_segments = {"text": "Thanks for watching!", "segments": []}
-    assert OmniusClient.transcription_rejection_reason(no_segments) == (
-        "known silence hallucination"
-    )
 
-    repeated = {"text": "Thanks for watching. Thanks for watching."}
-    assert OmniusClient.transcription_rejection_reason(repeated) == (
-        "known silence hallucination"
-    )
-
-    translated_artifact = {
-        "text": "ご視聴ありがとうございました",
-        "segments": [{"id": 0, "start": 0, "end": 12, "text": "ご視聴ありがとうございました"}],
+def test_asr_grounding_honors_backend_acoustic_rejection() -> None:
+    rejected = {
+        "text": "Thank you for watching!",
+        "rejection_reason": "dual Whisper disagreement on weak base decode",
     }
-    assert OmniusClient.transcription_rejection_reason(translated_artifact) == (
-        "known silence hallucination"
-    )
 
-    embellished_artifact = {"text": "Oh, thanks for watching!"}
-    assert OmniusClient.transcription_rejection_reason(embellished_artifact) == (
-        "known silence hallucination"
+    assert OmniusClient.transcription_rejection_reason(rejected) == (
+        "dual Whisper disagreement on weak base decode"
     )
 
 

@@ -152,6 +152,9 @@ class OmniusConfig(BaseModel):
     # full serial generation before every reply.
     reasoning_enabled: bool = False
     dialogue_router_enabled: bool = False
+    visual_snapshot_max_age_seconds: float = Field(default=2.5, gt=0, le=15)
+    visual_snapshot_max_cameras: int = Field(default=4, ge=1, le=16)
+    visual_contact_sheet_size: int = Field(default=768, ge=512, le=1536)
 
 
 class SystemServiceConfig(BaseModel):
@@ -176,6 +179,22 @@ class AttentionConfig(BaseModel):
     identity_question_min_sightings: int = Field(default=1, ge=1, le=100)
     identity_question_timeout_seconds: float = Field(default=300, gt=0, le=3600)
     identity_question_cooldown_seconds: float = Field(default=120, ge=0, le=86400)
+
+
+class ActivityConfig(BaseModel):
+    """Novelty/presence/sound-driven falloff for perception frequency.
+
+    Inference (detection, pose, semantics, OCR) runs at its full configured
+    rate while the room holds activity, and decays toward an idle floor after
+    `decay_seconds` of a genuinely empty, silent scene -- the same way a quiet
+    room needs less visual/auditory vigilance than a busy one. Any new
+    novelty, presence, or speech snaps the rate back to full immediately.
+    """
+
+    enabled: bool = True
+    idle_floor: float = Field(default=0.15, ge=0.02, le=1.0)
+    decay_seconds: float = Field(default=20.0, gt=0, le=600)
+    novelty_threshold: float = Field(default=0.12, ge=0, le=1)
 
 
 class IdentityConfig(BaseModel):
@@ -245,6 +264,7 @@ class ObjectLearningConfig(BaseModel):
     storage_dir: str = "data/object-library"
     similarity_threshold: float = Field(default=0.86, ge=0, le=1)
     auto_label_enabled: bool = True
+    adjudication_queue_size: int = Field(default=12, ge=1, le=64)
     auto_label_confidence_threshold: float = Field(default=0.68, ge=0, le=1)
     auto_label_min_confidence: float = Field(default=0.70, ge=0, le=1)
     auto_label_cooldown_seconds: float = Field(default=6, gt=0, le=600)
@@ -259,6 +279,8 @@ class ObjectLearningConfig(BaseModel):
     review_stale_after_seconds: float = Field(default=21600, gt=0, le=604800)
     confidence_audit_enabled: bool = True
     confidence_audit_batch_size: int = Field(default=5, ge=1, le=50)
+    duplicate_proposal_similarity: float = Field(default=0.94, ge=0, le=1)
+    duplicate_adjudication_batch_size: int = Field(default=1, ge=0, le=8)
 
 
 class OcrConfig(BaseModel):
@@ -339,6 +361,15 @@ class DefaultModeConfig(BaseModel):
     narrative_max_entries: int = Field(default=96, ge=8, le=288)
 
 
+class SocialCognitionConfig(BaseModel):
+    """Evidence-bound conversational affect and interaction reflection."""
+
+    enabled: bool = True
+    queue_size: int = Field(default=8, ge=1, le=64)
+    history_turns: int = Field(default=24, ge=4, le=200)
+    profile_context_characters: int = Field(default=1800, ge=400, le=8000)
+
+
 class PrivacyConfig(BaseModel):
     persistent_identity_enabled: bool = True
     profile_retention_days: int = Field(default=30, ge=0, le=3650)
@@ -366,6 +397,7 @@ class EggConfig(BaseModel):
     omnius: OmniusConfig
     system_service: SystemServiceConfig | None = None
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
+    activity: ActivityConfig = Field(default_factory=ActivityConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     dreams: DreamsConfig = Field(default_factory=DreamsConfig)
     object_learning: ObjectLearningConfig = Field(default_factory=ObjectLearningConfig)
@@ -374,6 +406,9 @@ class EggConfig(BaseModel):
     event_segmentation: EventSegmentationConfig = Field(default_factory=EventSegmentationConfig)
     cognitive_attention: CognitiveAttentionConfig = Field(default_factory=CognitiveAttentionConfig)
     default_mode: DefaultModeConfig = Field(default_factory=DefaultModeConfig)
+    social_cognition: SocialCognitionConfig = Field(
+        default_factory=SocialCognitionConfig
+    )
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 

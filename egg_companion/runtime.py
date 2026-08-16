@@ -31,8 +31,9 @@ from egg_companion.adapters.system_service import SystemServiceClient
 from egg_companion.adapters.vision import SegmentedObject, VisionEngine
 from egg_companion.cognition.architecture import CognitiveArchitecture
 from egg_companion.cognition.conversation import AudioTurn, ConversationTurnController
-from egg_companion.cognition.dialogue import DialogueClassifier, DialogueEvidence
+from egg_companion.cognition.dialogue import DialogueDecision
 from egg_companion.config import EggConfig
+from egg_companion.core.activity import ActivityGovernor
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
 from egg_companion.memory.pipeline import MemoryPipeline
@@ -48,6 +49,10 @@ from egg_companion.services.object_library import ObjectLibrary
 logger = logging.getLogger(__name__)
 
 
+class _BackgroundVisionPreempted(Exception):
+    """A low-priority Ornith job yielded to live human speech."""
+
+
 @dataclass(frozen=True)
 class _SpeechSegment:
     utterance_id: str
@@ -60,6 +65,22 @@ class _SpeechSegment:
 
 
 @dataclass(frozen=True)
+class _TurnVisualFrame:
+    camera_id: str
+    captured_at: datetime
+    captured_monotonic: float
+    frame: np.ndarray
+    observation: Observation | None
+
+
+@dataclass(frozen=True)
+class _TurnVisualSnapshot:
+    utterance_id: str
+    boundary_at: datetime
+    frames: tuple[_TurnVisualFrame, ...]
+
+
+@dataclass(frozen=True)
 class _AudioComprehensionJob:
     context_id: str
     audio: bytes
@@ -68,6 +89,21 @@ class _AudioComprehensionJob:
     entities: tuple[dict[str, object], ...]
     media_key: str | None = None
     media_checksum: str | None = None
+
+
+@dataclass(frozen=True)
+class _SocialReflectionJob:
+    context_id: str
+    transcript: str
+    response: str
+    spoken: bool
+    reason: str
+    captured_at: datetime
+    visible_entity_ids: tuple[str, ...]
+    visible_person_ids: tuple[str, ...]
+    history: tuple[dict[str, object], ...]
+    acoustic: dict[str, object]
+    audio_semantics: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -138,11 +174,11 @@ class CompanionRuntime:
             min_priority=config.attention.min_priority,
             max_targets=config.attention.max_targets,
         )
+        self._activity = ActivityGovernor(config.activity)
         self._cognitive_attention = CognitiveAttentionController(
             config.cognitive_attention, config.attention.proactive_speech_enabled
         )
         self._interaction_policy = InteractionPolicy()
-        self._dialogue = DialogueClassifier()
         self._direction = ReSpeakerDirection(config.audio)
         self._capture = ReSpeakerCapture(
             config.audio,
@@ -175,6 +211,9 @@ class CompanionRuntime:
         self._audio_comprehension_jobs: asyncio.Queue[_AudioComprehensionJob] = (
             asyncio.Queue(config.audio_comprehension.queue_size)
         )
+        self._social_reflection_jobs: asyncio.Queue[_SocialReflectionJob] = (
+            asyncio.Queue(config.social_cognition.queue_size)
+        )
         self._utterances: asyncio.Queue[AudioTurn] = asyncio.Queue(
             config.runtime.reasoning_queue_size
         )
@@ -182,7 +221,7 @@ class CompanionRuntime:
         self._perceptual_buffer = PerceptualBuffer(config.memory)
         self._object_candidates: asyncio.Queue[
             tuple[str, Detection, SegmentedObject, str, int]
-        ] = asyncio.Queue(maxsize=4)
+        ] = asyncio.Queue(maxsize=config.object_learning.adjudication_queue_size)
         self._ocr_candidates: asyncio.Queue[_OcrCandidate] = asyncio.Queue(
             maxsize=config.ocr.queue_size
         )
@@ -207,6 +246,20 @@ class CompanionRuntime:
                         "coalesced %s identity fragments into canonical people (%s evidence links)",
                         coalescing["aliases"], coalescing["evidence_links_copied"],
                     )
+                object_aliases = [
+                    {
+                        "alias_id": str(profile["profile_id"]),
+                        "canonical_id": str(profile["merged_into"]),
+                        "similarity": float(
+                            profile.get("label_confidence") or 0.0
+                        ),
+                        "reason": "persisted_ornith_object_coalescing",
+                    }
+                    for profile in self.objects.migration_profiles()
+                    if profile.get("merged_into")
+                ]
+                if object_aliases:
+                    memory_store.coalesce_object_evidence(object_aliases)
                 self._memory = MemoryPipeline(config, memory_store)
             except Exception as error:
                 logger.exception("cognitive memory unavailable; live sensing remains active")
@@ -232,6 +285,9 @@ class CompanionRuntime:
         self._latest_frame: np.ndarray | None = None
         self._latest_frames: dict[str, tuple[np.ndarray, float]] = {}
         self._latest_observations: dict[str, Observation] = {}
+        self._turn_visual_snapshots: dict[str, _TurnVisualSnapshot] = {}
+        self._turn_acoustic_context: dict[str, dict[str, object]] = {}
+        self._background_visual_tasks: set[asyncio.Future] = set()
         self._last_object_candidate_at = 0.0
         self._last_vlm_at = 0.0
         self._object_recall_lock = threading.Lock()
@@ -240,7 +296,10 @@ class CompanionRuntime:
         self._identity_name_questions: set[str] = set()
         self._pending_identity_name: _PendingIdentityQuestion | None = None
         self._last_identity_question_at = 0.0
-        self._last_valid_speech_at = 0.0
+        # Startup is activity: give cameras, voice transport, and the dashboard
+        # one complete quiet-window before any heavyweight dream inference.
+        # Persisted narrative work remains queued and is not lost.
+        self._last_valid_speech_at = time.monotonic()
         self._object_candidate_tracks: dict[str, list[dict[str, object]]] = {}
         self._last_ocr_candidate_at: dict[str, float] = {}
         self._ocr_mask_tracks: dict[str, list[dict[str, object]]] = {}
@@ -677,6 +736,10 @@ class CompanionRuntime:
             component_specs.append(
                 ("audio-comprehension", self._process_audio_comprehension)
             )
+        if self.config.social_cognition.enabled:
+            component_specs.append(
+                ("social-reflection", self._process_social_reflections)
+            )
         if self.config.identity.temporal_vlm_comparison_enabled:
             component_specs.append(
                 ("temporal-person-vlm", self._process_person_comparisons)
@@ -863,7 +926,10 @@ class CompanionRuntime:
                             latest_observation = observation
                             self._latest_observation = observation
                             self._latest_observations[observation.camera_id] = observation
-                            self._queue_vision_memory(observation, frame)
+                            asyncio.create_task(
+                                self._queue_vision_memory(observation, frame.copy()),
+                                name=f"vision-memory:{observation.camera_id}",
+                            )
                             asyncio.create_task(self._queue_object_candidate(frame.copy(), observation), name="object-candidate")
                             asyncio.create_task(
                                 self._queue_ocr_candidates(frame.copy(), observation),
@@ -885,10 +951,15 @@ class CompanionRuntime:
                     if vision is not None and analysis_task is None and now >= next_analysis_at:
                         include_pose = now >= next_pose_at
                         include_semantics = now >= next_semantic_at
+                        alertness = self._activity.scale(now)
                         if include_pose:
-                            next_pose_at = now + 1 / self.config.vision.pose_fps
+                            next_pose_at = now + 1 / self._activity.scaled_fps(
+                                self.config.vision.pose_fps, now
+                            )
                         if include_semantics:
-                            next_semantic_at = now + 1 / self.config.vision.semantic_fps
+                            next_semantic_at = now + 1 / self._activity.scaled_fps(
+                                self.config.vision.semantic_fps, now
+                            )
                         analysis_task = asyncio.create_task(
                             asyncio.to_thread(
                                 self._analyze,
@@ -899,7 +970,10 @@ class CompanionRuntime:
                             ),
                             name=f"vision-analysis:{camera.config.id}",
                         )
-                        next_analysis_at = now + 1 / self.config.vision.analysis_fps
+                        next_analysis_at = now + 1 / self._activity.scaled_fps(
+                            self.config.vision.analysis_fps, now
+                        )
+                        self.telemetry.record_activity(alertness, camera.config.id)
                     if now >= next_preview_at:
                         raw_frame = await asyncio.to_thread(self._encode_frame, frame)
                         self.telemetry.record_frame(camera.config.id, raw_frame, frame.shape, fps)
@@ -1219,6 +1293,9 @@ class CompanionRuntime:
             observation = await self._observations.get()
             tick = self._brain.perceive(observation)
             self.telemetry.record_brain_tick(tick)
+            self._activity.note_visual(
+                tick.novelty, bool(observation.detections), time.monotonic()
+            )
             for target, decision in tick.decisions:
                 await self._handle_target(target, decision, observation)
 
@@ -1256,6 +1333,7 @@ class CompanionRuntime:
                     self._capture.last_speech_ratio,
                     self._capture.last_speech_ms,
                 )
+                self._activity.note_audio(self._capture.last_speech_detected, now)
                 next_vad_preview_at = now + 0.1
                 preview_buffer = preview_buffer[-self.config.audio.sample_rate:]
             try:
@@ -1342,6 +1420,9 @@ class CompanionRuntime:
                     self._conversation_turns.reject_audio_input()
                     self._record_voice_transition("speech_ingress_rejected")
                     continue
+                self._capture_turn_visual_snapshot(
+                    utterance_id, boundary.at_monotonic
+                )
                 self._speech_segments.put_nowait(
                     _SpeechSegment(
                         utterance_id=utterance_id,
@@ -1370,6 +1451,18 @@ class CompanionRuntime:
                 )
 
     async def _on_utterance_started(self, started_at: float) -> None:
+        # Human speech owns both local inference backends from acoustic onset.
+        # Releasing the shared Omnius gate here, rather than after transcription,
+        # prevents a dream pass from adding its full generation time to a live
+        # turn. The schedulers retain their source ledger and retry when quiet.
+        self._last_valid_speech_at = started_at
+        for task in tuple(self._background_visual_tasks):
+            if not task.done():
+                task.cancel()
+        semantic_task = self._active_narrative_semantic_task
+        if semantic_task is not None and not semantic_task.done():
+            self._narrative_yield_to_speech = True
+            semantic_task.cancel()
         await asyncio.to_thread(self._direction.try_set_led_state, "listen")
         barge = self._conversation_turns.speech_started(started_at)
         barge_id = barge.barge_id if barge else None
@@ -1433,6 +1526,23 @@ class CompanionRuntime:
             self._record_voice_transition("barge_tail_interrupted")
             return False
 
+    async def _run_background_visual(self, awaitable):
+        task = asyncio.ensure_future(awaitable)
+        tasks = getattr(self, "_background_visual_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._background_visual_tasks = tasks
+        tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            parent = asyncio.current_task()
+            if parent is not None and parent.cancelling():
+                raise
+            raise _BackgroundVisionPreempted from None
+        finally:
+            tasks.discard(task)
+
     async def _process_speech(self) -> None:
         while True:
             segment = await self._speech_segments.get()
@@ -1461,6 +1571,7 @@ class CompanionRuntime:
                 self._record_voice_transition("asr_failed")
                 continue
             if not transcript:
+                self._turn_visual_snapshots.pop(segment.utterance_id, None)
                 metadata = dict(self._omnius.last_transcription_metadata)
                 metadata["boundary"] = segment.boundary
                 self.telemetry.record_asr_rejection(
@@ -1482,6 +1593,15 @@ class CompanionRuntime:
                 "barge_id": segment.barge_id,
                 "boundary": segment.boundary,
             }
+            self._turn_acoustic_context[segment.utterance_id] = {
+                **segment.acoustic,
+                "boundary": dict(segment.boundary),
+                "asr": dict(self._omnius.last_transcription_metadata),
+            }
+            while len(self._turn_acoustic_context) > 64:
+                self._turn_acoustic_context.pop(
+                    next(iter(self._turn_acoustic_context))
+                )
             self.telemetry.record_transcript(transcript, transcript_metadata)
             self._perceptual_buffer.append_audio(
                 BufferedMediaRef(
@@ -1742,7 +1862,7 @@ class CompanionRuntime:
             )
         )
 
-    def _queue_vision_memory(
+    async def _queue_vision_memory(
         self, observation: Observation, frame: np.ndarray | None = None
     ) -> None:
         if self._memory is None:
@@ -1759,6 +1879,11 @@ class CompanionRuntime:
                 },
                 "identity_id": detection.attributes.get("identity_id"),
                 "object_id": detection.attributes.get("object_id"),
+                "label_state": (
+                    "vla_adjudicated"
+                    if detection.attributes.get("object_id")
+                    else "detector_hypothesis"
+                ),
                 "behavior": detection.attributes.get("behavior"),
             }
             for detection in observation.detections
@@ -1817,14 +1942,18 @@ class CompanionRuntime:
             and self.config.memory.retain_raw_media
             and time.monotonic() - last_media_at >= 5.0
         ):
+            # Reserve this camera's bounded persistence slot before yielding;
+            # otherwise adjacent inference completions can all schedule a copy.
+            self._last_visual_evidence_at[observation.camera_id] = time.monotonic()
             try:
-                encoded = self._encode_frame(frame)
+                encoded = await asyncio.to_thread(self._encode_frame, frame)
                 relative_key = (
                     f"vision/{observation.timestamp:%Y/%m/%d}/"
                     f"{observation.camera_id}-{event_id}.jpg"
                 )
-                media_key, media_checksum = self._memory.persist_media(relative_key, encoded)
-                self._last_visual_evidence_at[observation.camera_id] = time.monotonic()
+                media_key, media_checksum = await asyncio.to_thread(
+                    self._memory.persist_media, relative_key, encoded
+                )
             except Exception as error:
                 logger.warning("visual evidence artifact could not be retained: %s", error)
         evidence = EvidenceRef(
@@ -2046,6 +2175,42 @@ class CompanionRuntime:
         snapshot = self.dreams.snapshot()
         snapshot["narrative_replay"] = self._latest_narrative_replay
         return snapshot
+
+    def dreams_summary_snapshot(self) -> dict[str, object]:
+        snapshot = self.dreams.snapshot()
+        replay = self._latest_narrative_replay
+        return {
+            "enabled": snapshot.get("enabled"),
+            "state": snapshot.get("state"),
+            "active_run_id": snapshot.get("active_run_id"),
+            "next_scheduled_at": snapshot.get("next_scheduled_at"),
+            "model": snapshot.get("model", {}),
+            "policy": snapshot.get("policy", {}),
+            "runs": [
+                {
+                    key: run.get(key)
+                    for key in (
+                        "run_id", "requested_by", "state", "model_id", "model_revision",
+                        "started_at", "completed_at", "duration_seconds", "profiles_examined",
+                        "samples_embedded", "proposals", "merges", "conflicts_blocked", "error",
+                    )
+                }
+                for run in snapshot.get("runs", [])[:12]
+                if isinstance(run, dict)
+            ],
+            "candidate_count": len(snapshot.get("candidates", [])),
+            "narrative_replay": (
+                {
+                    key: replay.get(key)
+                    for key in (
+                        "dream_run_id", "replayed_at", "days_replayed",
+                        "backlog_remaining", "story_revision",
+                    )
+                }
+                if isinstance(replay, dict)
+                else None
+            ),
+        }
 
     async def run_identity_dream(self, requested_by: str = "manual") -> dict[str, object]:
         face_validation: dict[str, int] | None = None
@@ -2671,8 +2836,31 @@ class CompanionRuntime:
         if selected is None:
             return False
         candidate, subject_id, deduplication_key = selected
-        question = " ".join(str(candidate["summary"]).split())
-        question = f"{visible_preferred_names[0]}, {question}"
+        interaction_strategy = (
+            await asyncio.to_thread(self._memory.interaction_strategy)
+            if self._memory is not None
+            else {}
+        )
+        if self._memory is not None:
+            interaction_strategy["relevant_social_profiles"] = await asyncio.to_thread(
+                self._memory.social_profiles, sorted(visible_ids)
+            )
+        try:
+            authored = await self._omnius.compose_curiosity_question(
+                candidate,
+                visible_preferred_names,
+                self._scene_context(),
+                self._conversation_turns.prompt_history(),
+                interaction_strategy,
+            )
+        except Exception as error:
+            logger.warning("model-authored curiosity dialogue unavailable: %s", error)
+            return False
+        if authored is None or authored.get("speak") is not True:
+            return False
+        question = str(authored.get("question") or "").strip()
+        if not question:
+            return False
         revision = self._conversation_turns.revision
         spoken = await self._speak(question, expected_revision=revision)
         if not spoken:
@@ -2690,10 +2878,16 @@ class CompanionRuntime:
         self._curiosity_spoken_at.append(now)
         self._last_curiosity_at = now
         self.telemetry.record_interaction(
-            True, "model-authored grounded question", "", question
+            True,
+            "model-authored grounded curiosity shaped by interaction feedback",
+            "",
+            question,
         )
         self._queue_interaction_memory(
-            "", question, True, "model-authored grounded question"
+            "",
+            question,
+            True,
+            "model-authored grounded curiosity shaped by interaction feedback",
         )
         return True
 
@@ -2712,7 +2906,7 @@ class CompanionRuntime:
         now = time.monotonic()
         frame_key = f"frame:{observation.camera_id}"
         if now - self._last_ocr_candidate_at.get(frame_key, 0.0) < (
-            self.config.ocr.full_frame_interval_seconds
+            self._activity.scaled_interval(self.config.ocr.full_frame_interval_seconds, now)
         ):
             return
         self._last_ocr_candidate_at[frame_key] = now
@@ -3632,58 +3826,58 @@ class CompanionRuntime:
     async def _queue_object_candidate(self, frame: np.ndarray, observation: Observation) -> None:
         learning = self.config.object_learning
         now = time.monotonic()
-        if (
-            not learning.auto_label_enabled
-            or self._object_candidates.full()
-            or now - self._last_object_candidate_at < learning.recall_interval_seconds
-        ):
+        if not learning.auto_label_enabled:
             return
         candidates = [
             detection for detection in observation.detections
             if detection.label != "person"
             and not detection.attributes.get("object_id")
             and detection.attributes.get("mask_polygon")
-            and self._candidate_area_ratio(detection) <= 0.35
-            and detection.confidence >= learning.auto_label_confidence_threshold
         ]
-        # Reliable, bounded candidates have the highest expected information
-        # gain. Selecting the least-confident detection was feeding Ornith the
-        # noisiest masks and artificially making detector noise look novel.
-        candidate = max(
-            candidates,
-            key=lambda item: item.confidence * (1.0 - self._candidate_area_ratio(item)),
-            default=None,
-        )
-        if candidate is None:
-            return
-        if not self._candidate_is_stable(observation.camera_id, candidate, now):
-            return
-        self._last_object_candidate_at = now
         vision = self._vision
         if vision is None:
             return
-        segmented = await asyncio.to_thread(vision.segment_detection, frame, candidate)
-        if segmented is None:
-            return
-        fingerprint = await asyncio.to_thread(self._segmented_fingerprint, segmented)
         self._object_candidate_fingerprints = {
             key: expires_at for key, expires_at in self._object_candidate_fingerprints.items()
             if expires_at > now
         }
-        if fingerprint in self._object_candidate_fingerprints:
-            self.telemetry.record_object_learning("duplicate_candidate", candidate.label)
-            return
-        self._object_candidate_fingerprints[fingerprint] = now + max(
-            learning.auto_label_cooldown_seconds * 2, learning.recall_cache_seconds
-        )
-        self.telemetry.record_object_learning(
-            "stable_candidate", f"{observation.camera_id}:{candidate.label}"
-        )
-        self._object_candidates.put_nowait((observation.camera_id, candidate, segmented, fingerprint, 0))
+        for candidate in candidates:
+            if not self._candidate_is_stable(observation.camera_id, candidate, now):
+                continue
+            segmented = await asyncio.to_thread(
+                vision.segment_detection, frame, candidate
+            )
+            if segmented is None:
+                continue
+            fingerprint = await asyncio.to_thread(
+                self._segmented_fingerprint, segmented
+            )
+            if fingerprint in self._object_candidate_fingerprints:
+                self.telemetry.record_object_learning(
+                    "duplicate_candidate", candidate.label
+                )
+                continue
+            if self._object_candidates.full():
+                self.telemetry.record_object_learning(
+                    "adjudication_backpressure",
+                    f"{observation.camera_id}:{candidate.label}",
+                )
+                continue
+            self._object_candidate_fingerprints[fingerprint] = now + max(
+                learning.auto_label_cooldown_seconds * 2,
+                learning.recall_cache_seconds,
+            )
+            self._last_object_candidate_at = now
+            self.telemetry.record_object_learning(
+                "stable_candidate", f"{observation.camera_id}:{candidate.label}"
+            )
+            self._object_candidates.put_nowait(
+                (observation.camera_id, candidate, segmented, fingerprint, 0)
+            )
 
     async def _classify_with_ocr(
         self, image_png: bytes, detector_label: str, detector_confidence: float
-    ) -> tuple[tuple[str, float] | None, dict[str, object] | None]:
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         """Analyze one sparse stable mask; OCR admission is pixel-grounded."""
         analysis_method = getattr(
             self._omnius, "classify_masked_object_analysis", None
@@ -3703,14 +3897,22 @@ class CompanionRuntime:
         if isinstance(vlm_response, BaseException):
             raise vlm_response
         vlm_analysis = vlm_response if isinstance(vlm_response, dict) else None
-        vlm_result = (
-            (
-                str(vlm_analysis["label"]),
-                float(vlm_analysis["confidence"]),
-            )
-            if vlm_analysis is not None
-            else vlm_response
-        )
+        if (
+            vlm_analysis is None
+            and isinstance(vlm_response, tuple)
+            and len(vlm_response) == 2
+        ):
+            vlm_analysis = {
+                "object_present": True,
+                "label": str(vlm_response[0]),
+                "confidence": float(vlm_response[1]),
+                "appearance_description": str(vlm_response[0]),
+                "detector_supported": str(vlm_response[0]).casefold()
+                == detector_label.casefold(),
+                "detector_assessment": "compatibility classification",
+                "visible_text": False,
+                "text_regions": [],
+            }
         self.telemetry.record_object_learning("ocr_request")
         if isinstance(ocr_result, BaseException):
             logger.warning("advanced OCR failed; continuing with VLM result only", exc_info=ocr_result)
@@ -3726,7 +3928,7 @@ class CompanionRuntime:
                     ),
                 }
             self.telemetry.record_object_learning("ocr_hit", ocr_result["text"][:80])
-        return vlm_result, ocr_result
+        return vlm_analysis, ocr_result
 
     async def _auto_label_objects(self) -> None:
         while self._vision is None:
@@ -3737,15 +3939,6 @@ class CompanionRuntime:
             try:
                 self.telemetry.record_object_learning("clip_query", detection.label)
                 recalled = await asyncio.to_thread(self.objects.match, segmented, vision)
-                if recalled is not None:
-                    self._cache_object_recall(camera_id, detection, recalled[0], recalled[1])
-                    self.telemetry.record_object_learning(
-                        "clip_recall", f"{recalled[0].label}:{recalled[1]:.3f}"
-                    )
-                    logger.debug("CLIP recalled object %s without Ornith VLM", recalled[0].label)
-                    continue
-                if time.monotonic() - self._last_vlm_at < self.config.object_learning.auto_label_cooldown_seconds:
-                    continue
                 speech_age = time.monotonic() - self._last_valid_speech_at
                 if speech_age < self.config.object_learning.speech_priority_seconds:
                     delay = self.config.object_learning.speech_priority_seconds - speech_age
@@ -3762,9 +3955,88 @@ class CompanionRuntime:
                     self.config.object_learning.vlm_max_image_size,
                 )
                 self.telemetry.record_object_learning("vlm_request", detection.label)
-                result, ocr_result = await self._classify_with_ocr(image_png, detection.label, detection.confidence)
-                if result is None or result[1] < self.config.object_learning.auto_label_min_confidence:
-                    detail = "invalid response" if result is None else f"{result[0]}:{result[1]:.3f}"
+                comparison_similarity = float(recalled[1]) if recalled else None
+                if recalled is not None:
+                    proposed = recalled[0]
+                    self.telemetry.record_object_learning(
+                        "clip_proposal", f"{proposed.label}:{recalled[1]:.3f}"
+                    )
+                    reference_png = await asyncio.to_thread(
+                        self.objects.thumbnail, proposed.profile_id
+                    )
+                    reference = await asyncio.to_thread(
+                        self.objects.profile_record, proposed.profile_id
+                    )
+                    comparison_method = getattr(
+                        self._omnius, "compare_masked_object_candidate", None
+                    )
+                    if (
+                        reference_png
+                        and reference is not None
+                        and callable(comparison_method)
+                    ):
+                        comparison_result, ocr_result = await self._run_background_visual(
+                            asyncio.gather(
+                                comparison_method(
+                                    reference_png,
+                                    image_png,
+                                    {
+                                        "profile_id": proposed.profile_id,
+                                        "label": proposed.label,
+                                        "appearance_description": reference.get(
+                                            "appearance_description"
+                                        ),
+                                        "samples": reference.get("samples"),
+                                        "review_state": reference.get("review_state"),
+                                        "clip_similarity": comparison_similarity,
+                                    },
+                                    detection.label,
+                                    detection.confidence,
+                                ),
+                                self._run_advanced_ocr(image_png),
+                                return_exceptions=True,
+                            )
+                        )
+                        if isinstance(comparison_result, BaseException):
+                            raise comparison_result
+                        analysis = (
+                            comparison_result
+                            if isinstance(comparison_result, dict)
+                            else None
+                        )
+                        if isinstance(ocr_result, BaseException):
+                            logger.warning(
+                                "advanced OCR failed during object comparison: %s",
+                                ocr_result,
+                            )
+                            ocr_result = None
+                    else:
+                        # A missing comparison path must never turn CLIP into an
+                        # identity oracle. Independently classify the new mask
+                        # and create separate evidence.
+                        analysis, ocr_result = await self._run_background_visual(
+                            self._classify_with_ocr(
+                                image_png, detection.label, detection.confidence
+                            )
+                        )
+                else:
+                    proposed = None
+                    analysis, ocr_result = await self._run_background_visual(
+                        self._classify_with_ocr(
+                            image_png, detection.label, detection.confidence
+                        )
+                    )
+                confidence = (
+                    float(analysis.get("confidence") or 0.0)
+                    if isinstance(analysis, dict)
+                    else 0.0
+                )
+                if analysis is None or confidence < self.config.object_learning.auto_label_min_confidence:
+                    detail = (
+                        "invalid response"
+                        if analysis is None
+                        else f"{analysis.get('label')}:{confidence:.3f}"
+                    )
                     self.telemetry.record_object_learning("vlm_rejection", detail)
                     if attempt < self.config.object_learning.auto_label_max_retries:
                         await asyncio.sleep(
@@ -3776,23 +4048,87 @@ class CompanionRuntime:
                                 (camera_id, detection, segmented, fingerprint, attempt + 1)
                             )
                     continue
-                label, confidence = result
+                if analysis.get("object_present") is not True:
+                    self.telemetry.record_object_learning(
+                        "detector_hypothesis_rejected",
+                        str(analysis.get("appearance_description") or detection.label),
+                    )
+                    self._queue_object_adjudication_memory(
+                        camera_id,
+                        detection,
+                        image_png,
+                        analysis,
+                        None,
+                        ocr_result if isinstance(ocr_result, dict) else None,
+                    )
+                    continue
+                label = str(analysis.get("label") or "").strip()
+                if not label:
+                    continue
                 provenance = {
                     "model_id": self.config.omnius.vision_model,
                     "detector_label": detection.label,
                     "detector_confidence": detection.confidence,
                     "mask_checksum": hashlib.sha256(image_png).hexdigest(),
                     "classified_at": datetime.now(timezone.utc).isoformat(),
+                    "adjudication": dict(analysis),
+                    "clip_candidate_id": (
+                        proposed.profile_id if proposed is not None else None
+                    ),
+                    "clip_similarity": comparison_similarity,
                 }
-                if ocr_result is not None:
+                if isinstance(ocr_result, dict):
                     provenance["ocr"] = ocr_result
-                profile = await asyncio.to_thread(
-                    self.objects.learn, label, segmented, vision, "ornith-vlm", confidence, provenance
+                same_instance = bool(
+                    proposed is not None and analysis.get("same_instance") is True
                 )
+                if same_instance:
+                    profile = await asyncio.to_thread(
+                        self.objects.confirm_match,
+                        proposed.profile_id,
+                        label,
+                        segmented,
+                        vision,
+                        confidence,
+                        model_id=self.config.omnius.vision_model,
+                        appearance_description=str(
+                            analysis.get("appearance_description") or ""
+                        ),
+                        provenance=provenance,
+                        adjudication=analysis,
+                    )
+                else:
+                    profile = await asyncio.to_thread(
+                        self.objects.learn,
+                        label,
+                        segmented,
+                        vision,
+                        "ornith-vlm",
+                        confidence,
+                        provenance,
+                        force_new=True,
+                        appearance_description=str(
+                            analysis.get("appearance_description") or ""
+                        ),
+                        adjudication=analysis,
+                    )
                 if profile:
                     await self._sync_object_profile(profile.profile_id)
-                    self._cache_object_recall(camera_id, detection, profile, confidence)
-                    if ocr_result is not None:
+                    self._cache_object_recall(
+                        camera_id,
+                        detection,
+                        profile,
+                        comparison_similarity if same_instance else confidence,
+                    )
+                    self._queue_object_adjudication_memory(
+                        camera_id,
+                        detection,
+                        image_png,
+                        analysis,
+                        profile.profile_id,
+                        ocr_result if isinstance(ocr_result, dict) else None,
+                    )
+                    if isinstance(ocr_result, dict):
                         self._queue_ocr_memory(
                             _OcrCandidate(
                                 camera_id,
@@ -3825,7 +4161,21 @@ class CompanionRuntime:
                     self.telemetry.record_object_learning(
                         "vlm_success", f"{profile.profile_id}:{profile.label}:{confidence:.3f}"
                     )
-                    logger.info("Ornith VLM learned segmented object %s at %.2f", profile.label, confidence)
+                    logger.info(
+                        "Ornith VLA %s segmented object %s at %.2f",
+                        "confirmed" if same_instance else "grounded",
+                        profile.label,
+                        confidence,
+                    )
+            except _BackgroundVisionPreempted:
+                self.telemetry.record_object_learning(
+                    "speech_preempted", f"{camera_id}:{detection.label}"
+                )
+                if not self._object_candidates.full():
+                    self._object_candidates.put_nowait(
+                        (camera_id, detection, segmented, fingerprint, attempt)
+                    )
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -3849,9 +4199,38 @@ class CompanionRuntime:
                 self.config.object_learning.vlm_max_image_size,
             )
             self.telemetry.record_object_learning("vlm_request", f"review:{previous_label}")
-            result, ocr_result = await self._classify_with_ocr(image_png, previous_label, segmented.confidence)
-            if result is None or result[1] < self.config.object_learning.auto_label_min_confidence:
+            analysis, ocr_result = await self._run_background_visual(
+                self._classify_with_ocr(
+                    image_png, previous_label, segmented.confidence
+                )
+            )
+            confidence = (
+                float(analysis.get("confidence") or 0.0)
+                if isinstance(analysis, dict)
+                else 0.0
+            )
+            if analysis is None or confidence < self.config.object_learning.auto_label_min_confidence:
                 self.telemetry.record_object_learning("vlm_rejection", f"review:{previous_label}")
+                await asyncio.to_thread(self.objects.mark_review_failed, profile_id)
+                return
+            if analysis.get("object_present") is not True:
+                profile = await asyncio.to_thread(
+                    self.objects.reject_profile,
+                    profile_id,
+                    str(
+                        analysis.get("appearance_description")
+                        or "retained mask did not ground a coherent physical object"
+                    ),
+                    analysis,
+                )
+                if profile:
+                    await self._sync_object_profile(profile.profile_id)
+                self.telemetry.record_object_learning(
+                    "legacy_profile_retracted", f"{profile_id}:{previous_label}"
+                )
+                return
+            label = str(analysis.get("label") or "").strip()
+            if not label:
                 await asyncio.to_thread(self.objects.mark_review_failed, profile_id)
                 return
             provenance = {
@@ -3859,22 +4238,117 @@ class CompanionRuntime:
                 "detector_confidence": segmented.confidence,
                 "mask_checksum": hashlib.sha256(image_png).hexdigest(),
                 "classified_at": datetime.now(timezone.utc).isoformat(),
+                "adjudication": dict(analysis),
             }
-            if ocr_result is not None:
+            if isinstance(ocr_result, dict):
                 provenance["ocr"] = ocr_result
             profile = await asyncio.to_thread(
-                self.objects.relabel, profile_id, result[0], result[1], "ornith-vlm",
-                self.config.omnius.vision_model, provenance,
+                self.objects.relabel,
+                profile_id,
+                label,
+                confidence,
+                "ornith-vlm",
+                self.config.omnius.vision_model,
+                provenance,
+                appearance_description=str(
+                    analysis.get("appearance_description") or ""
+                ),
+                adjudication=analysis,
             )
             if profile:
                 await self._sync_object_profile(profile.profile_id)
                 self.telemetry.record_object_learning(
-                    "vlm_success", f"review:{profile.profile_id}:{profile.label}:{result[1]:.3f}"
+                    "vlm_success", f"review:{profile.profile_id}:{profile.label}:{confidence:.3f}"
                 )
+        except _BackgroundVisionPreempted:
+            self.telemetry.record_object_learning(
+                "speech_preempted", f"review:{profile_id}"
+            )
         except Exception as error:
             await asyncio.to_thread(self.objects.mark_review_failed, profile_id)
             self.telemetry.record_object_learning("vlm_error", error)
             self.telemetry.record_runtime_error("ornith-review", error)
+
+    def _queue_object_adjudication_memory(
+        self,
+        camera_id: str,
+        detection: Detection,
+        image_png: bytes,
+        analysis: dict[str, object],
+        profile_id: str | None,
+        ocr_result: dict[str, object] | None,
+    ) -> None:
+        """Keep detector proposals and VLA verdicts as reversible evidence."""
+
+        if self._memory is None:
+            return
+        now = datetime.now(timezone.utc)
+        checksum = hashlib.sha256(image_png).hexdigest()
+        media_key = None
+        if self.config.memory.retain_raw_media:
+            try:
+                media_key, checksum = self._memory.persist_media(
+                    f"object-adjudication/{now:%Y/%m/%d}/{camera_id}-{checksum}.png",
+                    image_png,
+                )
+            except Exception as error:
+                logger.warning("object adjudication image could not be retained: %s", error)
+        evidence = EvidenceRef(
+            str(uuid4()),
+            "vision",
+            now,
+            "ornith-object-adjudicator",
+            camera_id,
+            media_key,
+            float(analysis.get("confidence") or 0.0),
+            {
+                "detector_hypothesis": detection.label,
+                "detector_confidence": detection.confidence,
+                "detector_supported": analysis.get("detector_supported"),
+                "object_present": analysis.get("object_present"),
+                "same_instance": analysis.get("same_instance"),
+                "appearance_description": analysis.get("appearance_description"),
+                "analysis": dict(analysis),
+                "ocr": dict(ocr_result) if ocr_result else None,
+                "model_id": self.config.omnius.vision_model,
+                "_media_checksum": checksum,
+            },
+        )
+        entities = []
+        if profile_id:
+            entities.append(
+                {
+                    "id": profile_id,
+                    "type": "object",
+                    "label": str(analysis.get("label") or profile_id),
+                    "confidence": float(analysis.get("confidence") or 0.0),
+                    "source": "ornith-vlm",
+                    "appearance_description": str(
+                        analysis.get("appearance_description") or ""
+                    ),
+                    "camera_id": camera_id,
+                }
+            )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "vision",
+                now,
+                "ornith-object-adjudicator",
+                (evidence,),
+                (profile_id,) if profile_id else (),
+                payload={
+                    "labels": [
+                        str(analysis.get("label"))
+                        if profile_id
+                        else "rejected detector hypothesis"
+                    ],
+                    "entities": entities,
+                    "skip_pairwise_co_observation": True,
+                    "object_adjudication": dict(analysis),
+                },
+            )
+        )
 
     async def _object_review_scheduler(self) -> None:
         while self._vision is None or self._omnius is None:
@@ -3894,34 +4368,128 @@ class CompanionRuntime:
         due = await asyncio.to_thread(self.objects.profiles_due_for_review, learning.review_stale_after_seconds)
         self.telemetry.set_review_queue_depth(len(due))
         for profile_id, label, _confidence in due[: learning.confidence_audit_batch_size]:
+            if (
+                time.monotonic() - getattr(self, "_last_valid_speech_at", 0.0)
+                < learning.speech_priority_seconds
+            ):
+                self.telemetry.record_object_learning(
+                    "speech_deferral", "existing-object pixel review"
+                )
+                break
             self.telemetry.record_object_learning("review_queued", f"{profile_id}:{label}")
             segmented = await asyncio.to_thread(self.objects.segmented_profile, profile_id)
             if segmented is None:
                 continue
-            audit = None
-            if learning.confidence_audit_enabled:
-                profile_record = await asyncio.to_thread(self.objects.profile_record, profile_id)
-                if profile_record is not None:
-                    audit_payload = {
-                        "label": profile_record["label"],
-                        "label_confidence": profile_record["label_confidence"],
-                        "samples": profile_record["samples"],
-                        "review_state": profile_record["review_state"],
-                        "label_history": profile_record["label_history"],
-                    }
-                    try:
-                        audit = await self._omnius.audit_object_label(audit_payload)
-                    except Exception as error:
-                        logger.exception("Object confidence audit failed")
-                        self.telemetry.record_runtime_error("confidence-audit", error)
-            if audit is not None and audit["consistent"] and audit["confidence"] >= learning.auto_label_min_confidence:
-                await asyncio.to_thread(self.objects.mark_audited, profile_id, "consistent", audit["reason"])
-                self.telemetry.record_object_learning("audit_consistent", f"{profile_id}:{audit['reason']}")
-                continue
-            self.telemetry.record_object_learning(
-                "audit_flagged", f"{profile_id}:{(audit or {}).get('reason', 'no-audit')}"
-            )
+            # Text history can schedule work but cannot clear a visual claim.
+            # Every due profile is re-opened against its retained pixels.
             await self._review_existing_object(profile_id, label, segmented)
+        await self._sweep_object_duplicate_adjudication()
+
+    async def _sweep_object_duplicate_adjudication(self) -> None:
+        learning = self.config.object_learning
+        if learning.duplicate_adjudication_batch_size <= 0:
+            return
+        if (
+            time.monotonic() - getattr(self, "_last_valid_speech_at", 0.0)
+            < learning.speech_priority_seconds
+        ):
+            return
+        duplicate_candidates = getattr(self.objects, "duplicate_candidates", None)
+        if not callable(duplicate_candidates):
+            return
+        proposals = await asyncio.to_thread(
+            duplicate_candidates,
+            learning.duplicate_proposal_similarity,
+            learning.duplicate_adjudication_batch_size,
+        )
+        for left_id, right_id, similarity in proposals:
+            left_png, right_png, left, right = await asyncio.gather(
+                asyncio.to_thread(self.objects.thumbnail, left_id),
+                asyncio.to_thread(self.objects.thumbnail, right_id),
+                asyncio.to_thread(self.objects.profile_record, left_id),
+                asyncio.to_thread(self.objects.profile_record, right_id),
+            )
+            if not left_png or not right_png or left is None or right is None:
+                continue
+            try:
+                analysis = await self._run_background_visual(
+                    self._omnius.compare_masked_object_candidate(
+                        left_png,
+                        right_png,
+                        {
+                            "profile_id": left_id,
+                            "label": left.get("label"),
+                            "appearance_description": left.get(
+                                "appearance_description"
+                            ),
+                            "samples": left.get("samples"),
+                            "clip_similarity": similarity,
+                        },
+                        str(right.get("label") or "unresolved object"),
+                        float(right.get("confidence") or 0.0),
+                    )
+                )
+            except _BackgroundVisionPreempted:
+                self.telemetry.record_object_learning(
+                    "speech_preempted", f"duplicate:{left_id}:{right_id}"
+                )
+                return
+            if analysis is None:
+                continue
+            analysis = {
+                **analysis,
+                "left_profile_id": left_id,
+                "right_profile_id": right_id,
+                "clip_similarity": similarity,
+                "purpose": "retroactive physical-object consolidation",
+            }
+            await asyncio.to_thread(
+                self.objects.record_pair_adjudication,
+                left_id,
+                right_id,
+                analysis,
+            )
+            if (
+                analysis.get("object_present") is not True
+                or analysis.get("same_instance") is not True
+                or float(analysis.get("confidence") or 0.0)
+                < learning.auto_label_min_confidence
+            ):
+                self.telemetry.record_object_learning(
+                    "duplicate_not_confirmed", f"{left_id}:{right_id}:{similarity:.3f}"
+                )
+                continue
+            canonical_id, alias_id = (
+                (left_id, right_id)
+                if int(left.get("samples") or 0) >= int(right.get("samples") or 0)
+                else (right_id, left_id)
+            )
+            canonical = await asyncio.to_thread(
+                self.objects.merge_profiles,
+                canonical_id,
+                alias_id,
+                similarity,
+                analysis,
+            )
+            if canonical is None:
+                continue
+            await self._sync_object_profile(canonical.profile_id)
+            if self._memory is not None:
+                await asyncio.to_thread(
+                    self._memory.store.coalesce_object_evidence,
+                    [
+                        {
+                            "alias_id": alias_id,
+                            "canonical_id": canonical_id,
+                            "similarity": similarity,
+                            "reason": "ornith_same_physical_object",
+                            "adjudication": analysis,
+                        }
+                    ],
+                )
+            self.telemetry.record_object_learning(
+                "duplicate_coalesced", f"{alias_id}->{canonical_id}:{similarity:.3f}"
+            )
 
     def _cache_object_recall(self, camera_id: str, detection: Detection, profile, similarity: float) -> None:
         expires_at = time.monotonic() + self.config.object_learning.recall_cache_seconds
@@ -3934,6 +4502,8 @@ class CompanionRuntime:
             "label_source": profile.label_source,
             "evidence_count": profile.samples,
             "provenance": dict(profile.label_provenance),
+            "appearance_description": profile.appearance_description,
+            "adjudication_state": "vlm_confirmed",
             "confidence_components": fusion.components,
             "expires_at": expires_at,
         }
@@ -4006,6 +4576,12 @@ class CompanionRuntime:
                             "object_label_source": match["label_source"],
                             "object_evidence_count": match["evidence_count"],
                             "object_label_provenance": match["provenance"],
+                            "object_appearance_description": match.get(
+                                "appearance_description"
+                            ),
+                            "object_adjudication_state": match.get(
+                                "adjudication_state"
+                            ),
                             "object_confidence_components": match["confidence_components"],
                         },
                     )
@@ -4047,6 +4623,8 @@ class CompanionRuntime:
                     self._active_reasoning_revision = None
                 self._conversation_turns.finish_processing(turn.revision)
                 self._record_voice_transition("heard_turn_processing_finished")
+                self._turn_visual_snapshots.pop(turn.utterance_id, None)
+                self._turn_acoustic_context.pop(turn.utterance_id, None)
 
     def _cancel_stale_reasoning(self, current_revision: int) -> bool:
         active = self._active_reasoning_task
@@ -4066,7 +4644,8 @@ class CompanionRuntime:
         transcript = turn.text
         pending = self.telemetry.pending_observation()
         pending_identity = self._active_identity_question()
-        live_context = self._scene_context()
+        visual_snapshot = self._turn_visual_snapshots.get(turn.utterance_id)
+        live_context = self._visual_snapshot_context(visual_snapshot)
         interruption = None
         if turn.barge_id:
             playback = self._conversation_turns.active_playback
@@ -4165,7 +4744,7 @@ class CompanionRuntime:
             ):
                 return
 
-        language = self._local_language_route(transcript, pending is not None)
+        language = None
         if self.config.omnius.dialogue_router_enabled:
             try:
                 model_language = await self._omnius.reason_about_utterance(
@@ -4180,30 +4759,23 @@ class CompanionRuntime:
         web_query = self._web_search_query(transcript, language)
         if not self._conversation_turns.can_publish(turn.revision):
             return
-        dialogue = self._dialogue.classify(
-            DialogueEvidence(
-                transcript,
-                doa_aligned=(
-                    self._latest_observation is not None
-                    and self._latest_observation.microphone_direction is not None
-                ),
-                seconds_since_tts=(
-                    time.monotonic() - self._last_spoken_at
-                    if self._last_spoken_at is not None
-                    else None
-                ),
-                interaction_pending=pending is not None or pending_identity is not None,
-                language_directed=(
-                    True
-                    if web_query or pending_identity is not None
-                    else bool(language["directed"]) if language is not None else None
-                ),
-                playback_overlap=turn.barge_id is not None,
-                interruption_genuine=(
-                    interruption.genuine if interruption is not None else None
-                ),
+        if language is not None:
+            dialogue = DialogueDecision(
+                bool(language["directed"]),
+                str(language["act"]),  # type: ignore[arg-type]
+                {"model_confidence": float(language["confidence"])},
+                "model-authored utterance routing",
             )
-        )
+        else:
+            # A transport/model outage must not be replaced with keyword semantics.
+            # The normal conversation model still has the ordered history and can
+            # return [[SILENT]] when the VAD-verified speech was not addressed to Egg.
+            dialogue = DialogueDecision(
+                True,
+                "conversation",
+                {"router_available": 0.0},
+                "semantic router unavailable; final dialogue model adjudicates",
+            )
         if not dialogue.directed:
             self.telemetry.record_interaction(False, dialogue.reason, transcript, "[[SILENT]]")
             return
@@ -4293,16 +4865,33 @@ class CompanionRuntime:
                     context_id=turn.utterance_id,
                 )
                 return
-        if self._is_visual_question(transcript):
-            visual = self._visual_question_frame()
-            if visual is not None:
-                camera_id, frame = visual
+        if language is not None and language.get("tool") == "vision":
+            if visual_snapshot is not None and visual_snapshot.frames:
                 started = time.monotonic()
                 self._record_turn_tool_start(
-                    turn.utterance_id, "fresh_vision", transcript
+                    turn.utterance_id,
+                    "asr_boundary_vision",
+                    str(language.get("tool_query") or transcript),
                 )
                 try:
-                    image = await asyncio.to_thread(self._encode_visual_question_frame, frame)
+                    encoded_frames = await asyncio.gather(
+                        *(
+                            asyncio.to_thread(
+                                self._encode_visual_question_frame, item.frame
+                            )
+                            for item in visual_snapshot.frames
+                        )
+                    )
+                    visual_inputs = [
+                        (
+                            item.camera_id,
+                            encoded,
+                            item.captured_at.isoformat(),
+                        )
+                        for item, encoded in zip(
+                            visual_snapshot.frames, encoded_frames, strict=True
+                        )
+                    ]
                     reflective = (
                         await asyncio.to_thread(
                             self._memory.reflective_context, 900
@@ -4310,10 +4899,10 @@ class CompanionRuntime:
                         if self._memory is not None
                         else ""
                     )
-                    reply = await self._omnius.answer_visual_question(
-                        image,
+                    analysis = await self._omnius.answer_visual_question_analysis(
+                        visual_inputs,
                         transcript,
-                        f"camera={camera_id}; {live_context}"
+                        live_context
                         + (
                             "; reflective working model (derived and revisable): "
                             + reflective
@@ -4321,20 +4910,57 @@ class CompanionRuntime:
                             else ""
                         ),
                     )
+                    reply = (
+                        str(analysis["answer"])
+                        if isinstance(analysis, dict) and analysis.get("answer")
+                        else None
+                    )
                 except Exception as error:
-                    logger.warning("fresh visual question path unavailable: %s", error)
+                    logger.warning("ASR-boundary visual question path unavailable: %s", error)
                     reply = None
+                    analysis = None
                     self._record_turn_tool_call(
                         turn.utterance_id,
-                        "fresh_vision", transcript, False, str(error),
+                        "asr_boundary_vision",
+                        str(language.get("tool_query") or transcript),
+                        False,
+                        str(error),
                         (time.monotonic() - started) * 1000,
                     )
                 else:
+                    detail = json.dumps(
+                        {
+                            "answer": reply,
+                            "grounded": analysis.get("grounded") if analysis else None,
+                            "confidence": analysis.get("confidence") if analysis else None,
+                            "supporting_camera_ids": analysis.get(
+                                "supporting_camera_ids", []
+                            ) if analysis else [],
+                            "captured_at": visual_snapshot.boundary_at.isoformat(),
+                            "camera_ids": [
+                                item.camera_id for item in visual_snapshot.frames
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
                     self._record_turn_tool_call(
                         turn.utterance_id,
-                        "fresh_vision", transcript, bool(reply), reply or "no answer",
+                        "asr_boundary_vision",
+                        str(language.get("tool_query") or transcript),
+                        bool(reply),
+                        detail,
                         (time.monotonic() - started) * 1000,
                     )
+                    if analysis is not None:
+                        asyncio.create_task(
+                            self._queue_turn_visual_evidence(
+                                visual_snapshot,
+                                encoded_frames,
+                                analysis,
+                                transcript,
+                            ),
+                            name=f"turn-visual-memory:{turn.utterance_id}",
+                        )
                 if reply and self._conversation_turns.can_publish(turn.revision):
                     decision = self._interaction_policy.evaluate(
                         transcript, reply, directed=True
@@ -4344,7 +4970,7 @@ class CompanionRuntime:
                         if decision.allow_speech else False
                     )
                     reason = (
-                        "fresh question-conditioned camera evidence"
+                        "model-routed ASR-boundary multi-camera evidence"
                         if spoken else decision.reason
                     )
                     self.telemetry.record_interaction(spoken, reason, transcript, reply)
@@ -4353,6 +4979,15 @@ class CompanionRuntime:
                         context_id=turn.utterance_id,
                     )
                     return
+            else:
+                self._record_turn_tool_call(
+                    turn.utterance_id,
+                    "asr_boundary_vision",
+                    str(language.get("tool_query") or transcript),
+                    False,
+                    "No camera frame was fresh at the utterance boundary.",
+                    0.0,
+                )
         context = await self._cognitive_context(transcript)
         if not self._conversation_turns.can_publish(turn.revision):
             return
@@ -4519,16 +5154,38 @@ class CompanionRuntime:
         self.telemetry.record_identity_dialogue(
             "named", profile.profile_id, camera_id, preferred_name
         )
-        reply = f"Nice to meet you, {preferred_name}."
-        spoken = await self._speak(reply, expected_revision=expected_revision)
-        reason = (
-            "preferred name bound to the specifically prompted face"
-            if spoken
-            else "preferred name saved; acknowledgement superseded before playback"
+        interaction_strategy = (
+            await asyncio.to_thread(self._memory.interaction_strategy)
+            if self._memory is not None
+            else {}
         )
-        self.telemetry.record_interaction(spoken, reason, transcript, reply)
+        if self._memory is not None:
+            interaction_strategy["relevant_social_profiles"] = await asyncio.to_thread(
+                self._memory.social_profiles, [profile.profile_id]
+            )
+        try:
+            reply = await self._omnius.compose_identity_acknowledgement(
+                preferred_name,
+                transcript,
+                self._conversation_turns.prompt_history(),
+                interaction_strategy,
+            )
+        except Exception as error:
+            logger.warning("model-authored identity acknowledgement unavailable: %s", error)
+            reply = None
+        spoken = (
+            await self._speak(reply, expected_revision=expected_revision)
+            if reply
+            else False
+        )
+        reason = (
+            "preferred name bound to the specifically prompted face and acknowledged naturally"
+            if spoken
+            else "preferred name saved; model acknowledgement unavailable or superseded"
+        )
+        self.telemetry.record_interaction(spoken, reason, transcript, reply or "")
         self._queue_interaction_memory(
-            transcript, reply, spoken, reason, context_id=context_id
+            transcript, reply or "", spoken, reason, context_id=context_id
         )
         return True
 
@@ -4540,19 +5197,7 @@ class CompanionRuntime:
             query = language.get("tool_query")
             if isinstance(query, str) and query.strip():
                 return " ".join(query.split())[:300]
-        explicit = re.search(
-            r"\b(?:search(?:\s+the)?\s+web|web\s+search|look\s+up|lookup|google|"
-            r"check\s+(?:the\s+)?(?:web|internet|online))\b",
-            transcript,
-            flags=re.IGNORECASE,
-        )
-        return " ".join(transcript.split())[:300] if explicit else None
-
-    @staticmethod
-    def _may_name_person(transcript: str) -> bool:
-        normalized_text = transcript.casefold().replace("’", "'")
-        normalized = f" {' '.join(normalized_text.split())} "
-        return any(phrase in normalized for phrase in (" my name is ", " i'm ", " i am ", " call me "))
+        return None
 
     def _queue_identity_name_memory(
         self, profile_id: str, name: str, transcript: str, context_id: str
@@ -4615,72 +5260,87 @@ class CompanionRuntime:
             )
         )
 
-    @staticmethod
-    def _may_label_held_object(transcript: str) -> bool:
-        words = {word.strip(".,!?;:\"'").casefold() for word in transcript.split()}
-        return bool(words & {"this", "that", "object", "holding", "called", "name"})
+    def _capture_turn_visual_snapshot(
+        self, utterance_id: str, boundary_monotonic: float
+    ) -> _TurnVisualSnapshot:
+        """Freeze every fresh camera at the acoustic utterance boundary.
 
-    @staticmethod
-    def _local_language_route(
-        transcript: str, interaction_pending: bool = False
-    ) -> dict[str, object]:
-        normalized = " ".join(transcript.casefold().split())
-        words = {word.strip(".,!?;:\"'") for word in normalized.split()}
-        directed = bool(
-            interaction_pending
-            or normalized.endswith("?")
-            or words
-            & (
-                DialogueClassifier.QUESTION_WORDS
-                | DialogueClassifier.COMMAND_WORDS
-                | {"egg", "you", "your", "please"}
-            )
-        )
-        explicit_web = bool(
-            re.search(r"\b(search|look up|google|browse|on the web|online)\b", normalized)
-        )
-        return {
-            "directed": directed,
-            "act": "question" if normalized.endswith("?") else "conversation",
-            "confidence": 0.95 if directed else 0.5,
-            "tool": "web_search" if explicit_web else "none",
-            "tool_query": transcript if explicit_web else None,
-        }
+        Camera admission is intentionally based only on freshness and the
+        configured transport bound. No object label, person box, or phrase in
+        the transcript can choose which reality reaches the visual model.
+        """
 
-    @staticmethod
-    def _is_visual_question(transcript: str) -> bool:
-        normalized = " ".join(transcript.casefold().split())
-        return bool(
-            re.search(
-                r"\b(am i holding|in my hand|what(?:'s| is) this|what do you see|"
-                r"what am i showing|can you see|look at this|read this|what is on)\b",
-                normalized,
-            )
+        now_monotonic = time.monotonic()
+        now_wall = datetime.now(timezone.utc)
+        boundary_at = now_wall - timedelta(
+            seconds=max(0.0, now_monotonic - boundary_monotonic)
         )
-
-    def _visual_question_frame(self) -> tuple[str, np.ndarray] | None:
-        now = time.monotonic()
-        candidates: list[tuple[float, str, np.ndarray]] = []
-        for camera_id, (frame, captured_at) in self._latest_frames.items():
-            age = now - captured_at
-            if age > 3.0:
+        candidates: list[_TurnVisualFrame] = []
+        for camera_id, (frame, captured_monotonic) in self._latest_frames.items():
+            age = boundary_monotonic - captured_monotonic
+            if age < -0.05 or age > self.config.omnius.visual_snapshot_max_age_seconds:
                 continue
+            captured_at = boundary_at - timedelta(seconds=max(0.0, age))
             observation = self._latest_observations.get(camera_id)
-            person_area = 0.0
-            object_count = 0
+            if observation is not None and observation.timestamp > boundary_at:
+                observation = None
+            candidates.append(
+                _TurnVisualFrame(
+                    camera_id,
+                    captured_at,
+                    captured_monotonic,
+                    frame.copy(),
+                    observation,
+                )
+            )
+        # Stable camera configuration order makes image-index provenance
+        # repeatable. The limit is a memory/transport bound, not semantic rank.
+        configured_order = {
+            camera.id: index for index, camera in enumerate(self.config.cameras)
+        }
+        candidates.sort(
+            key=lambda item: (configured_order.get(item.camera_id, 10_000), item.camera_id)
+        )
+        snapshot = _TurnVisualSnapshot(
+            utterance_id,
+            boundary_at,
+            tuple(candidates[: self.config.omnius.visual_snapshot_max_cameras]),
+        )
+        self._turn_visual_snapshots[utterance_id] = snapshot
+        while len(self._turn_visual_snapshots) > 32:
+            self._turn_visual_snapshots.pop(next(iter(self._turn_visual_snapshots)))
+        return snapshot
+
+    def _visual_snapshot_context(
+        self, snapshot: _TurnVisualSnapshot | None
+    ) -> str:
+        if snapshot is None or not snapshot.frames:
+            return self._scene_context()
+        camera_context: list[str] = []
+        for visual in snapshot.frames:
+            observation = visual.observation
+            detections = []
             if observation is not None:
                 for detection in observation.detections:
-                    if detection.label == "person":
-                        person_area = max(person_area, detection.bbox.area)
-                    else:
-                        object_count += 1
-            frame_area = max(1.0, float(frame.shape[0] * frame.shape[1]))
-            score = 3.0 * min(1.0, person_area / frame_area) + 0.08 * object_count - 0.1 * age
-            candidates.append((score, camera_id, frame))
-        if not candidates:
-            return None
-        _, camera_id, frame = max(candidates, key=lambda item: item[0])
-        return camera_id, frame.copy()
+                    identity = detection.attributes.get("identity")
+                    object_id = detection.attributes.get("object_id")
+                    status = (
+                        f"VLA-adjudicated object {object_id}"
+                        if object_id
+                        else "detector hypothesis"
+                    )
+                    detections.append(
+                        f"{detection.label} {detection.confidence:.2f} ({status})"
+                        + (f" identity={identity}" if identity else "")
+                    )
+            camera_context.append(
+                f"{visual.camera_id} captured {visual.captured_at.isoformat()}: "
+                + (", ".join(detections) if detections else "no analyzed detections")
+            )
+        return (
+            f"ASR-boundary={snapshot.boundary_at.isoformat()}; "
+            + " | ".join(camera_context)
+        )
 
     @staticmethod
     def _encode_visual_question_frame(frame: np.ndarray) -> bytes:
@@ -4699,6 +5359,82 @@ class CompanionRuntime:
         if not ok:
             raise RuntimeError("failed to encode current visual question frame")
         return encoded.tobytes()
+
+    async def _queue_turn_visual_evidence(
+        self,
+        snapshot: _TurnVisualSnapshot,
+        encoded_frames: list[bytes],
+        analysis: dict[str, object],
+        transcript: str,
+    ) -> None:
+        if self._memory is None:
+            return
+        evidence: list[EvidenceRef] = []
+        entity_ids: set[str] = set()
+        supporting = {
+            str(item) for item in analysis.get("supporting_camera_ids", [])
+        }
+        for visual, encoded in zip(snapshot.frames, encoded_frames, strict=True):
+            media_key = None
+            checksum = hashlib.sha256(encoded).hexdigest()
+            if self.config.memory.retain_raw_media:
+                try:
+                    media_key, checksum = await asyncio.to_thread(
+                        self._memory.persist_media,
+                        (
+                            f"conversation-vision/{snapshot.boundary_at:%Y/%m/%d}/"
+                            f"{snapshot.utterance_id}-{visual.camera_id}.jpg"
+                        ),
+                        encoded,
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "conversation visual evidence could not be retained: %s", error
+                    )
+            observation = visual.observation
+            if observation is not None:
+                for detection in observation.detections:
+                    for key in ("identity_id", "object_id"):
+                        value = detection.attributes.get(key)
+                        if value:
+                            entity_ids.add(str(value))
+            evidence.append(
+                EvidenceRef(
+                    str(uuid4()),
+                    "vision",
+                    visual.captured_at,
+                    "camera-asr-boundary",
+                    visual.camera_id,
+                    media_key,
+                    float(analysis.get("confidence") or 0.0),
+                    {
+                        "context_id": snapshot.utterance_id,
+                        "utterance_id": snapshot.utterance_id,
+                        "transcript": transcript,
+                        "boundary_at": snapshot.boundary_at.isoformat(),
+                        "supporting_camera": visual.camera_id in supporting,
+                        "vla_analysis": dict(analysis),
+                        "model_id": self.config.omnius.vision_model,
+                        "_media_checksum": checksum,
+                    },
+                )
+            )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "vision",
+                snapshot.boundary_at,
+                "asr-boundary-vision",
+                tuple(evidence),
+                tuple(sorted(entity_ids)),
+                payload={
+                    "labels": ["conversation visual grounding"],
+                    "context_id": snapshot.utterance_id,
+                    "skip_pairwise_co_observation": True,
+                    "vla_analysis": dict(analysis),
+                },
+            )
+        )
 
     async def _handle_target(self, target: AttentionTarget, decision: AttentionDecision, observation: Observation) -> None:
         self.telemetry.record_attention(target.track_id, target.detection.label, decision)
@@ -4800,6 +5536,59 @@ class CompanionRuntime:
             < settings.identity_question_cooldown_seconds
         ):
             return False
+        if (
+            self._conversation_turns.pending_ingress > 0
+            or not self._speech_segments.empty()
+            or not self._utterances.empty()
+            or self._speaking
+        ):
+            return False
+
+        profile = await asyncio.to_thread(self.identities.profile_record, profile_id)
+        if profile is None:
+            return False
+        interaction_strategy = (
+            await asyncio.to_thread(self._memory.interaction_strategy)
+            if self._memory is not None
+            else {}
+        )
+        if self._memory is not None:
+            interaction_strategy["relevant_social_profiles"] = await asyncio.to_thread(
+                self._memory.social_profiles, [profile_id]
+            )
+        try:
+            authored = await self._omnius.compose_identity_question(
+                {
+                    "profile_id": profile_id,
+                    "first_seen": (
+                        profile.get("first_seen").isoformat()
+                        if isinstance(profile.get("first_seen"), datetime)
+                        else profile.get("first_seen")
+                    ),
+                    "last_seen": (
+                        profile.get("last_seen").isoformat()
+                        if isinstance(profile.get("last_seen"), datetime)
+                        else profile.get("last_seen")
+                    ),
+                    "sightings": profile.get("sightings"),
+                    "samples": profile.get("samples"),
+                    "last_camera": profile.get("last_camera"),
+                },
+                self._scene_context(),
+                self._conversation_turns.prompt_history(),
+                interaction_strategy,
+            )
+        except Exception as error:
+            logger.warning("model-authored identity dialogue unavailable: %s", error)
+            return False
+        if authored is None or authored.get("speak") is not True:
+            self.telemetry.record_identity_dialogue(
+                "deferred", profile_id, target.camera_id
+            )
+            return False
+        question = str(authored.get("question") or "").strip()
+        if not question:
+            return False
 
         pending = _PendingIdentityQuestion(
             profile_id=profile_id,
@@ -4811,7 +5600,6 @@ class CompanionRuntime:
         self.telemetry.record_identity_dialogue(
             "asking", pending.profile_id, pending.camera_id
         )
-        question = "I don't think we've met yet. What should I call you?"
         spoken = await self._speak(question)
         if not spoken:
             if self._pending_identity_name == pending:
@@ -4827,7 +5615,7 @@ class CompanionRuntime:
         )
         self.telemetry.record_interaction(
             True,
-            "stable unnamed face prompted once for a preferred name",
+            "model-authored social introduction for a stable unnamed face",
             "",
             question,
         )
@@ -4835,7 +5623,7 @@ class CompanionRuntime:
             "",
             question,
             True,
-            "stable unnamed face prompted once for a preferred name",
+            "model-authored social introduction for a stable unnamed face",
         )
         return True
 
@@ -4916,6 +5704,13 @@ class CompanionRuntime:
     ) -> None:
         if self._memory is None:
             return
+        self._queue_social_reflection_job(
+            transcript,
+            response,
+            allowed,
+            reason,
+            context_id,
+        )
         now = datetime.now(timezone.utc)
         visible_entity_ids = {
             str(entity_id)
@@ -4959,6 +5754,293 @@ class CompanionRuntime:
                     "labels": ["spoken" if allowed else "suppressed"],
                     "attention_reason": reason,
                     "skip_pairwise_co_observation": True,
+                },
+            )
+        )
+
+    def _queue_social_reflection_job(
+        self,
+        transcript: str,
+        response: str,
+        spoken: bool,
+        reason: str,
+        context_id: str | None,
+    ) -> None:
+        if (
+            not self.config.social_cognition.enabled
+            or not transcript.strip()
+            or not context_id
+            or not hasattr(self, "_social_reflection_jobs")
+        ):
+            return
+        visible: set[str] = set()
+        visible_people: set[str] = set()
+        snapshot = getattr(self, "_turn_visual_snapshots", {}).get(context_id)
+        observations = (
+            [item.observation for item in snapshot.frames if item.observation]
+            if snapshot is not None
+            else [self._latest_observation] if self._latest_observation else []
+        )
+        for observation in observations:
+            if observation is None:
+                continue
+            for detection in observation.detections:
+                for key in ("identity_id", "object_id"):
+                    value = detection.attributes.get(key)
+                    if value:
+                        visible.add(str(value))
+                        if key == "identity_id":
+                            visible_people.add(str(value))
+        job = _SocialReflectionJob(
+            context_id,
+            " ".join(transcript.split())[:1000],
+            " ".join(response.split())[:1000],
+            spoken,
+            " ".join(reason.split())[:400],
+            datetime.now(timezone.utc),
+            tuple(sorted(visible)),
+            tuple(sorted(visible_people)),
+            tuple(
+                dict(item)
+                for item in self._conversation_turns.prompt_history()[
+                    -self.config.social_cognition.history_turns :
+                ]
+            ),
+            dict(self._turn_acoustic_context.get(context_id, {})),
+            (
+                {
+                    key: value
+                    for key, value in self._latest_audio_comprehension.items()
+                    if key != "completed_monotonic"
+                }
+                if isinstance(self._latest_audio_comprehension, dict)
+                and self._latest_audio_comprehension.get("context_id") == context_id
+                else {}
+            ),
+        )
+        if self._social_reflection_jobs.full():
+            self._social_reflection_jobs.get_nowait()
+            self.telemetry.record_runtime_error(
+                "social-reflection-overload",
+                "oldest pending social reflection was superseded",
+            )
+        self._social_reflection_jobs.put_nowait(job)
+
+    async def _process_social_reflections(self) -> None:
+        while True:
+            job = await self._social_reflection_jobs.get()
+            prior_strategy = (
+                await asyncio.to_thread(self._memory.interaction_strategy)
+                if self._memory is not None
+                else {}
+            )
+            prior_profiles = (
+                await asyncio.to_thread(
+                    self._memory.social_profiles, list(job.visible_person_ids)
+                )
+                if self._memory is not None
+                else []
+            )
+            try:
+                analysis = await self._run_background_visual(
+                    self._omnius.reflect_social_interaction(
+                        {
+                            "context_id": job.context_id,
+                            "transcript": job.transcript,
+                            "response": job.response,
+                            "spoken": job.spoken,
+                            "response_policy_reason": job.reason,
+                            "visible_entity_ids": list(job.visible_entity_ids),
+                            "visible_person_ids": list(job.visible_person_ids),
+                            "captured_at": job.captured_at.isoformat(),
+                            "acoustic_evidence": dict(job.acoustic),
+                            "audio_semantics": dict(job.audio_semantics),
+                        },
+                        list(job.history),
+                        prior_strategy,
+                        prior_profiles,
+                    )
+                )
+            except _BackgroundVisionPreempted:
+                if not self._social_reflection_jobs.full():
+                    self._social_reflection_jobs.put_nowait(job)
+                continue
+            if analysis is None:
+                self.telemetry.record_runtime_error(
+                    "social-reflection",
+                    "model returned invalid social reflection JSON",
+                )
+                continue
+            self._queue_social_reflection_memory(job, analysis)
+
+    def _queue_social_reflection_memory(
+        self,
+        job: _SocialReflectionJob,
+        analysis: dict[str, object],
+    ) -> None:
+        if self._memory is None:
+            return
+        state_id = f"interaction-state:{uuid4()}"
+        affect = dict(analysis["momentary_affect"])
+        revision = analysis.get("strategy_revision")
+        profile_updates = analysis.get("profile_updates")
+        descriptors: list[dict[str, object]] = [
+            {
+                "id": state_id,
+                "type": "interaction_state",
+                "label": str(affect["label"]),
+                "confidence": float(affect["confidence"]),
+                "valence": float(affect["valence"]),
+                "arousal": float(affect["arousal"]),
+                "time_local": True,
+                "revisable": True,
+                "context_id": job.context_id,
+                "communicative_behavior": str(
+                    analysis["communicative_behavior"]["summary"]
+                ),
+                "behavior_confidence": float(
+                    analysis["communicative_behavior"]["confidence"]
+                ),
+                "relationship_update": str(
+                    analysis["relationship_update"]["summary"]
+                ),
+                "relationship_confidence": float(
+                    analysis["relationship_update"]["confidence"]
+                ),
+                "response_feedback": str(
+                    analysis["response_feedback"]["summary"]
+                ),
+                "response_feedback_confidence": float(
+                    analysis["response_feedback"]["confidence"]
+                ),
+            }
+        ]
+        entity_ids = {state_id, *job.visible_entity_ids}
+        relations = [
+            {
+                "source_id": state_id,
+                "relation": "interpreted_while_present",
+                "target_id": entity_id,
+                "confidence": float(affect["confidence"]),
+                "metadata": {
+                    "time_local": True,
+                    "not_a_personality_claim": True,
+                    "context_id": job.context_id,
+                },
+            }
+            for entity_id in job.visible_entity_ids
+        ]
+        if isinstance(revision, dict):
+            strategy_id = "interaction-strategy:current"
+            entity_ids.add(strategy_id)
+            descriptors.append(
+                {
+                    "id": strategy_id,
+                    "type": "interaction_strategy",
+                    "label": "Evolving interaction strategy",
+                    "confidence": float(revision["confidence"]),
+                    "directive": str(revision["directive"]),
+                    "rationale": str(revision["rationale"]),
+                    "source_context_id": job.context_id,
+                    "revisable": True,
+                    "updated_at": job.captured_at.isoformat(),
+                }
+            )
+            relations.append(
+                {
+                    "source_id": state_id,
+                    "relation": "informs_interaction_strategy",
+                    "target_id": strategy_id,
+                    "confidence": float(revision["confidence"]),
+                    "metadata": {"context_id": job.context_id},
+                }
+            )
+        if isinstance(profile_updates, list):
+            for update in profile_updates:
+                if not isinstance(update, dict):
+                    continue
+                subject_id = str(update.get("subject_id") or "")
+                if subject_id not in job.visible_person_ids:
+                    continue
+                profile_id = f"social-profile:{subject_id}"
+                entity_ids.add(profile_id)
+                descriptors.append(
+                    {
+                        "id": profile_id,
+                        "type": "social_profile",
+                        "label": "Revisable interaction profile",
+                        "confidence": float(update["confidence"]),
+                        "subject_id": subject_id,
+                        "summary": str(update["summary"]),
+                        "sentiment_trajectory": str(update["sentiment_trajectory"]),
+                        "communication_patterns": list(
+                            update["communication_patterns"]
+                        ),
+                        "interaction_preferences": list(
+                            update["interaction_preferences"]
+                        ),
+                        "uncertainties": list(update["uncertainties"]),
+                        "evidence_summary": str(update["evidence"]),
+                        "profile_scope": "observed_interactions_only",
+                        "revisable": True,
+                        "updated_at": job.captured_at.isoformat(),
+                    }
+                )
+                relations.extend(
+                    (
+                        {
+                            "source_id": profile_id,
+                            "relation": "models_interaction_with",
+                            "target_id": subject_id,
+                            "confidence": float(update["confidence"]),
+                            "metadata": {
+                                "not_a_personality_claim": True,
+                                "context_id": job.context_id,
+                            },
+                        },
+                        {
+                            "source_id": state_id,
+                            "relation": "updates_social_profile",
+                            "target_id": profile_id,
+                            "confidence": float(update["confidence"]),
+                            "metadata": {"context_id": job.context_id},
+                        },
+                    )
+                )
+        evidence = EvidenceRef(
+            str(uuid4()),
+            "speech",
+            job.captured_at,
+            "model-social-reflection",
+            "conversation",
+            quality=float(affect["confidence"]),
+            metadata={
+                "context_id": job.context_id,
+                "utterance_id": job.context_id,
+                "transcript": job.transcript,
+                "response": job.response,
+                "acoustic_evidence": dict(job.acoustic),
+                "audio_semantics": dict(job.audio_semantics),
+                "analysis": dict(analysis),
+                "model_id": self.config.omnius.model,
+                "time_local_interpretation": True,
+            },
+        )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "social_reflection",
+                job.captured_at,
+                "model-social-reflection",
+                (evidence,),
+                tuple(sorted(entity_ids)),
+                payload={
+                    "labels": [str(affect["label"]), "interaction feedback"],
+                    "entities": descriptors,
+                    "relations": relations,
+                    "skip_pairwise_co_observation": True,
+                    "context_id": job.context_id,
+                    "social_reflection": dict(analysis),
                 },
             )
         )
@@ -5116,6 +6198,12 @@ class CompanionRuntime:
         graph_signals = await asyncio.to_thread(
             self._memory.graph_signals, list(entity_ids)
         )
+        interaction_strategy = await asyncio.to_thread(
+            self._memory.interaction_strategy
+        )
+        social_profiles = await asyncio.to_thread(
+            self._memory.social_profiles, list(entity_ids)
+        )
         cognitive_state = {
             "visible_graph_signals": {
                 entity_id: asdict(signal)
@@ -5127,6 +6215,8 @@ class CompanionRuntime:
             "observation_policy": await asyncio.to_thread(
                 self._memory.observation_policy
             ),
+            "interaction_strategy": interaction_strategy,
+            "relevant_social_profiles": social_profiles,
         }
         context = await asyncio.to_thread(
             self._memory.context_for,
@@ -5136,6 +6226,27 @@ class CompanionRuntime:
             query_embedding,
             cognitive_state,
         )
+        if interaction_strategy.get("directive"):
+            context += (
+                "\n\nEVOLVING INTERACTION STRATEGY (model-authored, evidence-derived, "
+                "revisable; never override current human intent):\n"
+                + str(interaction_strategy["directive"])
+                + (
+                    "\nRationale from prior response feedback: "
+                    + str(interaction_strategy.get("rationale") or "")
+                    if interaction_strategy.get("rationale")
+                    else ""
+                )
+            )
+        if social_profiles:
+            serialized_profiles = json.dumps(
+                social_profiles, ensure_ascii=False, default=str
+            )[: self.config.social_cognition.profile_context_characters]
+            context += (
+                "\n\nREVISABLE SOCIAL INTERACTION PROFILES (model-synthesized from linked "
+                "evidence; observed interaction patterns only, never personality facts):\n"
+                + serialized_profiles
+            )
         retrieval = self._memory.retrieval_snapshot()
         self.telemetry.record_retrieval(retrieval)
         recalled_nodes = [

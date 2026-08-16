@@ -346,13 +346,13 @@ def test_daily_narrative_ranks_interaction_and_collapses_repeated_camera_labels(
     )
     store.append_evidence(
         EvidenceRef(
-            "historical-silence-hallucination",
+            "historical-rejected-transcript",
             "speech",
             observed_at + timedelta(minutes=7),
             "asr",
             "microphone",
-            quality=0.1,
-            metadata={"transcript": "Thanks for watching!", "admitted": True},
+                quality=0.1,
+                metadata={"transcript": "Thanks for watching!", "admitted": False},
         )
     )
 

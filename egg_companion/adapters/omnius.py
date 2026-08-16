@@ -11,6 +11,7 @@ import tempfile
 import time
 import wave
 import zlib
+from datetime import datetime, timezone
 
 import aiohttp
 import numpy as np
@@ -29,12 +30,6 @@ class OmniusClient:
     _UNSAFE_LIVE_ASR_MODELS = {
         "large-v3": "exceeds the live Jetson memory budget and can terminate Omnius",
     }
-    _KNOWN_SILENCE_HALLUCINATIONS = {
-        "ご視聴ありがとうございました",
-        "thank you for watching",
-        "thanks for watching",
-    }
-
     def __init__(self, config: OmniusConfig) -> None:
         self.config = config
         self._conversation: list[dict[str, str]] = []
@@ -397,10 +392,14 @@ class OmniusClient:
             f"Utterance: {utterance!r}\nContext: {context[:1200]}\n"
             "Return only JSON: {\"directed\":boolean,\"act\":\"question\"|\"correction\"|"
             "\"person_naming\"|\"object_naming\"|\"command\"|\"acknowledgement\"|"
-            "\"conversation\",\"confidence\":number,\"tool\":\"none\"|\"web_search\","
-            "\"tool_query\":string|null}. Select web_search for an explicit request to search or "
+            "\"conversation\",\"confidence\":number,\"tool\":\"none\"|\"vision\"|\"web_search\","
+            "\"tool_query\":string|null}. Select vision when an accurate reply depends on the "
+            "speaker's presently visible scene, gesture, held or indicated item, spatial relation, "
+            "display, or readable text. Select web_search for an explicit request to search or "
             "for current external information that cannot be grounded in the embodied context. "
-            "Make tool_query a concise standalone search query."
+            "Otherwise select none. tool must be exactly none, vision, or web_search. For vision, "
+            "make tool_query the concise visual question without answering it. For web_search, make "
+            "tool_query a concise standalone search query."
         )
         try:
             parsed = json.loads(raw)
@@ -418,9 +417,11 @@ class OmniusClient:
             return None
         tool = parsed.get("tool", "none")
         tool_query = parsed.get("tool_query")
-        if tool not in {"none", "web_search"}:
+        if tool not in {"none", "vision", "web_search"}:
             return None
-        if tool == "web_search":
+        if tool in {"vision", "web_search"}:
+            if not isinstance(tool_query, str) or not tool_query.strip():
+                tool_query = utterance if tool == "vision" else None
             if not isinstance(tool_query, str) or not tool_query.strip():
                 return None
             tool_query = " ".join(tool_query.split())[:300]
@@ -556,7 +557,11 @@ class OmniusClient:
             "reasoning. Do not use lexical frequency or detector repetition as meaning by itself. "
             "Distinguish sensory evidence, heard speech, agent speech, tool evidence, inference, and "
             "uncertainty. The observation policy must be learned from this evidence and the prior "
-            "policy, not copied as a static checklist. Constitution changes must improve the general "
+            "policy, not copied as a static checklist. Treat social-reflection affect and behavioral "
+            "records as time-local uncertain interpretations, never fixed traits. Use response-feedback "
+            "evidence to assess whether Egg's communication worked, and let supported outcomes revise "
+            "future interaction strategy, curiosity, tone, and question choice. Constitution changes "
+            "must improve the general "
             "future method rather than encode facts or keywords from this day. Your response is the "
             "semantic interpretation pass: do not describe the account as still awaiting or pending "
             "model semantics merely because the provenance ledger carries that pre-synthesis state. "
@@ -602,7 +607,9 @@ class OmniusClient:
             "Reflect on an evidence-grounded daily narrative to revise future attention and inquiry. "
             "Do not expose hidden reasoning. Preserve uncertainty and provenance. Changes to the "
             "constitution must improve the general method rather than encode this day's facts or "
-            "keywords.\n"
+            "keywords. Curiosity must arise from unresolved evidence and relationship context, not a "
+            "canned question template. Compare conversation outcomes with prior interaction strategy "
+            "and revise the method when feedback supports it.\n"
             f"Constitution: {self._bounded_prompt_json(constitution, 600)}\n"
             f"Prior policy: {self._bounded_prompt_json(prior_policy, 700)}\n"
             f"Daily ledger: {self._bounded_prompt_json(daily_evidence, 1800)}\n"
@@ -1074,6 +1081,299 @@ class OmniusClient:
             "Ask one natural, specific question about whether that label is accurate."
         )
 
+    async def compose_identity_question(
+        self,
+        profile: dict[str, object],
+        scene: str,
+        history: list[dict[str, object]],
+        interaction_strategy: dict[str, object],
+    ) -> dict[str, object] | None:
+        raw = await self._structured_chat(
+            "Decide whether and how Egg should ask a presently visible, face-grounded but unnamed "
+            "person what they prefer to be called. This is social dialogue, not identity inference. "
+            "Use encounter history, the audible conversation, current grounded scene, and Egg's "
+            "evolving interaction strategy. Do not infer a name, demographic, personality, mental "
+            "state, or relationship. Ask only if it is contextually natural; otherwise decline.\n"
+            f"Face profile: {self._bounded_prompt_json(profile, 1200)}\n"
+            f"Scene: {scene[:1400]}\n"
+            f"Conversation: {self._bounded_prompt_json(history, 2200)}\n"
+            f"Interaction strategy: {self._bounded_prompt_json(interaction_strategy, 1400)}\n"
+            "Return only JSON: {\"speak\":boolean,\"question\":string|null,"
+            "\"reason\":string,\"confidence\":number}. A spoken question must be one concise, "
+            "natural sentence and must not claim prior familiarity that the evidence lacks."
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        speak = parsed.get("speak")
+        question = parsed.get("question")
+        reason = parsed.get("reason")
+        confidence = parsed.get("confidence")
+        if (
+            not isinstance(speak, bool)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 400
+            or not isinstance(confidence, (int, float))
+            or not 0 <= float(confidence) <= 1
+        ):
+            return None
+        if speak:
+            if not isinstance(question, str):
+                return None
+            question = " ".join(question.split())
+            if not question or len(question) > 240:
+                return None
+        elif question is not None:
+            return None
+        return {
+            "speak": speak,
+            "question": question,
+            "reason": " ".join(reason.split()),
+            "confidence": float(confidence),
+        }
+
+    async def compose_identity_acknowledgement(
+        self,
+        preferred_name: str,
+        utterance: str,
+        history: list[dict[str, object]],
+        interaction_strategy: dict[str, object],
+    ) -> str | None:
+        raw = await self._structured_chat(
+            "A presently visible person has just explicitly supplied their preferred name after "
+            "Egg asked. Author Egg's next brief, natural response in the ongoing conversation. "
+            "Acknowledge the information without inventing familiarity or using a canned greeting, "
+            "and use the name only as naturally as this moment warrants.\n"
+            f"Preferred name: {preferred_name!r}\n"
+            f"Utterance: {utterance!r}\n"
+            f"Ordered conversation: {self._bounded_prompt_json(history, 2200)}\n"
+            f"Interaction strategy: {self._bounded_prompt_json(interaction_strategy, 1600)}\n"
+            "Return only JSON with exactly one key: {\"reply\":string}. Keep it to one concise "
+            "spoken sentence."
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or set(parsed) != {"reply"}:
+            return None
+        reply = parsed.get("reply")
+        if not self._bounded_text(reply, 300):
+            return None
+        return " ".join(str(reply).split())
+
+    async def compose_curiosity_question(
+        self,
+        candidate: dict[str, object],
+        visible_people: list[str],
+        scene: str,
+        history: list[dict[str, object]],
+        interaction_strategy: dict[str, object],
+    ) -> dict[str, object] | None:
+        raw = await self._structured_chat(
+            "Egg's dream model selected a source-backed unresolved thread while a person is present. "
+            "Decide whether asking now is genuinely useful and socially natural. If so, author one "
+            "concise spoken question grounded in the selected thread, current scene, ordered dialogue, "
+            "and evolving interaction strategy. Do not mechanically repeat the candidate summary, bolt "
+            "a name onto a template, invent familiarity, or ask merely to appear curious.\n"
+            f"Selected thread: {self._bounded_prompt_json(candidate, 1800)}\n"
+            f"Visible preferred names: {self._bounded_prompt_json(visible_people, 400)}\n"
+            f"Scene: {scene[:1400]}\n"
+            f"Conversation: {self._bounded_prompt_json(history, 2200)}\n"
+            f"Interaction strategy: {self._bounded_prompt_json(interaction_strategy, 1400)}\n"
+            "Return only JSON: {\"speak\":boolean,\"question\":string|null,"
+            "\"reason\":string,\"confidence\":number}. If speak is false, question must be null."
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if set(parsed) != {"speak", "question", "reason", "confidence"}:
+            return None
+        speak = parsed.get("speak")
+        question = parsed.get("question")
+        reason = parsed.get("reason")
+        confidence = parsed.get("confidence")
+        if (
+            not isinstance(speak, bool)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 400
+            or not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0 <= float(confidence) <= 1
+        ):
+            return None
+        if speak:
+            if not isinstance(question, str):
+                return None
+            question = " ".join(question.split())
+            if not question or len(question) > 300:
+                return None
+        elif question is not None:
+            return None
+        return {
+            "speak": speak,
+            "question": question,
+            "reason": " ".join(reason.split()),
+            "confidence": float(confidence),
+        }
+
+    async def reflect_social_interaction(
+        self,
+        interaction: dict[str, object],
+        history: list[dict[str, object]],
+        prior_strategy: dict[str, object],
+        prior_profiles: list[dict[str, object]],
+    ) -> dict[str, object] | None:
+        """Create revisable, evidence-bound social and response feedback."""
+
+        raw = await self._structured_chat(
+            "Reflect on one completed embodied conversation turn. Describe apparent affect and "
+            "communicative behavior only as uncertain, time-local interpretations supported by the "
+            "utterance and interaction outcome. Never diagnose, infer protected traits, assign a fixed "
+            "personality, or treat tone as fact. Compare Egg's response with what followed in the "
+            "ordered history and propose a strategy revision only when the evidence supports a concrete "
+            "improvement. The strategy is a revisable communication method, never a fact about a person. "
+            "For each visibly grounded person whose evidence is distinguishable, update a longitudinal "
+            "interaction profile: synthesize sentiment trajectory, observed communication patterns, "
+            "explicitly evidenced interaction preferences, and uncertainties across prior and current "
+            "evidence. A profile describes Egg's interaction evidence, not a person's essence; preserve "
+            "contradictions and uncertainty, and emit no update when attribution is ambiguous. "
+            "Do not claim response speed, success, trust, preference, or a relationship change unless the "
+            "provided fields or a subsequent human turn directly support it; report insufficient evidence "
+            "with low confidence instead.\n"
+            f"Interaction: {self._bounded_prompt_json(interaction, 2400)}\n"
+            f"Ordered conversation: {self._bounded_prompt_json(history, 3000)}\n"
+            f"Prior strategy: {self._bounded_prompt_json(prior_strategy, 1800)}\n"
+            f"Prior social profiles: {self._bounded_prompt_json(prior_profiles, 3000)}\n"
+            "Return only JSON with exactly: momentary_affect, communicative_behavior, "
+            "relationship_update, response_feedback, strategy_revision, profile_updates. "
+            "momentary_affect has label "
+            "string, valence number -1..1, arousal number 0..1, confidence number 0..1, evidence string. "
+            "communicative_behavior, relationship_update, and response_feedback each have summary, "
+            "confidence, evidence strings. strategy_revision is null or has directive, rationale, and "
+            "confidence. profile_updates is an array; each item has exactly subject_id, summary, "
+            "sentiment_trajectory, communication_patterns, interaction_preferences, uncertainties, "
+            "confidence, evidence. The three plural fields are arrays of strings. subject_id must be "
+            "one of interaction.visible_person_ids. Keep arrays to at most 8 items and every string "
+            "under 400 characters.",
+            max_tokens=900,
+        )
+        return self.parse_social_reflection(raw)
+
+    @staticmethod
+    def parse_social_reflection(content: object) -> dict[str, object] | None:
+        if not isinstance(content, str):
+            return None
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or set(parsed) != {
+            "momentary_affect",
+            "communicative_behavior",
+            "relationship_update",
+            "response_feedback",
+            "strategy_revision",
+            "profile_updates",
+        }:
+            return None
+        affect = parsed.get("momentary_affect")
+        if not isinstance(affect, dict) or set(affect) != {
+            "label", "valence", "arousal", "confidence", "evidence"
+        }:
+            return None
+        if not all(
+            isinstance(affect.get(key), (int, float))
+            and not isinstance(affect.get(key), bool)
+            for key in ("valence", "arousal", "confidence")
+        ):
+            return None
+        if not (
+            -1 <= float(affect["valence"]) <= 1
+            and 0 <= float(affect["arousal"]) <= 1
+            and 0 <= float(affect["confidence"]) <= 1
+        ):
+            return None
+        for field in ("label", "evidence"):
+            if not OmniusClient._bounded_text(affect.get(field), 400):
+                return None
+        for key in (
+            "communicative_behavior", "relationship_update", "response_feedback"
+        ):
+            item = parsed.get(key)
+            if not isinstance(item, dict) or set(item) != {
+                "summary", "confidence", "evidence"
+            }:
+                return None
+            if (
+                not OmniusClient._bounded_text(item.get("summary"), 400)
+                or not OmniusClient._bounded_text(item.get("evidence"), 400)
+                or not isinstance(item.get("confidence"), (int, float))
+                or isinstance(item.get("confidence"), bool)
+                or not 0 <= float(item["confidence"]) <= 1
+            ):
+                return None
+        revision = parsed.get("strategy_revision")
+        if revision is not None:
+            if not isinstance(revision, dict) or set(revision) != {
+                "directive", "rationale", "confidence"
+            }:
+                return None
+            if (
+                not OmniusClient._bounded_text(revision.get("directive"), 1000)
+                or not OmniusClient._bounded_text(revision.get("rationale"), 400)
+                or not isinstance(revision.get("confidence"), (int, float))
+                or isinstance(revision.get("confidence"), bool)
+                or not 0 <= float(revision["confidence"]) <= 1
+            ):
+                return None
+        updates = parsed.get("profile_updates")
+        if not isinstance(updates, list) or len(updates) > 8:
+            return None
+        for update in updates:
+            if not isinstance(update, dict) or set(update) != {
+                "subject_id",
+                "summary",
+                "sentiment_trajectory",
+                "communication_patterns",
+                "interaction_preferences",
+                "uncertainties",
+                "confidence",
+                "evidence",
+            }:
+                return None
+            if any(
+                not OmniusClient._bounded_text(update.get(field), 400)
+                for field in (
+                    "subject_id", "summary", "sentiment_trajectory", "evidence"
+                )
+            ):
+                return None
+            confidence = update.get("confidence")
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= float(confidence) <= 1
+            ):
+                return None
+            for field in (
+                "communication_patterns", "interaction_preferences", "uncertainties"
+            ):
+                values = update.get(field)
+                if (
+                    not isinstance(values, list)
+                    or len(values) > 8
+                    or any(
+                        not OmniusClient._bounded_text(value, 400) for value in values
+                    )
+                ):
+                    return None
+        return parsed
+
     async def interpret_observation_feedback(self, utterance: str, candidate: dict[str, object]) -> dict[str, str] | None:
         raw = await self._structured_chat(
             "Interpret this response to a pending visual calibration question.\n"
@@ -1431,11 +1731,6 @@ class OmniusClient:
         if isinstance(backend_rejection, str) and backend_rejection.strip():
             return backend_rejection.strip()
         text = payload.get("text")
-        if isinstance(text, str) and OmniusClient._is_known_silence_hallucination(text):
-            # Some backends return text with no segment array. This guard must
-            # precede segment-quality handling or their most common silence
-            # hallucination bypasses grounding entirely.
-            return "known silence hallucination"
         segments = payload.get("segments")
         scored = (
             [segment for segment in segments if isinstance(segment, dict)]
@@ -1566,24 +1861,6 @@ class OmniusClient:
             for character in text.casefold()
         )
         return " ".join(normalized.split())
-
-    @staticmethod
-    def _is_known_silence_hallucination(text: str) -> bool:
-        normalized = OmniusClient._normalized_transcript(text)
-        words = normalized.split()
-        if len(words) <= 10 and (
-            "thanks for watching" in normalized
-            or "thank you for watching" in normalized
-            or "thank you so much for watching" in normalized
-        ):
-            return True
-        for phrase in OmniusClient._KNOWN_SILENCE_HALLUCINATIONS:
-            phrase_words = phrase.split()
-            if words and len(words) % len(phrase_words) == 0 and words == phrase_words * (
-                len(words) // len(phrase_words)
-            ):
-                return True
-        return False
 
     @staticmethod
     def _segment_metadata(segments: object, *, redact_text: bool) -> list[dict[str, object]]:
@@ -1744,16 +2021,23 @@ class OmniusClient:
                 {
                     "role": "user",
                     "content": (
-                        "Classify only the opaque segmented object in this PNG; ignore transparent pixels and background. "
-                        "Identify the specific physical item with a short ordinary noun phrase. Correct the detector "
-                        "when its category is vague, stylistic, or unsupported by the pixels. Do not return a scene, "
-                        "genre, material, person occupation, or visual style as the object label. "
+                        "Adjudicate only the opaque segmented pixels in this PNG; transparent pixels and background are "
+                        "not evidence. First decide whether those pixels contain a coherent physical object rather than "
+                        "a fragment, shadow, texture, body part, duplicate mask, or detector hallucination. If grounded, "
+                        "identify it with a short ordinary noun phrase and describe its actually visible shape, color, "
+                        "parts, markings, damage, orientation, and state without inventing hidden properties. Independently "
+                        "state whether the detector's proposed category is supported. Do not return a scene, genre, "
+                        "material, person occupation, or visual style as the object label. "
                         "Independently inspect the opaque pixels for actually visible printed, written, or displayed "
                         "characters. Do not infer text merely because this kind of object commonly has a label, and "
                         "do not guess or transcribe unreadable characters. Return JSON only: "
-                        "{\"label\":string|null,\"confidence\":number,\"visible_text\":boolean,"
+                        "{\"object_present\":boolean,\"label\":string|null,\"confidence\":number,"
+                        "\"appearance_description\":string,\"detector_supported\":boolean,"
+                        "\"detector_assessment\":string,\"visible_text\":boolean,"
                         "\"text_regions\":[string]}. text_regions is at most four short location descriptions "
                         "such as 'upper-left display' or 'shirt front'; it is empty when no text is visibly grounded. "
+                        "When object_present is false, label must be null, confidence describes that rejection, and "
+                        "appearance_description must say what the pixels actually show. "
                         f"Detector candidate: {detector_label!r} at {detector_confidence:.2f}."
                     ),
                     "images": [image_data],
@@ -1765,7 +2049,7 @@ class OmniusClient:
             # Ornith otherwise spends the entire generation budget reasoning and
             # can finish with an empty content field before it emits the JSON.
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64},
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 180},
             "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -1784,6 +2068,68 @@ class OmniusClient:
             raise RuntimeError("Omnius VLM returned an invalid completion") from error
         return self.parse_object_analysis(content)
 
+    async def compare_masked_object_candidate(
+        self,
+        reference_png: bytes,
+        current_png: bytes,
+        reference: dict[str, object],
+        detector_label: str,
+        detector_confidence: float,
+    ) -> dict[str, object] | None:
+        """Adjudicate a CLIP proposal from two pixel-grounded object masks."""
+
+        payload = {
+            "model": self.config.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "The first image is retained evidence for an existing object profile. The second image is a new "
+                        "segmented detection. Transparent pixels are not evidence. Decide whether the second contains a "
+                        "coherent physical object, and whether both images show the same physical object instance—not "
+                        "merely two objects of the same category. Confirm same_instance only when visible shape, parts, "
+                        "markings, wear, text, and other distinctive evidence agree and no visible conflict exists; an "
+                        "embedding similarity is only a proposal. If viewpoint or occlusion prevents instance-level "
+                        "adjudication, return false. Describe the current object's visible appearance and correct both "
+                        "the detector and retained label when pixels require it. Return JSON only: "
+                        "{\"object_present\":boolean,\"same_instance\":boolean,\"confidence\":number,"
+                        "\"label\":string|null,\"appearance_description\":string,\"detector_supported\":boolean,"
+                        "\"analysis\":string,\"visible_correspondences\":[string],\"visible_conflicts\":[string],"
+                        "\"visible_text\":boolean,\"text_regions\":[string]}.\n"
+                        f"Retained profile metadata (not pixel truth): {json.dumps(reference, ensure_ascii=False)[:1000]}\n"
+                        f"Current detector proposal: {detector_label!r} at {detector_confidence:.2f}."
+                    ),
+                    "images": [
+                        base64.b64encode(reference_png).decode("ascii"),
+                        base64.b64encode(current_png).decode("ascii"),
+                    ],
+                }
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 240},
+            "keep_alive": "5m",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with self._model_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
+                    json=payload,
+                ) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(
+                            f"Ornith object comparison HTTP {response.status}: {detail}"
+                        )
+                    result = await response.json()
+        try:
+            content = result["message"]["content"]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError("Ornith object comparison returned an invalid completion") from error
+        return self.parse_object_comparison(content)
+
     async def classify_masked_object(
         self, image_png: bytes, detector_label: str, detector_confidence: float
     ) -> tuple[str, float] | None:
@@ -1792,6 +2138,8 @@ class OmniusClient:
             image_png, detector_label, detector_confidence
         )
         if analysis is None:
+            return None
+        if analysis.get("object_present") is not True or not analysis.get("label"):
             return None
         return str(analysis["label"]), float(analysis["confidence"])
 
@@ -1904,11 +2252,27 @@ class OmniusClient:
             ] if isinstance(correspondences, list) else [],
         }
 
-    async def answer_visual_question(
-        self, image_jpeg: bytes, utterance: str, scene: str
-    ) -> str | None:
-        """Answer a deictic question from one current camera frame."""
-        image_data = base64.b64encode(image_jpeg).decode("ascii")
+    async def answer_visual_question_analysis(
+        self,
+        frames: list[tuple[str, bytes, str]],
+        utterance: str,
+        scene: str,
+    ) -> dict[str, object] | None:
+        """Answer from ASR-boundary frames, preserving grounding metadata."""
+
+        if not frames:
+            return None
+        visual_payload, tile_ledger = await asyncio.to_thread(
+            self._visual_contact_sheet, frames
+        )
+        frame_ledger = [
+            {
+                "camera_id": camera_id,
+                "captured_at": captured_at,
+                "contact_sheet_tile": tile_ledger[index],
+            }
+            for index, (camera_id, _image, captured_at) in enumerate(frames)
+        ]
         payload = {
             "model": self.config.vision_model,
             "messages": [
@@ -1916,22 +2280,26 @@ class OmniusClient:
                     "role": "user",
                     "content": (
                         "You are the visual perception path for an embodied companion. "
-                        "Answer the speaker's question using only visible pixels in this current frame. "
+                        "Answer the speaker's question using only visible pixels in the supplied labeled camera "
+                        "contact sheet, whose tiles were all "
+                        "frozen at the accepted utterance boundary. Reconcile cameras when they overlap and cite only "
+                        "camera IDs whose pixels support the answer. "
                         "Be direct and conversational in one short sentence. If an item is partly occluded, "
                         "say what it most likely is and express uncertainty. If the pixels do not support an "
                         "answer, say what must be moved into view. Do not identify people or infer sensitive "
-                        "traits. ASR can confuse 'what' with 'where'; when the utterance contains 'am I holding', "
-                        "the intended question is what item is held. Return JSON only: "
-                        '{"answer":string,"grounded":boolean,"confidence":number}.\n'
-                        f"Speaker utterance: {utterance!r}\nCurrent detector context: {scene[:800]}"
+                        "traits. Do not let detector labels override pixels. Return JSON only: "
+                        '{"answer":string,"grounded":boolean,"confidence":number,'
+                        '"supporting_camera_ids":[string],"observations":[string],"uncertainty":string|null}.\n'
+                        f"Speaker utterance: {utterance!r}\nFrame ledger: {json.dumps(frame_ledger)}\n"
+                        f"Contemporaneous detector context (hypotheses, not truth): {scene[:1200]}"
                     ),
-                    "images": [image_data],
+                    "images": [base64.b64encode(visual_payload).decode("ascii")],
                 }
             ],
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 96},
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 180},
             "keep_alive": "5m",
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -1950,20 +2318,105 @@ class OmniusClient:
             content = result["message"]["content"]
             parsed = json.loads(content)
             answer = parsed.get("answer")
+            grounded = parsed.get("grounded")
             confidence = float(parsed.get("confidence", 0.0))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
-        if not isinstance(answer, str):
+        if not isinstance(answer, str) or not isinstance(grounded, bool):
             return None
         normalized = " ".join(answer.strip().split())
         if not normalized or len(normalized) > 320 or not 0 <= confidence <= 1:
             return None
-        return normalized
+        valid_camera_ids = {camera_id for camera_id, _image, _captured_at in frames}
+        supporting = parsed.get("supporting_camera_ids")
+        observations = parsed.get("observations")
+        uncertainty = parsed.get("uncertainty")
+        return {
+            "answer": normalized,
+            "grounded": grounded,
+            "confidence": confidence,
+            "supporting_camera_ids": [
+                item for item in supporting[:8]
+                if isinstance(item, str) and item in valid_camera_ids
+            ] if isinstance(supporting, list) else [],
+            "observations": [
+                " ".join(item.split())[:240]
+                for item in observations[:8]
+                if isinstance(item, str) and item.strip()
+            ] if isinstance(observations, list) else [],
+            "uncertainty": (
+                " ".join(uncertainty.split())[:300]
+                if isinstance(uncertainty, str) and uncertainty.strip()
+                else None
+            ),
+        }
+
+    def _visual_contact_sheet(
+        self, frames: list[tuple[str, bytes, str]]
+    ) -> tuple[bytes, list[str]]:
+        """Pack simultaneous views into one labeled, locally generated VLM image."""
+        from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+        count = len(frames)
+        columns = 1 if count == 1 else 2
+        rows = math.ceil(count / columns)
+        size = self.config.visual_contact_sheet_size
+        tile_width = size // columns
+        tile_height = size // rows
+        sheet = Image.new("RGB", (tile_width * columns, tile_height * rows), "black")
+        draw = ImageDraw.Draw(sheet)
+        font = ImageFont.load_default()
+        ledger: list[str] = []
+        for index, (camera_id, encoded, _captured_at) in enumerate(frames):
+            row, column = divmod(index, columns)
+            image = Image.open(io.BytesIO(encoded)).convert("RGB")
+            fitted = ImageOps.contain(
+                image,
+                (tile_width, tile_height),
+                method=Image.Resampling.LANCZOS,
+            )
+            left = column * tile_width + (tile_width - fitted.width) // 2
+            top = row * tile_height + (tile_height - fitted.height) // 2
+            sheet.paste(fitted, (left, top))
+            label = str(camera_id)[:80]
+            label_box = draw.textbbox((0, 0), label, font=font)
+            label_width = label_box[2] - label_box[0]
+            label_height = label_box[3] - label_box[1]
+            label_x = column * tile_width + 6
+            label_y = row * tile_height + 6
+            draw.rectangle(
+                (
+                    label_x - 3,
+                    label_y - 3,
+                    label_x + label_width + 3,
+                    label_y + label_height + 3,
+                ),
+                fill="black",
+            )
+            draw.text((label_x, label_y), label, fill="white", font=font)
+            ledger.append(f"row {row + 1}, column {column + 1}")
+        output = io.BytesIO()
+        sheet.save(output, format="JPEG", quality=82, optimize=True)
+        return output.getvalue(), ledger
+
+    async def answer_visual_question(
+        self, image_jpeg: bytes, utterance: str, scene: str
+    ) -> str | None:
+        """Compatibility view for callers that provide one current frame."""
+
+        analysis = await self.answer_visual_question_analysis(
+            [("camera", image_jpeg, datetime.now(timezone.utc).isoformat())],
+            utterance,
+            scene,
+        )
+        return str(analysis["answer"]) if analysis is not None else None
 
     @staticmethod
     def parse_object_classification(content: object) -> tuple[str, float] | None:
         analysis = OmniusClient.parse_object_analysis(content)
         if analysis is None:
+            return None
+        if analysis.get("object_present", True) is not True or not analysis.get("label"):
             return None
         return str(analysis["label"]), float(analysis["confidence"])
 
@@ -1976,10 +2429,16 @@ class OmniusClient:
         except json.JSONDecodeError:
             return None
         label, confidence = parsed.get("label"), parsed.get("confidence")
-        if not isinstance(label, str) or not isinstance(confidence, (int, float)):
+        object_present = parsed.get("object_present", isinstance(label, str))
+        if (
+            not isinstance(object_present, bool)
+            or not isinstance(confidence, (int, float))
+            or (object_present and not isinstance(label, str))
+            or (not object_present and label is not None)
+        ):
             return None
-        normalized = " ".join(label.strip().split())
-        if not normalized or len(normalized) > 64 or not 0 <= float(confidence) <= 1:
+        normalized = " ".join(label.strip().split()) if isinstance(label, str) else ""
+        if (object_present and (not normalized or len(normalized) > 64)) or not 0 <= float(confidence) <= 1:
             return None
         visible_text = parsed.get("visible_text", False)
         text_regions = parsed.get("text_regions", [])
@@ -1994,12 +2453,94 @@ class OmniusClient:
             # A visual-language hint can schedule OCR but must itself be
             # internally consistent before it enters provenance.
             visible_text = bool(normalized_regions)
-        return {
-            "label": normalized,
+        result = {
+            "label": normalized if object_present else None,
             "confidence": float(confidence),
             "visible_text": visible_text,
             "text_regions": normalized_regions,
         }
+        if not any(
+            key in parsed
+            for key in (
+                "object_present",
+                "appearance_description",
+                "detector_supported",
+                "detector_assessment",
+            )
+        ):
+            return result
+        return {
+            **result,
+            "object_present": object_present,
+            "appearance_description": " ".join(
+                str(
+                    parsed.get("appearance_description")
+                    or normalized
+                    or "segmented pixels did not ground a coherent object"
+                ).split()
+            )[:600],
+            "detector_supported": bool(parsed.get("detector_supported", True)),
+            "detector_assessment": " ".join(
+                str(parsed.get("detector_assessment") or "").split()
+            )[:400],
+        }
+
+    @staticmethod
+    def parse_object_comparison(content: object) -> dict[str, object] | None:
+        if not isinstance(content, str):
+            return None
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        object_present = parsed.get("object_present")
+        same_instance = parsed.get("same_instance")
+        confidence = parsed.get("confidence")
+        label = parsed.get("label")
+        description = parsed.get("appearance_description")
+        analysis = parsed.get("analysis")
+        if (
+            not isinstance(object_present, bool)
+            or not isinstance(same_instance, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= float(confidence) <= 1
+            or (object_present and not isinstance(label, str))
+            or (not object_present and label is not None)
+            or not isinstance(description, str)
+            or not isinstance(analysis, str)
+        ):
+            return None
+        normalized_label = " ".join(label.split()) if isinstance(label, str) else None
+        if object_present and (not normalized_label or len(normalized_label) > 64):
+            return None
+        result = {
+            "object_present": object_present,
+            "same_instance": same_instance if object_present else False,
+            "confidence": float(confidence),
+            "label": normalized_label,
+            "appearance_description": " ".join(description.split())[:600],
+            "detector_supported": bool(parsed.get("detector_supported", False)),
+            "analysis": " ".join(analysis.split())[:600],
+            "visible_correspondences": [
+                " ".join(item.split())[:180]
+                for item in parsed.get("visible_correspondences", [])[:8]
+                if isinstance(item, str) and item.strip()
+            ] if isinstance(parsed.get("visible_correspondences"), list) else [],
+            "visible_conflicts": [
+                " ".join(item.split())[:180]
+                for item in parsed.get("visible_conflicts", [])[:8]
+                if isinstance(item, str) and item.strip()
+            ] if isinstance(parsed.get("visible_conflicts"), list) else [],
+            "visible_text": bool(parsed.get("visible_text", False)),
+            "text_regions": [
+                " ".join(item.split())[:80]
+                for item in parsed.get("text_regions", [])[:4]
+                if isinstance(item, str) and item.strip()
+            ] if isinstance(parsed.get("text_regions"), list) else [],
+        }
+        if not result["appearance_description"] or not result["analysis"]:
+            return None
+        return result
 
     async def audit_object_label(self, profile: dict[str, object]) -> dict[str, object] | None:
         """Cheap, text-only confidence audit of an already-labelled object.
@@ -2041,8 +2582,9 @@ class OmniusClient:
             raise RuntimeError("Omnius TTS response is not a WAV payload")
         return audio
 
-    async def _structured_chat(self, prompt: str) -> str:
+    async def _structured_chat(self, prompt: str, *, max_tokens: int = 128) -> str:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        bounded_tokens = max(64, min(int(max_tokens), 1024))
         payload = {
             "model": self.config.model,
             "messages": [
@@ -2057,7 +2599,11 @@ class OmniusClient:
             "tools": False,
             "think": self.config.reasoning_enabled,
             "realtime": True,
-            "realtime_options": {"max_history_messages": 4, "max_tokens": 128},
+            "max_tokens": bounded_tokens,
+            "realtime_options": {
+                "max_history_messages": 4,
+                "max_tokens": bounded_tokens,
+            },
         }
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:

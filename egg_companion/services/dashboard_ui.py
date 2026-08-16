@@ -726,6 +726,12 @@ PAGE = r"""<!doctype html>
     let catalogRetry = null;
     let voiceFormDirty = false;
     let refreshing = false;
+    let conversationLoading = false;
+    let conversationLoadedAt = 0;
+    let conversationLedger = [];
+    let dreamLoading = false;
+    let dreamLoadedAt = 0;
+    let dreamState = null;
     let lastWave = [];
     let lastPeopleSignature = '';
     let lastObjectSignature = '';
@@ -764,7 +770,9 @@ PAGE = r"""<!doctype html>
       if (route === '/configuration' && !effectiveConfig) loadConfiguration();
       if (route === '/vision' && currentState) renderCameras(currentState.telemetry?.cameras || []);
       if (route === '/voice' && !catalog) loadCatalog();
+      if (route === '/' || route === '/voice') loadConversation();
       if (route === '/graph') loadGraph();
+      if (route === '/dreams') loadDreams();
       if (route === '/narrative') loadNarratives();
       if (currentState) renderActivePage(currentState, route);
       if (priorRoute !== route) window.scrollTo({top: 0, behavior: 'instant'});
@@ -913,7 +921,7 @@ PAGE = r"""<!doctype html>
 
     function renderConversation(telemetry, target, full = false) {
       const node = $(target);
-      const durable = Array.isArray(telemetry.conversation_history) ? telemetry.conversation_history : [];
+      const durable = conversationLedger;
       let turns = full ? durable : durable.slice(-4);
       if (!turns.length) {
         turns = [
@@ -933,6 +941,25 @@ PAGE = r"""<!doctype html>
         return `<div class="message ${turn.role === 'agent' ? 'agent' : 'heard'} ${turn.status === 'suppressed' ? 'suppressed' : ''}"><span class="message-role">${turn.role === 'agent' ? 'Egg' : 'Heard'}</span>${esc(turn.text)}${tagMarkup}<span class="message-meta">${turn.at ? esc(new Date(turn.at).toLocaleString()) + ' · ' : ''}${esc(stateLabel(turn.status || 'final'))}</span></div>`;
       }).join('');
       node.scrollTop = pinnedToBottom ? node.scrollHeight : previousScroll;
+    }
+    async function loadConversation(force = false) {
+      const now = Date.now();
+      if (conversationLoading || (!force && now - conversationLoadedAt < 4000)) return;
+      conversationLoading = true;
+      try {
+        const response = await fetch('/api/voice/conversation?limit=5000', {cache:'no-store'});
+        if (!response.ok) throw new Error(await response.text());
+        const ledger = await response.json();
+        if (Array.isArray(ledger)) conversationLedger = ledger;
+        conversationLoadedAt = Date.now();
+        const telemetry = currentState?.telemetry || {};
+        if ($('.page.active')?.dataset.page === '/') renderConversation(telemetry, '#overview-conversation');
+        if ($('.page.active')?.dataset.page === '/voice') renderConversation(telemetry, '#conversation', true);
+      } catch (_) {
+        conversationLoadedAt = 0;
+      } finally {
+        conversationLoading = false;
+      }
     }
     function renderOverview(state) {
       const telemetry = state.telemetry || {}, cameras = telemetry.cameras || [], asr = telemetry.asr || {}, memory = telemetry.memory?.lifecycle || {}, active = memory.active || [], checks = state.checks || [];
@@ -1061,6 +1088,23 @@ PAGE = r"""<!doctype html>
       }
       $('#dream-history').innerHTML = table(['Started','State','Device','Profiles / samples','Proposals','Merges','Day chapters / story','Duration'], runs.map(run => { const replay = run.details?.chronological_replay || {}; return [esc(new Date(run.started_at).toLocaleString()), statusBadge(run.state), esc(run.device || '—'), `${esc(run.profiles_examined || 0)} / ${esc(run.samples_embedded || 0)}`, esc(run.proposals || 0), esc(run.merges || 0), replay.state === 'failed' ? '<span class="badge bad">replay failed</span>' : `${esc(replay.days_replayed || 0)} / r${esc(replay.story_revision ?? '—')}`, `${Number(run.duration_seconds || 0).toFixed(2)} s`]; }), 'No dream runs recorded');
     }
+    async function loadDreams(force = false) {
+      if (dreamLoading || (!force && Date.now() - dreamLoadedAt < 5000)) return;
+      dreamLoading = true;
+      try {
+        const response = await fetch('/api/dreams', {cache:'no-store'});
+        if (!response.ok) throw new Error(await response.text());
+        dreamState = await response.json();
+        dreamLoadedAt = Date.now();
+        if ($('.page.active')?.dataset.page === '/dreams') {
+          renderDreams(dreamState, currentState?.identity_summary || {});
+        }
+      } catch (_) {
+        dreamLoadedAt = 0;
+      } finally {
+        dreamLoading = false;
+      }
+    }
     function renderNarrativeIndex(chapters) {
       narrativeIndex = chapters;
       const replay = currentState?.dreams?.narrative_replay || {}, remaining = Number(replay.backlog_remaining || 0);
@@ -1118,7 +1162,7 @@ PAGE = r"""<!doctype html>
       else if (route === '/entities') renderEntities(state);
       else if (route === '/memory') renderMemory(state.memory);
       else if (route === '/cognition') renderCognition(telemetry);
-      else if (route === '/dreams') renderDreams(state.dreams, state.identity_summary);
+      else if (route === '/dreams') renderDreams(dreamState || state.dreams, state.identity_summary);
       else if (route === '/narrative') loadNarratives();
       else if (route === '/system') renderSystem(state);
     }
@@ -1139,6 +1183,9 @@ PAGE = r"""<!doctype html>
       try {
         const response = await fetch('/api/state', {cache:'no-store'}); if (!response.ok) throw new Error(await response.text());
         render(await response.json());
+        const route = $('.page.active')?.dataset.page;
+        if (route === '/' || route === '/voice') loadConversation();
+        if (route === '/dreams') loadDreams();
       } catch (error) { setConnection('offline', 'Disconnected', 'Retrying automatically'); $('#last-sync').textContent = 'Update failed'; }
       finally { refreshing = false; }
     }

@@ -157,7 +157,8 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "voice-service-state" in dashboard.PAGE
     assert "voiceFormDirty" in dashboard.PAGE
     assert "Complete durable audible ledger" in dashboard.PAGE
-    assert "telemetry.conversation_history" in dashboard.PAGE
+    assert "conversationLedger" in dashboard.PAGE
+    assert "/api/voice/conversation?limit=5000" in dashboard.PAGE
     assert "message-tags" in dashboard.PAGE
     assert "turn.tags" in dashboard.PAGE
     assert "health recheck running" in dashboard.PAGE

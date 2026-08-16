@@ -67,6 +67,8 @@ class IdentityLibrary:
         self._tracks: dict[str, list[_PersonTrack]] = {}
         self._last_match_components: dict[str, float] = {}
         self._last_match_outcome = "new"
+        self._dashboard_snapshot_cache: list[dict[str, object]] = []
+        self._dashboard_summary_cache: dict[str, object] = {}
         if config.enabled:
             self._directory.mkdir(parents=True, exist_ok=True)
             self._database = sqlite3.connect(self._directory / "identities.sqlite3", check_same_thread=False)
@@ -74,6 +76,29 @@ class IdentityLibrary:
             self._create_schema()
             self._load()
             self._seed_face_galleries()
+
+    def dashboard_snapshot(
+        self,
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Return a recent projection without waiting behind face inference.
+
+        Face embedding/profile updates may legitimately hold the gallery lock
+        while CUDA work finishes. The dashboard is observational and should
+        display the last coherent projection during that interval.
+        """
+        if not self._lock.acquire(blocking=False):
+            return (
+                [dict(item) for item in self._dashboard_snapshot_cache],
+                dict(self._dashboard_summary_cache),
+            )
+        try:
+            rows = self.snapshot()
+            summary = self.summary()
+            self._dashboard_snapshot_cache = [dict(item) for item in rows]
+            self._dashboard_summary_cache = dict(summary)
+            return rows, summary
+        finally:
+            self._lock.release()
 
     def observe(
         self,

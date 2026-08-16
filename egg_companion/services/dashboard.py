@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import re
+import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -110,6 +112,19 @@ class ReadinessMonitor:
 
 
 async def serve_dashboard(config: EggConfig, port: int) -> None:
+    dashboard_executor = ThreadPoolExecutor(
+        max_workers=6, thread_name_prefix="egg-dashboard"
+    )
+
+    async def dashboard_call(function, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(dashboard_executor, function, *args)
+
+    async def measured_dashboard_call(name: str, function, *args):
+        started = time.monotonic()
+        value = await dashboard_call(function, *args)
+        return name, value, round((time.monotonic() - started) * 1000, 1)
+
     readiness = ReadinessMonitor(config)
     state: dict[str, object] = {
         "runtime": "checking",
@@ -162,22 +177,37 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     async def state_handler(_: web.Request) -> web.Response:
         await refresh()
         runtime = state["companion"]
-        telemetry = runtime.telemetry.snapshot(config) if isinstance(runtime, CompanionRuntime) else {"cameras": []}
+        dashboard_timings: dict[str, float] = {}
         if isinstance(runtime, CompanionRuntime):
-            telemetry["conversation_history"] = await asyncio.to_thread(
-                runtime.conversation_history, 5000
+            measured = await asyncio.gather(
+                measured_dashboard_call("telemetry", runtime.telemetry.snapshot, config),
+                measured_dashboard_call("identities", runtime.identities.dashboard_snapshot),
+                measured_dashboard_call("dreams", runtime.dreams_summary_snapshot),
+                measured_dashboard_call("objects", runtime.objects.dashboard_snapshot),
+                measured_dashboard_call("memory", runtime.memory_snapshot),
             )
+            values = {name: value for name, value, _ in measured}
+            dashboard_timings = {name: duration for name, _, duration in measured}
+            telemetry = values["telemetry"]
+            identities, identity_summary = values["identities"]
+            dreams = values["dreams"]
+            objects = values["objects"]
+            memory = values["memory"]
+        else:
+            telemetry = {"cameras": []}
+            identities, identity_summary, dreams, objects, memory = [], {}, {}, [], {}
         return web.json_response({
             "runtime": state["runtime"],
             "checks": [{"name": check.name, "status": check.status, "detail": check.detail} for check in state["checks"]],
             "readiness": readiness.snapshot(),
             "omnius": str(config.omnius.base_url),
             "telemetry": telemetry,
-            "identities": runtime.identities.snapshot() if isinstance(runtime, CompanionRuntime) else [],
-            "identity_summary": runtime.identities.summary() if isinstance(runtime, CompanionRuntime) else {},
-            "dreams": runtime.dreams_snapshot() if isinstance(runtime, CompanionRuntime) else {},
-            "objects": runtime.objects.snapshot() if isinstance(runtime, CompanionRuntime) else [],
-            "memory": runtime.memory_snapshot() if isinstance(runtime, CompanionRuntime) else {},
+            "identities": identities,
+            "identity_summary": identity_summary,
+            "dreams": dreams,
+            "objects": objects,
+            "memory": memory,
+            "dashboard_timings_ms": dashboard_timings,
         })
 
     async def index_handler(_: web.Request) -> web.Response:
@@ -211,7 +241,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             node_limit = max(50, min(2000, int(request.query.get("limit", "1500"))))
         except ValueError as error:
             raise web.HTTPBadRequest(text="limit must be an integer") from error
-        payload = await asyncio.to_thread(companion().knowledge_graph_snapshot, node_limit)
+        payload = await dashboard_call(companion().knowledge_graph_snapshot, node_limit)
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def graph_node_handler(request: web.Request) -> web.Response:
@@ -219,13 +249,13 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         source_id = request.query.get("id", "")
         if kind not in {"entity", "evidence", "claim", "episode"} or not source_id:
             raise web.HTTPBadRequest(text="kind and id identify a graph node")
-        detail = await asyncio.to_thread(companion().graph_node_detail, kind, source_id)
+        detail = await dashboard_call(companion().graph_node_detail, kind, source_id)
         if detail is None:
             raise web.HTTPNotFound(text="graph node is not available")
         return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
     async def evidence_media_handler(request: web.Request) -> web.Response:
-        artifact = await asyncio.to_thread(
+        artifact = await dashboard_call(
             companion().evidence_media, request.match_info["evidence_id"]
         )
         if artifact is None:
@@ -307,7 +337,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         )
 
     async def identity_timeline_handler(request: web.Request) -> web.Response:
-        timeline = await asyncio.to_thread(
+        timeline = await dashboard_call(
             companion().identity_timeline, request.match_info["profile_id"]
         )
         if timeline is None:
@@ -333,7 +363,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             limit = max(1, min(20000, int(request.query.get("limit", "5000"))))
         except ValueError as error:
             raise web.HTTPBadRequest(text="limit must be an integer") from error
-        payload = await asyncio.to_thread(companion().conversation_history, limit)
+        payload = await dashboard_call(companion().conversation_history, limit)
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def voice_config_handler(request: web.Request) -> web.Response:
@@ -395,11 +425,11 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def memory_handler(_: web.Request) -> web.Response:
-        return web.json_response(await asyncio.to_thread(companion().memory_snapshot))
+        return web.json_response(await dashboard_call(companion().memory_snapshot))
 
     async def dreams_handler(_: web.Request) -> web.Response:
         return web.json_response(
-            await asyncio.to_thread(companion().dreams_snapshot),
+            await dashboard_call(companion().dreams_snapshot),
             headers={"Cache-Control": "no-store"},
         )
 
@@ -417,7 +447,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         except ValueError as error:
             raise web.HTTPBadRequest(text="limit must be an integer") from error
         return web.json_response(
-            await asyncio.to_thread(companion().daily_narratives, limit),
+            await dashboard_call(companion().daily_narratives, limit),
             headers={"Cache-Control": "no-store"},
         )
 
@@ -427,13 +457,13 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             datetime.strptime(local_date, "%Y-%m-%d")
         except ValueError as error:
             raise web.HTTPBadRequest(text="local_date must be YYYY-MM-DD") from error
-        result = await asyncio.to_thread(companion().daily_narrative, local_date)
+        result = await dashboard_call(companion().daily_narrative, local_date)
         if result is None:
             raise web.HTTPNotFound(text="daily narrative not found")
         return web.json_response(result, headers={"Cache-Control": "no-store"})
 
     async def memory_entity_handler(request: web.Request) -> web.Response:
-        detail = await asyncio.to_thread(
+        detail = await dashboard_call(
             companion().inspect_memory_entity, request.match_info["entity_id"]
         )
         if detail is None:
@@ -441,16 +471,16 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         return web.json_response(detail)
 
     async def memory_episodes_handler(_: web.Request) -> web.Response:
-        return web.json_response(await asyncio.to_thread(companion().memory_episodes))
+        return web.json_response(await dashboard_call(companion().memory_episodes))
 
     async def memory_claims_handler(_: web.Request) -> web.Response:
-        return web.json_response(await asyncio.to_thread(companion().memory_claims))
+        return web.json_response(await dashboard_call(companion().memory_claims))
 
     async def memory_alias_handler(request: web.Request) -> web.Response:
         require_loopback(request)
         body = await request.json()
         try:
-            result = await asyncio.to_thread(
+            result = await dashboard_call(
                 companion().add_memory_alias, request.match_info["entity_id"], str(body["alias"])
             )
         except KeyError as error:
@@ -463,7 +493,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         require_loopback(request)
         body = await request.json()
         try:
-            result = await asyncio.to_thread(
+            result = await dashboard_call(
                 companion().correct_memory_claim,
                 request.match_info["claim_id"],
                 str(body["replacement"]),
@@ -476,7 +506,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
 
     async def memory_export_handler(_: web.Request) -> web.Response:
         try:
-            payload = await asyncio.to_thread(companion().export_memory)
+            payload = await dashboard_call(companion().export_memory)
         except PermissionError as error:
             raise web.HTTPForbidden(text=str(error)) from error
         return web.json_response(
@@ -486,7 +516,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
 
     async def memory_entity_export_handler(request: web.Request) -> web.Response:
         try:
-            payload = await asyncio.to_thread(
+            payload = await dashboard_call(
                 companion().export_memory_entity, request.match_info["entity_id"]
             )
         except KeyError as error:
@@ -499,7 +529,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         require_loopback(request)
         body = await request.json()
         try:
-            result = await asyncio.to_thread(
+            result = await dashboard_call(
                 companion().revise_memory,
                 str(body["target_type"]),
                 str(body["target_id"]),
@@ -527,7 +557,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     async def memory_delete_handler(request: web.Request) -> web.Response:
         require_loopback(request)
         try:
-            await asyncio.to_thread(
+            await dashboard_call(
                 companion().delete_memory_entity, request.match_info["entity_id"]
             )
         except KeyError as error:
@@ -541,7 +571,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         runtime = companion()
         if runtime._memory is None:
             raise web.HTTPConflict(text="cognitive memory is disabled")
-        result = await asyncio.to_thread(runtime._memory.consolidate)
+        result = await dashboard_call(runtime._memory.consolidate)
         runtime.telemetry.record_consolidation(result)
         return web.json_response(result)
 
@@ -605,8 +635,9 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         if isinstance(task, asyncio.Task):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        audit_task = state["audit_task"]
+        audit_task = readiness._task
         if isinstance(audit_task, asyncio.Task):
             audit_task.cancel()
             await asyncio.gather(audit_task, return_exceptions=True)
         await runner.cleanup()
+        dashboard_executor.shutdown(wait=False, cancel_futures=True)

@@ -212,3 +212,41 @@ def test_store_exposes_bounded_multimodal_graph_snapshot(tmp_path) -> None:
     assert relation["target"] == "entity:content-channel"
     assert relation["confidence"] == pytest.approx(0.91)
     assert graph["counts"]["links"] >= 2
+
+
+def test_dashboard_summaries_do_not_inline_large_narrative_documents(tmp_path) -> None:
+    store = MemoryStore(MemoryConfig(storage_dir=str(tmp_path / "memory")))
+    now = datetime.now(timezone.utc)
+    large_ledger = [{"summary": "retained evidence " * 100}] * 50
+    store.upsert_entity(
+        "daily_narrative",
+        "Daily story",
+        {
+            "document_kind": "daily-narrative",
+            "revision": 4,
+            "local_date": "2026-08-14",
+            "abstract_summary": "A grounded day.",
+            "timeline": large_ledger,
+            "conversation_ledger": large_ledger,
+        },
+        "daily-narrative:2026-08-14",
+        now=now,
+    )
+
+    summaries = store.list_entity_summaries(limit=24)
+    graph = store.knowledge_graph_snapshot(50)
+    narrative = next(
+        node for node in graph["nodes"]
+        if node["id"] == "entity:daily-narrative:2026-08-14"
+    )
+
+    assert "metadata" not in summaries[0]
+    assert narrative["metadata"] == {
+        "document_kind": "daily-narrative",
+        "revision": 4,
+        "local_date": "2026-08-14",
+        "abstract_summary": "A grounded day.",
+    }
+    assert store.entity_detail("daily-narrative:2026-08-14")["entity"][
+        "metadata"
+    ]["timeline"] == large_ledger

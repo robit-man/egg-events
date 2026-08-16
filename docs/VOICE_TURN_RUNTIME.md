@@ -41,8 +41,9 @@ intentionally not part of this implementation.
    `segment_seconds` remains the hard memory/latency cap.
 4. Completed audio carries its original, pre-normalization RMS/VAD snapshot into
    the bounded ASR FIFO. Digitally silent WAVs are rejected before the Omnius
-   request; source-gate failures and unscored, known silence hallucinations are
-   rejected before they can become transcript, memory, or dialogue evidence.
+   request; source-gate failures and acoustically or probabilistically
+   unsupported decodes are rejected before they can become transcript, memory,
+   or dialogue evidence.
 5. ASR failure or an acoustically rejected overlap releases the provisional
    barge and resumes the tail.
 6. Admitted nonempty ASR creates the next authoritative heard-audio revision and

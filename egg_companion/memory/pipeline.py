@@ -72,6 +72,12 @@ class MemoryPipeline:
                     "label": label,
                     "label_source": profile.get("label_source"),
                     "review_state": profile.get("review_state"),
+                    "appearance_description": profile.get(
+                        "appearance_description"
+                    ),
+                    "adjudication_history": profile.get("adjudication_history")
+                    if isinstance(profile.get("adjudication_history"), list)
+                    else [],
                     "label_provenance": profile.get("label_provenance")
                     if isinstance(profile.get("label_provenance"), dict)
                     else {},
@@ -118,6 +124,31 @@ class MemoryPipeline:
             self._observation_policy_cache = self.store.observational_policy()
             self._observation_policy_cached_at = now
         return dict(self._observation_policy_cache)
+
+    def interaction_strategy(self) -> dict[str, object]:
+        entity = self.store.entity_metadata("interaction-strategy:current")
+        if not isinstance(entity, dict):
+            return {}
+        metadata = entity.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def social_profiles(self, entity_ids: list[str]) -> list[dict[str, object]]:
+        """Return revisable interaction profiles grounded to presently relevant people."""
+        profiles: list[dict[str, object]] = []
+        for entity_id in dict.fromkeys(str(value) for value in entity_ids):
+            entity = self.store.entity_metadata(f"social-profile:{entity_id}")
+            if not isinstance(entity, dict):
+                continue
+            metadata = entity.get("metadata")
+            if isinstance(metadata, dict):
+                profiles.append(
+                    {
+                        "profile_id": f"social-profile:{entity_id}",
+                        "subject_id": entity_id,
+                        **dict(metadata),
+                    }
+                )
+        return profiles
 
     def pending_narrative_semantics(self) -> dict[str, object] | None:
         records = self.store.pending_narrative_semantics(1)

@@ -30,13 +30,6 @@ MODEL_CACHE = os.getenv("EGG_WHISPER_MODEL_CACHE", "/models")
 FAST_MODEL = os.getenv("EGG_WHISPER_FAST_MODEL", "tiny.en")
 ACCURATE_MODEL = os.getenv("EGG_WHISPER_ACCURATE_MODEL", "base.en")
 MAX_AUDIO_BYTES = 16 * 1024 * 1024
-KNOWN_HALLUCINATIONS = {
-    "thanks for watching",
-    "thank you for watching",
-    "thank you so much for watching",
-}
-
-
 def normalize_text(value: object) -> str:
     if not isinstance(value, str):
         return ""
@@ -56,8 +49,6 @@ def rejection_reason(result: dict[str, Any]) -> str | None:
     text = normalize_text(result.get("text"))
     if not text:
         return "empty transcript"
-    if text in KNOWN_HALLUCINATIONS:
-        return "known silence hallucination"
     segments = [
         segment for segment in result.get("segments", []) if isinstance(segment, dict)
     ]
