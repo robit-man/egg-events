@@ -64,6 +64,20 @@ class ActivityGovernorTests(unittest.TestCase):
 
         self.assertEqual(governor.scale(1000.0), 1.0)
 
+    def test_last_source_tracks_the_most_recent_trigger(self) -> None:
+        governor = ActivityGovernor(ActivityConfig(novelty_threshold=0.1))
+
+        self.assertIsNone(governor.last_source)
+
+        governor.note_visual(novelty=1.0, has_presence=True, now=0.0, camera_id="camera-video1")
+        self.assertEqual(governor.last_source, "vision:camera-video1")
+
+        governor.note_audio(speech_detected=True, now=1.0)
+        self.assertEqual(governor.last_source, "audio")
+
+        governor.note_visual(novelty=0.0, has_presence=False, now=2.0, camera_id="camera-video1")
+        self.assertEqual(governor.last_source, "audio")
+
     def test_scaled_fps_and_interval_move_in_opposite_directions_when_idle(self) -> None:
         settings = ActivityConfig(idle_floor=0.25, decay_seconds=5, novelty_threshold=0.1)
         governor = ActivityGovernor(settings)
@@ -74,6 +88,16 @@ class ActivityGovernorTests(unittest.TestCase):
 
         self.assertAlmostEqual(fps, 2.0, places=2)
         self.assertAlmostEqual(interval, 80.0, places=2)
+
+
+    def test_background_capacity_is_baseline_while_active_and_rises_when_quiet(self) -> None:
+        settings = ActivityConfig(idle_floor=0.25, decay_seconds=5, novelty_threshold=0.1)
+        governor = ActivityGovernor(settings)
+        governor.note_visual(novelty=1.0, has_presence=True, now=0.0)
+
+        self.assertAlmostEqual(governor.background_capacity(0.0), 1.0, places=2)
+        self.assertAlmostEqual(governor.background_capacity(1000.0, max_multiplier=4.0), 4.0, places=2)
+        self.assertAlmostEqual(governor.background_capacity(1000.0, max_multiplier=10.0), 4.0, places=2)
 
 
 if __name__ == "__main__":

@@ -26,14 +26,21 @@ class ActivityGovernor:
     def __init__(self, settings: ActivitySettings) -> None:
         self._settings = settings
         self._last_activity_at: float | None = None
+        self._last_source: str | None = None
 
-    def note_visual(self, novelty: float, has_presence: bool, now: float) -> None:
+    def note_visual(self, novelty: float, has_presence: bool, now: float, camera_id: str = "") -> None:
         if has_presence or novelty >= self._settings.novelty_threshold:
             self._last_activity_at = now
+            self._last_source = f"vision:{camera_id}" if camera_id else "vision"
 
     def note_audio(self, speech_detected: bool, now: float) -> None:
         if speech_detected:
             self._last_activity_at = now
+            self._last_source = "audio"
+
+    @property
+    def last_source(self) -> str | None:
+        return self._last_source
 
     def scale(self, now: float) -> float:
         """Current alertness in [idle_floor, 1.0]. 1.0 while active or unstarted."""
@@ -51,3 +58,12 @@ class ActivityGovernor:
     def scaled_interval(self, base_interval: float, now: float) -> float:
         """Wider effective interval (i.e. lower frequency) while quiet."""
         return base_interval / self.scale(now)
+
+    def background_capacity(self, now: float, max_multiplier: float = 4.0) -> float:
+        """Headroom multiplier for bounded, non-urgent catch-up work (e.g. object
+        re-identification review) that competes with live perception for the
+        same GPU: 1.0 while the room is active, rising toward `max_multiplier`
+        as live inference falls off, so quiet moments fund backlog work that
+        busy ones would otherwise starve."""
+        scale = self.scale(now)
+        return min(max_multiplier, 1.0 / scale) if scale > 0 else max_multiplier

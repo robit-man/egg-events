@@ -731,6 +731,7 @@ class CompanionRuntime:
             ("identity-dream-scheduler", self._identity_dream_scheduler),
             ("default-mode-network", self._default_mode_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
+            ("cognition-frequency", self._report_activity),
         ]
         if self.config.audio_comprehension.enabled:
             component_specs.append(
@@ -951,7 +952,6 @@ class CompanionRuntime:
                     if vision is not None and analysis_task is None and now >= next_analysis_at:
                         include_pose = now >= next_pose_at
                         include_semantics = now >= next_semantic_at
-                        alertness = self._activity.scale(now)
                         if include_pose:
                             next_pose_at = now + 1 / self._activity.scaled_fps(
                                 self.config.vision.pose_fps, now
@@ -973,7 +973,6 @@ class CompanionRuntime:
                         next_analysis_at = now + 1 / self._activity.scaled_fps(
                             self.config.vision.analysis_fps, now
                         )
-                        self.telemetry.record_activity(alertness, camera.config.id)
                     if now >= next_preview_at:
                         raw_frame = await asyncio.to_thread(self._encode_frame, frame)
                         self.telemetry.record_frame(camera.config.id, raw_frame, frame.shape, fps)
@@ -1294,10 +1293,59 @@ class CompanionRuntime:
             tick = self._brain.perceive(observation)
             self.telemetry.record_brain_tick(tick)
             self._activity.note_visual(
-                tick.novelty, bool(observation.detections), time.monotonic()
+                tick.novelty,
+                bool(observation.detections),
+                time.monotonic(),
+                observation.camera_id,
             )
             for target, decision in tick.decisions:
                 await self._handle_target(target, decision, observation)
+
+    async def _report_activity(self) -> None:
+        """Surface the ActivityGovernor's alertness and the effective
+        per-modality processing rate it currently yields, independent of
+        whether any camera happens to be scheduling analysis right now."""
+        vision = self.config.vision
+        while True:
+            now = time.monotonic()
+            scale = self._activity.scale(now)
+            floor = self.config.activity.idle_floor
+            if scale >= 0.95:
+                state = "active"
+            elif scale <= floor + 0.02:
+                state = "quiet"
+            else:
+                state = "falling off"
+            modalities = [
+                {
+                    "name": "Vision analysis",
+                    "unit": "fps",
+                    "base_rate": round(vision.analysis_fps, 3),
+                    "effective_rate": round(self._activity.scaled_fps(vision.analysis_fps, now), 3),
+                },
+                {
+                    "name": "Pose",
+                    "unit": "fps",
+                    "base_rate": round(vision.pose_fps, 3),
+                    "effective_rate": round(self._activity.scaled_fps(vision.pose_fps, now), 3),
+                },
+                {
+                    "name": "Semantics",
+                    "unit": "fps",
+                    "base_rate": round(vision.semantic_fps, 3),
+                    "effective_rate": round(self._activity.scaled_fps(vision.semantic_fps, now), 3),
+                },
+                {
+                    "name": "OCR full-frame",
+                    "unit": "s/scan",
+                    "base_rate": round(self.config.ocr.full_frame_interval_seconds, 3),
+                    "effective_rate": round(
+                        self._activity.scaled_interval(self.config.ocr.full_frame_interval_seconds, now), 3
+                    ),
+                },
+            ]
+            self.telemetry.record_activity(scale, state, self._activity.last_source, modalities)
+            await asyncio.sleep(1.0)
 
     async def _stream_waveform(self) -> None:
         preview_buffer = np.empty(0, dtype=np.float32)
@@ -4361,13 +4409,18 @@ class CompanionRuntime:
             except Exception as error:
                 logger.exception("Object review sweep failed")
                 self.telemetry.record_runtime_error("object-review-sweep", error)
-            await asyncio.sleep(self.config.object_learning.review_sweep_interval_seconds)
+            # Object re-identification catch-up is bounded, non-urgent background
+            # work that competes with live perception for the same GPU: spend
+            # spare capacity on it while the room is quiet, back off while busy.
+            capacity = self._activity.background_capacity(time.monotonic())
+            await asyncio.sleep(self.config.object_learning.review_sweep_interval_seconds / capacity)
 
     async def _sweep_object_reviews(self) -> None:
         learning = self.config.object_learning
+        capacity = self._activity.background_capacity(time.monotonic())
         due = await asyncio.to_thread(self.objects.profiles_due_for_review, learning.review_stale_after_seconds)
         self.telemetry.set_review_queue_depth(len(due))
-        for profile_id, label, _confidence in due[: learning.confidence_audit_batch_size]:
+        for profile_id, label, _confidence in due[: round(learning.confidence_audit_batch_size * capacity)]:
             if (
                 time.monotonic() - getattr(self, "_last_valid_speech_at", 0.0)
                 < learning.speech_priority_seconds
@@ -4397,10 +4450,11 @@ class CompanionRuntime:
         duplicate_candidates = getattr(self.objects, "duplicate_candidates", None)
         if not callable(duplicate_candidates):
             return
+        capacity = self._activity.background_capacity(time.monotonic())
         proposals = await asyncio.to_thread(
             duplicate_candidates,
             learning.duplicate_proposal_similarity,
-            learning.duplicate_adjudication_batch_size,
+            max(1, round(learning.duplicate_adjudication_batch_size * capacity)),
         )
         for left_id, right_id, similarity in proposals:
             left_png, right_png, left, right = await asyncio.gather(
@@ -4459,10 +4513,13 @@ class CompanionRuntime:
                     "duplicate_not_confirmed", f"{left_id}:{right_id}:{similarity:.3f}"
                 )
                 continue
+            # A confirmed user or VLA label must survive consolidation even if
+            # the other profile accumulated more samples first; sample count
+            # only breaks ties within the same provenance trust tier.
+            left_rank = (self.objects.label_trust(left.get("label_source")), int(left.get("samples") or 0))
+            right_rank = (self.objects.label_trust(right.get("label_source")), int(right.get("samples") or 0))
             canonical_id, alias_id = (
-                (left_id, right_id)
-                if int(left.get("samples") or 0) >= int(right.get("samples") or 0)
-                else (right_id, left_id)
+                (left_id, right_id) if left_rank >= right_rank else (right_id, left_id)
             )
             canonical = await asyncio.to_thread(
                 self.objects.merge_profiles,

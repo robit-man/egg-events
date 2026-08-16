@@ -40,6 +40,16 @@ class ObjectProfile:
 class ObjectLibrary:
     """On-device CLIP library of user-labelled, SAM-segmented objects."""
 
+    # Provenance trust used to pick the surviving label when two profiles are
+    # confirmed to be the same physical object: an explicit user correction or
+    # a VLA-adjudicated label must win over an unverified/generic detector
+    # guess regardless of which profile happened to accumulate more samples.
+    _LABEL_SOURCE_TRUST = {"user": 2, "ornith-vlm": 1}
+
+    @classmethod
+    def label_trust(cls, label_source: str | None) -> int:
+        return cls._LABEL_SOURCE_TRUST.get(str(label_source or ""), 0)
+
     def __init__(self, config: ObjectLearningConfig) -> None:
         self.config = config
         self._directory = Path(config.storage_dir)

@@ -150,7 +150,12 @@ class RuntimeTelemetry:
         self._default_mode: dict[str, object] = {"state": "idle"}
         self._narrative_semantics: dict[str, object] = {"state": "idle"}
         self._gpu: dict[str, object] = {}
-        self._activity: dict[str, object] = {"scale": 1.0, "camera_id": None}
+        self._activity: dict[str, object] = {
+            "scale": 1.0,
+            "state": "active",
+            "last_source": None,
+            "modalities": [],
+        }
 
     def set_rotation(self, camera_id: str, angle: int) -> None:
         with self._lock:
@@ -624,14 +629,22 @@ class RuntimeTelemetry:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
-    def record_activity(self, scale: float, camera_id: str) -> None:
-        """Current novelty/presence/sound-driven alertness scale (1.0 = full
-        inference rate, `idle_floor` = quiet-room falloff) most recently
-        applied when scheduling that camera's analysis pass."""
+    def record_activity(
+        self,
+        scale: float,
+        state: str,
+        last_source: str | None,
+        modalities: list[dict[str, object]],
+    ) -> None:
+        """Current novelty/presence/sound-driven alertness (1.0 = full
+        inference rate, `idle_floor` = quiet-room falloff) and the effective
+        processing rate it currently yields per perception modality."""
         with self._lock:
             self._activity = {
                 "scale": round(scale, 4),
-                "camera_id": camera_id,
+                "state": state,
+                "last_source": last_source,
+                "modalities": modalities,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 

@@ -700,6 +700,7 @@ PAGE = r"""<!doctype html>
           <div class="grid">
             <article class="card span-6"><div class="card-header"><div><h3 class="card-title">Readiness</h3><p class="card-note">Direct hardware and service probes</p></div></div><div id="checks" class="check-list"><div class="empty">Checks pending.</div></div></article>
             <article class="card span-6"><div class="card-header"><div><h3 class="card-title">Runtime errors</h3><p class="card-note">Most recent component failures</p></div></div><div id="runtime-errors" class="table-wrap"></div></article>
+            <article class="card span-12"><div class="card-header"><div><h3 class="card-title">Cognition frequency</h3><p class="card-note">Novelty/presence/sound-driven perception rate across modalities; falls off toward an idle floor when the room is quiet, snaps back to full rate the instant something new appears or is heard</p></div><div id="activity-state" class="badge-row"></div></div><div id="activity-modalities" class="table-wrap"></div></article>
             <article class="card span-12"><div class="card-header"><div><h3 class="card-title">GPU and memory</h3><p class="card-note">jetson-stats telemetry and resident processes</p></div></div><div id="gpu-stats" class="badge-row" style="margin-bottom:14px"></div><div id="gpu-processes" class="table-wrap"></div></article>
           </div>
         </section>
@@ -1015,7 +1016,7 @@ PAGE = r"""<!doctype html>
         });
         $('#identity-continuity-ledger').innerHTML = table(['Entity','Mask / displacement','VLM comparison','Displacement analysis','Time'], continuityRows, 'No dislocated mask merges yet');
       }
-      $('#object-learning-state').innerHTML = `<span class="badge">${esc(learning.stable_candidates || 0)} stable</span><span class="badge">${esc(learning.clip_recalls || 0)}/${esc(learning.clip_queries || 0)} CLIP</span><span class="badge">${esc(learning.vlm_successes || 0)}/${esc(learning.vlm_requests || 0)} VLM</span><span class="badge">${esc(learning.ocr_hits || 0)}/${esc(learning.ocr_requests || 0)} OCR</span><span class="badge ${learning.vlm_errors ? 'bad' : ''}">${esc(learning.vlm_errors || 0)} errors</span>`;
+      $('#object-learning-state').innerHTML = `<span class="badge">${esc(learning.stable_candidates || 0)} stable</span><span class="badge">${esc(learning.clip_recalls || 0)}/${esc(learning.clip_queries || 0)} CLIP</span><span class="badge">${esc(learning.vlm_successes || 0)}/${esc(learning.vlm_requests || 0)} VLM</span><span class="badge">${esc(learning.ocr_hits || 0)}/${esc(learning.ocr_requests || 0)} OCR</span><span class="badge ${learning.vlm_errors ? 'bad' : ''}">${esc(learning.vlm_errors || 0)} errors</span><span class="badge ${learning.review_queue_depth ? 'warn' : 'good'}">${esc(learning.review_queue_depth || 0)} awaiting re-ID</span>`;
       if (selectedPersonId && $('#person-inspector').hidden && !personTimelineLoading) loadPersonTimeline(selectedPersonId);
     }
     function timelineRange(encounter) {
@@ -1147,9 +1148,23 @@ PAGE = r"""<!doctype html>
       } catch (error) { narrativeLoadedAt = 0; $('#narrative-status').innerHTML = '<span class="badge bad">Narrative unavailable</span>'; $('#narrative-timeline').innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
     }
     function renderSystem(state) {
-      const telemetry = state.telemetry || {}, checks = state.checks || [], errors = telemetry.runtime_errors || [], gpu = telemetry.gpu || {};
+      const telemetry = state.telemetry || {}, checks = state.checks || [], errors = telemetry.runtime_errors || [], gpu = telemetry.gpu || {}, activity = telemetry.activity || {};
       $('#checks').innerHTML = checks.map(check => `<div class="check ${esc(check.status)}"><span class="check-dot"></span><div><div class="check-name">${esc(check.name)}</div><div class="check-detail">${esc(check.detail)}</div></div></div>`).join('') || '<div class="empty">Checks pending.</div>';
       $('#runtime-errors').innerHTML = table(['Component','Detail','Time'], errors.slice(-20).reverse().map(error => [esc(error.component || 'runtime'), esc(error.detail || '—'), esc(formatTime(error.at))]), 'No runtime errors');
+      const activityStateClass = {active: 'good', 'falling off': 'warn'}[activity.state] || '';
+      const activitySource = activity.last_source ? activity.last_source.replace(/^vision:/, 'vision · ') : 'none yet';
+      $('#activity-state').innerHTML = activity.updated_at
+        ? `<span class="badge ${esc(activityStateClass)}">${esc(activity.state || 'unknown')}</span><span class="badge">Alertness ${Math.round((activity.scale ?? 1) * 100)}%</span><span class="badge">Last trigger: ${esc(activitySource)}</span><span class="badge">Updated ${esc(formatTime(activity.updated_at))}</span>`
+        : '<span class="muted">Cognition frequency telemetry unavailable.</span>';
+      $('#activity-modalities').innerHTML = table(
+        ['Modality', 'Effective rate', 'Full-activity rate'],
+        (activity.modalities || []).map(modality => [
+          esc(modality.name),
+          `${esc(modality.effective_rate)} ${esc(modality.unit)}`,
+          `${esc(modality.base_rate)} ${esc(modality.unit)}`,
+        ]),
+        'No perception-frequency telemetry yet.',
+      );
       if (!gpu.updated_at) { $('#gpu-stats').innerHTML = '<span class="muted">GPU telemetry unavailable.</span>'; $('#gpu-processes').innerHTML = '<div class="empty">No process telemetry.</div>'; return; }
       $('#gpu-stats').innerHTML = `<span class="badge">RAM ${esc(gpu.ram_used_mb)}/${esc(gpu.ram_total_mb)} MB</span><span class="badge">GPU ${gpu.gpu_load_percent == null ? '—' : esc(gpu.gpu_load_percent) + '%'}</span><span class="badge">Updated ${esc(formatTime(gpu.updated_at))}</span>`;
       $('#gpu-processes').innerHTML = table(['PID','Process','GPU memory','RSS','CPU'], (gpu.processes || []).map(process => [esc(process.pid), esc(process.name), `${esc(process.gpu_memory_mb)} MB`, `${esc(process.memory_mb)} MB`, `${esc(process.cpu_percent)}%`]), 'No GPU-resident processes');

@@ -51,6 +51,61 @@ def test_ornith_correction_and_clip_recall_survive_restart(tmp_path: Path) -> No
     assert "adjudication_history" not in summary
 
 
+def test_label_trust_ranks_user_over_vla_over_unverified() -> None:
+    assert ObjectLibrary.label_trust("user") > ObjectLibrary.label_trust("ornith-vlm")
+    assert ObjectLibrary.label_trust("ornith-vlm") > ObjectLibrary.label_trust("detector")
+    assert ObjectLibrary.label_trust(None) == ObjectLibrary.label_trust("detector") == 0
+
+
+def test_duplicate_merge_keeps_the_vla_confirmed_label_even_with_fewer_samples(
+    tmp_path: Path,
+) -> None:
+    """Reproduces the historical bug: an object seen many times under a wrong
+    generic detector label must not out-vote a freshly VLA-confirmed profile
+    of the same physical item just because it has more accumulated samples --
+    future mask reads should show the corrected label, not the stale one."""
+    config = ObjectLearningConfig(storage_dir=str(tmp_path), similarity_threshold=0.8)
+    library = ObjectLibrary(config)
+    stale = library.learn("object", segmented(150), FakeVision(), "detector", 0.4)
+    for _ in range(9):
+        library.learn("object", segmented(150), FakeVision(), "detector", 0.4)
+    assert stale is not None
+    stale_record = library.profile_record(stale.profile_id)
+    assert stale_record["samples"] == 10
+
+    corrected = library.learn(
+        "ceramic mug", segmented(151), FakeVision(), "ornith-vlm", 0.9, force_new=True
+    )
+    assert corrected is not None
+    corrected_record = library.profile_record(corrected.profile_id)
+    assert corrected_record["samples"] == 1
+
+    stale_rank = (
+        ObjectLibrary.label_trust(stale_record["label_source"]),
+        stale_record["samples"],
+    )
+    corrected_rank = (
+        ObjectLibrary.label_trust(corrected_record["label_source"]),
+        corrected_record["samples"],
+    )
+    canonical_id, alias_id = (
+        (stale.profile_id, corrected.profile_id)
+        if stale_rank >= corrected_rank
+        else (corrected.profile_id, stale.profile_id)
+    )
+    assert canonical_id == corrected.profile_id
+    assert alias_id == stale.profile_id
+
+    merged = library.merge_profiles(canonical_id, alias_id, 0.95, {"same_instance": True})
+    assert merged is not None
+    assert merged.label == "ceramic mug"
+    assert merged.samples == 11
+
+    recalled = library.match(segmented(151), FakeVision())
+    assert recalled is not None
+    assert recalled[0].label == "ceramic mug"
+
+
 def test_clip_recall_is_only_a_proposal_until_ornith_confirms_pixels() -> None:
     async def scenario() -> None:
         config = EggConfig.model_validate(
