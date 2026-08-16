@@ -30,9 +30,24 @@ class OmniusClient:
     _UNSAFE_LIVE_ASR_MODELS = {
         "large-v3": "exceeds the live Jetson memory budget and can terminate Omnius",
     }
+    _DEFAULT_SYSTEM_PROMPT = (
+        "You are Egg, an embodied companion with continuous, natural discourse. "
+        "Reply naturally, briefly, and helpfully. "
+        "Use only the current scene and conversation as evidence; never invent actions, objects, "
+        "locations, or facts. If the request cannot be answered from that context, ask a short "
+        "clarifying question. Every reply must address a concrete object in the observed scene or "
+        "the speaker's exact question; avoid vague phrases such as 'try something new', 'how can "
+        "I help', or generic invitations. Do not use stock greetings, acknowledgements, emojis, "
+        "or phrases such as 'I hear you clearly' or 'ready to listen'. Do not identify people, "
+        "infer sensitive traits, or describe personal appearance. Treat retrieved graph claims "
+        "as the only support for remembered facts, preserve stated uncertainty and contradictions, "
+        "and never claim first-person perceptual certainty beyond the supplied live evidence."
+    )
+
     def __init__(self, config: OmniusConfig) -> None:
         self.config = config
         self._conversation: list[dict[str, str]] = []
+        self._system_prompt: str = self._DEFAULT_SYSTEM_PROMPT
         self._model_gate = asyncio.Lock()
         # ASR must stay responsive while conversational inference is running;
         # its own gate preserves one-at-a-time transcription ordering without
@@ -329,35 +344,77 @@ class OmniusClient:
         if state.get("voiceReady") is not True:
             raise RuntimeError(f"Omnius voice did not become ready: {state}")
 
-    async def companion_reply(self, scene: str) -> str:
-        return await self._chat(
-            "Offer one concise, useful spoken observation or next step. "
-            f"Observed scene: {scene}"
-        )
+    async def companion_reply(
+        self,
+        scene: str,
+        *,
+        history: list[dict[str, object]] | None = None,
+    ) -> str:
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "You are in proactive observation mode. The room is quiet and a person "
+                    "is present. Offer one concise, useful spoken observation or next step "
+                    "grounded in the following evidence. Never invent facts or connections."
+                ),
+            },
+        ]
+        if history:
+            for turn in history[-10:]:
+                role = "assistant" if turn.get("role") == "agent" else "user"
+                text = str(turn.get("text") or "")
+                if text:
+                    messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": f"Observed scene: {scene}"})
+        return await self._chat(messages=messages, remember=False, include_memory=False)
 
     async def conversation_reply(
         self,
         utterance: str,
-        scene: str,
+        context: str,
         history: list[dict[str, object]] | None = None,
     ) -> str:
-        ordered_history = json.dumps(history or [], ensure_ascii=False)
-        return await self._chat(
-            "Local speech, already verified as human speech by VAD:\n"
-            f"{utterance!r}\n\nEmbodied context:\n{scene}\n\n"
-            f"Complete ordered audible conversation ledger:\n{ordered_history}\n\n"
-            "The ledger distinguishes completed and interrupted agent utterances. "
-            "Never answer in the human's voice, answer Egg's own prior question, or treat an "
-            "interrupted agent utterance as fully heard. "
-            "When the embodied context supplies a user-provided preferred name, use it naturally "
-            "when useful, without repeating it in every reply. When WEB SEARCH TOOL EVIDENCE is "
-            "present, ground current facts in that evidence and do not read URLs aloud. "
-            "Decide from the conversational history and context whether this is directed to Egg. "
-            "If it is not directed to Egg or does not merit an audible interruption, "
-            "reply exactly [[SILENT]].",
-            remember=False,
-            include_memory=False,
-        )
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "The following is your current cognitive context. Use it as evidence "
+                    "but never treat it as stronger than its sources. Do not read URLs aloud."
+                ),
+            },
+            {"role": "system", "content": context},
+        ]
+        for turn in (history or [])[-12:]:
+            role = "assistant" if turn.get("role") == "agent" else "user"
+            text = str(turn.get("text") or "")
+            status = str(turn.get("status") or "")
+            if not text:
+                continue
+            if role == "assistant" and status in {"interrupted", "superseded"}:
+                messages.append({
+                    "role": "assistant",
+                    "content": f"[interrupted] {text}",
+                })
+            else:
+                messages.append({"role": role, "content": text})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Local speech, already verified as human speech by VAD:\n{utterance!r}\n\n"
+                "Decide from the conversational history and context whether this is directed "
+                "to Egg. When the cognitive context supplies a user-provided preferred name, "
+                "use it naturally when useful, without repeating it in every reply. When WEB "
+                "SEARCH TOOL EVIDENCE is present in the context, ground current facts in that "
+                "evidence and do not read URLs aloud. Never answer in the human's voice, "
+                "answer Egg's own prior question, or treat an interrupted agent utterance as "
+                "fully heard. If it is not directed to Egg or does not merit an audible "
+                "interruption, reply exactly [[SILENT]]."
+            ),
+        })
+        return await self._chat(messages=messages, remember=False, include_memory=False)
 
     async def classify_interruption(
         self,
@@ -929,6 +986,77 @@ class OmniusClient:
             if not self._bounded_text(constitution, 6000):
                 return None
         elif constitution is not None:
+            return None
+        return parsed
+
+    async def self_assess_and_update_prompt(
+        self,
+        current_system_prompt: str,
+        recent_interactions: list[dict[str, object]],
+        cognitive_documents: dict[str, str],
+        daily_recaps: list[str],
+        constitution: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Meta-cognitive self-assessment: review recent interaction outcomes, day-over-day
+        recaps, and cognitive documents to produce an updated system prompt and directive
+        revisions for communication strategy, observation policy, and interaction strategy.
+
+        Returns dict with: system_prompt, communication_directive, observation_directive,
+        interaction_directive, assessment_summary. Any field may be null to signal 'no change'.
+        """
+        interaction_summary = json.dumps(
+            recent_interactions[-20:], ensure_ascii=False, default=str
+        )[:3000]
+        doc_summary = "\n\n".join(
+            f"[{kind}]\n{text[:800]}"
+            for kind, text in cognitive_documents.items()
+        )[:2500]
+        recap_text = "\n---\n".join(recap[:600] for recap in daily_recaps[-3:])[:1800]
+        prompt = (
+            "You are Egg performing a periodic self-assessment of your own prompt drivers. "
+            "Review recent interaction outcomes, day-over-day recaps, and your current cognitive "
+            "documents. Produce an updated system prompt that improves on the prior version based "
+            "on what you have learned. Also produce revised directives for communication strategy, "
+            "observation policy, and interaction strategy where the evidence supports a change. "
+            "When the evidence is insufficient to justify a revision, return null for that field. "
+            "The system prompt must remain grounded: it sets identity, grounding constraints, "
+            "silence-gating rules, and the voice/persona tone. Do not encode specific people, "
+            "objects, or episode details into the system prompt -- keep it as durable method. "
+            "Do not expose hidden reasoning.\n\n"
+            f"Current system prompt:\n{current_system_prompt[:2000]}\n\n"
+            f"Recent interaction outcomes:\n{interaction_summary}\n\n"
+            f"Cognitive documents:\n{doc_summary}\n\n"
+            f"Day-over-day recaps:\n{recap_text}\n\n"
+            f"Constitution: {self._bounded_prompt_json(constitution, 600)}\n\n"
+            "Return JSON only with exactly: system_prompt (the full revised system prompt string "
+            "or null), communication_directive (revised communication strategy directive or null), "
+            "observation_directive (revised observation policy directive or null), "
+            "interaction_directive (revised interaction strategy directive or null), "
+            "assessment_summary (a concise explanation of what changed and why). "
+            "Keep system_prompt under 1500 characters. Keep each directive under 400 characters."
+        )
+        raw = await self._narrative_structured_chat(prompt, max_tokens=1400)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("self-assessment JSON decode failed: %r", raw[:500])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        required = {
+            "system_prompt", "communication_directive", "observation_directive",
+            "interaction_directive", "assessment_summary",
+        }
+        if set(parsed.keys()) != required:
+            logger.warning("self-assessment keys mismatch: %s", set(parsed.keys()))
+            return None
+        if parsed.get("system_prompt") is not None and not self._bounded_text(
+            parsed["system_prompt"], 2000
+        ):
+            return None
+        if parsed.get("assessment_summary") and not self._bounded_text(
+            parsed["assessment_summary"], 1200
+        ):
             return None
         return parsed
 
@@ -2670,31 +2798,36 @@ class OmniusClient:
             raise RuntimeError("Omnius narrative chat returned an empty completion")
         return reply.strip()
 
+    def update_system_prompt(self, prompt: str) -> None:
+        """Replace the dynamic system prompt used by _chat()."""
+        if prompt and prompt.strip():
+            self._system_prompt = prompt.strip()
+
+    @property
+    def system_prompt(self) -> str:
+        return self._system_prompt
+
     async def _chat(
-        self, prompt: str, *, remember: bool = True, include_memory: bool = True
+        self,
+        prompt: str = "",
+        *,
+        remember: bool = True,
+        include_memory: bool = True,
+        messages: list[dict[str, str]] | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        payload = {
-            "model": self.config.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Egg, an embodied companion with continuous, natural discourse. Reply naturally, briefly, and helpfully. "
-                        "Use only the current scene and conversation as evidence; never invent actions, objects, "
-                        "locations, or facts. If the request cannot be answered from that context, ask a short "
-                        "clarifying question. Every reply must address a concrete object in the observed scene or "
-                        "the speaker's exact question; avoid vague phrases such as 'try something new', 'how can "
-                        "I help', or generic invitations. Do not use stock greetings, acknowledgements, emojis, "
-                        "or phrases such as 'I hear you clearly' or 'ready to listen'. Do not identify people, "
-                        "infer sensitive traits, or describe personal appearance. Treat retrieved graph claims "
-                        "as the only support for remembered facts, preserve stated uncertainty and contradictions, "
-                        "and never claim first-person perceptual certainty beyond the supplied live evidence."
-                    ),
-                },
+        if messages is not None:
+            chat_messages = list(messages)
+        else:
+            chat_messages = [
+                {"role": "system", "content": system_prompt or self._system_prompt},
                 *(self._conversation if include_memory else []),
                 {"role": "user", "content": prompt},
-            ],
+            ]
+        payload = {
+            "model": self.config.model,
+            "messages": chat_messages,
             "stream": False,
             "temperature": 0.6,
             "tools": False,
@@ -2721,8 +2854,9 @@ class OmniusClient:
             raise RuntimeError("Omnius returned an empty chat completion")
         response = reply.strip()
         if remember:
-            self._conversation.extend(
-                ({"role": "user", "content": prompt}, {"role": "assistant", "content": response})
-            )
+            last_user = chat_messages[-1] if chat_messages else None
+            if last_user and last_user.get("role") == "user":
+                self._conversation.append(last_user)
+            self._conversation.append({"role": "assistant", "content": response})
             self._conversation = self._conversation[-12:]
         return response

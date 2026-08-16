@@ -8,6 +8,7 @@ import numpy as np
 from egg_companion.adapters.vision import SegmentedObject
 from egg_companion.cognition.architecture import CognitiveArchitecture
 from egg_companion.config import CognitiveAttentionConfig, EggConfig, ObjectLearningConfig
+from egg_companion.core.activity import ActivityGovernor
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController
 from egg_companion.models import BoundingBox, Detection
@@ -276,6 +277,7 @@ def _sweep_runtime(config: EggConfig, library: _SweepLibrary, omnius) -> Compani
     runtime._vision = _FakeSweepVision()
     runtime._omnius = omnius
     runtime._memory = None
+    runtime._activity = ActivityGovernor(config.activity)
     runtime.telemetry = RuntimeTelemetry(config)
     return runtime
 

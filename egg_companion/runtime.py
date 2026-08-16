@@ -189,6 +189,7 @@ class CompanionRuntime:
         self._speaker = Speaker(config.audio)
         self._omnius = OmniusClient(config.omnius)
         self._conversation_turns = ConversationTurnController(history_limit=2000)
+        self._last_system_prompt_assessment_at: float = 0.0
         self._system_service = SystemServiceClient(config.system_service) if config.system_service else None
         try:
             self.identities = IdentityLibrary(config.identity)
@@ -732,6 +733,7 @@ class CompanionRuntime:
             ("default-mode-network", self._default_mode_scheduler),
             ("gpu-telemetry", self._maintain_gpu_telemetry),
             ("cognition-frequency", self._report_activity),
+            ("system-prompt-maintenance", self._system_prompt_scheduler),
         ]
         if self.config.audio_comprehension.enabled:
             component_specs.append(
@@ -2794,6 +2796,190 @@ class CompanionRuntime:
                     {"state": "failed", "error": str(error)[:240]}
                 )
             due_at = next_due()
+
+    async def _system_prompt_scheduler(self) -> None:
+        """Periodically self-assess and rebuild the dynamic system prompt from cognitive
+        documents, day-over-day recaps, and interaction outcome evidence."""
+        if self._memory is None:
+            self.telemetry.record_default_mode({"state": "system-prompt:disabled"})
+            await asyncio.Event().wait()
+        interval_seconds = max(120, min(
+            self.config.default_mode.interval_max_seconds * 4, 1800
+        ))
+        self._last_system_prompt_assessment_at = time.monotonic()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            now = time.monotonic()
+            last_activity = max(
+                self._last_valid_speech_at, self._last_spoken_at or 0.0
+            )
+            busy = (
+                self._speaking
+                or not self._speech_segments.empty()
+                or not self._utterances.empty()
+                or not self._memory_events.empty()
+            )
+            if busy or now - last_activity < self.config.default_mode.idle_seconds:
+                continue
+            try:
+                await self._run_self_assessment()
+                self._last_system_prompt_assessment_at = now
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("system-prompt self-assessment failed")
+                self.telemetry.record_runtime_error(
+                    "system-prompt-maintenance", error
+                )
+
+    async def _run_self_assessment(self) -> None:
+        if self._memory is None:
+            return
+        constitution = await asyncio.to_thread(
+            self._memory.store.narrative_constitution
+        )
+        recent = await asyncio.to_thread(
+            self._memory.store.conversation_history, 40
+        )
+        recent_interactions = [
+            entry for entry in recent
+            if entry.get("role") in {"heard", "agent"}
+        ][-20:]
+        cognitive_docs: dict[str, str] = {}
+        for doc in await asyncio.to_thread(self._memory.store.cognitive_documents):
+            kind = str(
+                (doc.get("metadata") or {}).get("document_kind") or ""
+            )
+            content = str((doc.get("metadata") or {}).get("content") or "")
+            if kind and content:
+                cognitive_docs[kind] = content
+        daily_recaps: list[str] = []
+        narratives = await asyncio.to_thread(
+            self._memory.daily_narratives, 5
+        )
+        for narrative in narratives:
+            detail = await asyncio.to_thread(
+                self._memory.daily_narrative,
+                str(narrative.get("local_date") or ""),
+            )
+            if detail:
+                meta = detail.get("metadata") or {}
+                summary = str(
+                    meta.get("abstract_summary")
+                    or (meta.get("semantic_context") or {}).get("narrative_summary")
+                    or ""
+                )
+                if summary:
+                    daily_recaps.append(summary)
+        result = await self._omnius.self_assess_and_update_prompt(
+            self._omnius.system_prompt,
+            recent_interactions,
+            cognitive_docs,
+            daily_recaps,
+            constitution,
+        )
+        if result is None:
+            return
+        new_prompt = result.get("system_prompt")
+        if new_prompt and isinstance(new_prompt, str) and new_prompt.strip():
+            self._omnius.update_system_prompt(new_prompt.strip())
+            logger.info(
+                "system prompt self-assessed and updated (%d chars)",
+                len(new_prompt),
+            )
+        comm_directive = result.get("communication_directive")
+        if comm_directive and isinstance(comm_directive, str):
+            await asyncio.to_thread(
+                self._apply_directive_update,
+                "communication-strategy",
+                comm_directive,
+                "system-prompt-self-assessment",
+            )
+        obs_directive = result.get("observation_directive")
+        if obs_directive and isinstance(obs_directive, str):
+            await asyncio.to_thread(
+                self._apply_observation_directive_update,
+                obs_directive,
+                "system-prompt-self-assessment",
+            )
+        inter_directive = result.get("interaction_directive")
+        if inter_directive and isinstance(inter_directive, str):
+            await asyncio.to_thread(
+                self._apply_interaction_directive_update,
+                inter_directive,
+                result.get("assessment_summary", ""),
+                "system-prompt-self-assessment",
+            )
+
+    def _apply_directive_update(
+        self, document_kind: str, directive: str, source: str
+    ) -> None:
+        if self._memory is None:
+            return
+        existing = self._memory.store.entity_metadata(
+            f"cognitive-document:{document_kind}"
+        )
+        metadata = (existing or {}).get("metadata") or {}
+        content = str(metadata.get("content") or "")
+        if directive.strip() in content:
+            return
+        revision = int(metadata.get("revision") or 0) + 1
+        self._memory.store.upsert_cognitive_document(
+            document_kind,
+            directive[:5000],
+            revision,
+            0.7,
+            [],
+            source_entity_ids=[],
+        )
+
+    def _apply_observation_directive_update(
+        self, directive: str, source: str
+    ) -> None:
+        if self._memory is None:
+            return
+        detail = self._memory.store.entity_detail("observation-policy:current")
+        if detail is None:
+            return
+        metadata = (detail.get("entity") or {}).get("metadata") or {}
+        policy = dict(metadata.get("policy") or {})
+        policy["directive"] = directive
+        policy["summary"] = directive[:600]
+        import hashlib
+        policy["revision"] = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:20]
+        self._memory.store.upsert_entity(
+            "observation_policy",
+            "Evolving observation policy",
+            {
+                "policy": policy,
+                "source_narrative_id": source,
+                "model_id": "self-assessment",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "epistemic_status": "model_synthesis_from_provenance_ledger",
+            },
+            "observation-policy:current",
+        )
+
+    def _apply_interaction_directive_update(
+        self, directive: str, rationale: str, source: str
+    ) -> None:
+        if self._memory is None:
+            return
+        self._memory.store.upsert_entity(
+            "interaction_strategy",
+            "Evolving interaction strategy",
+            {
+                "directive": directive,
+                "rationale": rationale or "self-assessment periodic review",
+                "confidence": 0.7,
+                "source_context_id": source,
+                "revisable": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "interaction-strategy:current",
+        )
 
     async def _maybe_ask_default_mode_question(
         self, result: dict[str, object]
@@ -5549,7 +5735,10 @@ class CompanionRuntime:
                         "\nReflective working model (derived and revisable): "
                         + reflective
                     )
-            reply = await self._omnius.companion_reply(scene)
+            reply = await self._omnius.companion_reply(
+                scene,
+                history=self._conversation_turns.prompt_history(),
+            )
             spoken = await self._speak(reply)
             reason = (
                 "model-authored observation policy requested proactive engagement"
