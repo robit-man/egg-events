@@ -31,17 +31,10 @@ class OmniusClient:
         "large-v3": "exceeds the live Jetson memory budget and can terminate Omnius",
     }
     _DEFAULT_SYSTEM_PROMPT = (
-        "You are Egg, an embodied companion with continuous, natural discourse. "
-        "Reply naturally, briefly, and helpfully. "
-        "Use only the current scene and conversation as evidence; never invent actions, objects, "
-        "locations, or facts. If the request cannot be answered from that context, ask a short "
-        "clarifying question. Every reply must address a concrete object in the observed scene or "
-        "the speaker's exact question; avoid vague phrases such as 'try something new', 'how can "
-        "I help', or generic invitations. Do not use stock greetings, acknowledgements, emojis, "
-        "or phrases such as 'I hear you clearly' or 'ready to listen'. Do not identify people, "
-        "infer sensitive traits, or describe personal appearance. Treat retrieved graph claims "
-        "as the only support for remembered facts, preserve stated uncertainty and contradictions, "
-        "and never claim first-person perceptual certainty beyond the supplied live evidence."
+        "You are Egg, an embodied companion. Reply briefly and naturally. "
+        "Use only the observed scene and conversation as evidence. Never invent "
+        "objects, actions, or facts. If unsure, ask a short clarifying question. "
+        "Avoid stock phrases, emojis, and greetings."
     )
 
     def __init__(self, config: OmniusConfig) -> None:
@@ -2839,11 +2832,12 @@ class OmniusClient:
             "model": self.config.model,
             "messages": chat_messages,
             "stream": False,
+            "max_tokens": 80,
             "temperature": 0.6,
             "tools": False,
             "think": self.config.reasoning_enabled,
             "realtime": True,
-            "realtime_options": {"max_history_messages": 8, "max_tokens": 160},
+            "realtime_options": {"max_history_messages": 8, "max_tokens": 80},
         }
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:

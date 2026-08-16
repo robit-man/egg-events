@@ -1597,6 +1597,7 @@ class CompanionRuntime:
         while True:
             segment = await self._speech_segments.get()
             await asyncio.to_thread(self._direction.try_set_led_state, "think")
+            asr_started = time.monotonic()
             try:
                 acoustic_evidence = {
                     **segment.acoustic,
@@ -1610,6 +1611,8 @@ class CompanionRuntime:
                     acoustic_evidence=acoustic_evidence,
                     language=self.config.transcription.asr_language,
                 )
+                asr_elapsed = (time.monotonic() - asr_started) * 1000
+                logger.info("asr elapsed %.0fms transcript=%r", asr_elapsed, (transcript or "")[:60])
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -4883,6 +4886,7 @@ class CompanionRuntime:
         return True
 
     async def _handle_audio_turn(self, turn: AudioTurn) -> None:
+        turn_started = time.monotonic()
         self._active_turn_context_id = turn.utterance_id
         transcript = turn.text
         pending = self.telemetry.pending_observation()
@@ -5288,6 +5292,8 @@ class CompanionRuntime:
                 transcript, reply, spoken, reason,
                 context_id=turn.utterance_id,
             )
+            elapsed = (time.monotonic() - turn_started) * 1000
+            logger.info("turn elapsed %.0fms (asr+context+llm+tts) reply=%r", elapsed, reply[:60])
             return
         self.telemetry.record_interaction(False, decision.reason, transcript, reply)
         self._queue_interaction_memory(
