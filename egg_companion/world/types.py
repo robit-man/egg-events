@@ -83,6 +83,93 @@ class EpistemicKind(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Observability states
+# ---------------------------------------------------------------------------
+
+
+class ObservabilityState(str, Enum):
+    """Observability states for object permanence."""
+    OBSERVED_PRESENT = "observed_present"
+    OBSERVED_ABSENT = "observed_absent"
+    NOT_OBSERVED = "not_observed"
+    OCCLUDED = "occluded"
+    OUTSIDE_COVERAGE = "outside_coverage"
+    SENSOR_UNAVAILABLE = "sensor_unavailable"
+    UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty decomposition
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Uncertainty:
+    """Decomposed uncertainty for a world model assertion."""
+    measurement: float = 0.0
+    identity: float = 0.0
+    classification: float = 0.0
+    spatial: float = 0.0
+    temporal: float = 0.0
+    source_disagreement: float = 0.0
+    staleness: float = 0.0
+
+    @property
+    def total(self) -> float:
+        """Root mean square of all uncertainty components."""
+        components = [
+            self.measurement, self.identity, self.classification,
+            self.spatial, self.temporal, self.source_disagreement, self.staleness,
+        ]
+        return (sum(c**2 for c in components) / len(components)) ** 0.5
+
+
+# ---------------------------------------------------------------------------
+# Evidence correlation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EvidenceCorrelationGroup:
+    """Groups correlated evidence to prevent independent confirmation inflation.
+    
+    Adjacent video frames, repeated measurements from the same sensor,
+    or observations from the same session should be grouped so that
+    confidence aggregation applies diminishing returns.
+    """
+    group_id: str
+    session_id: str | None = None
+    camera_id: str | None = None
+    sensor_id: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    observation_count: int = 1
+    correlation_type: str = "temporal"  # temporal, spatial, sensor, session
+    
+    @property
+    def independence_factor(self) -> float:
+        """Returns a factor [0, 1] representing effective independent observations.
+        
+        For N correlated observations, effective independent count is:
+        1 + (N-1) * factor where factor < 1 for correlated observations.
+        """
+        if self.observation_count <= 1:
+            return 1.0
+        
+        # Diminishing returns based on correlation type
+        factors = {
+            "temporal": 0.1,   # Adjacent frames are highly correlated
+            "spatial": 0.3,    # Nearby sensors have some independence
+            "sensor": 0.2,     # Same sensor, different time
+            "session": 0.5,    # Same session, different sensors
+        }
+        factor = factors.get(self.correlation_type, 0.1)
+        
+        effective = 1 + (self.observation_count - 1) * factor
+        return effective / self.observation_count
+
+
+# ---------------------------------------------------------------------------
 # Assertion lifecycle
 # ---------------------------------------------------------------------------
 

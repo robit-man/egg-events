@@ -11,11 +11,14 @@ from egg_companion.world.types import (
     AssertionState,
     CoordinateFrame,
     EpistemicKind,
+    EvidenceCorrelationGroup,
+    ObservabilityState,
     ObjectType,
     PropertyType,
     RelationType,
     SourceType,
     TypedValue,
+    Uncertainty,
     ValueType,
 )
 from egg_companion.world.assertions import EventAssertion, RelationAssertion, WorldAssertion
@@ -35,6 +38,7 @@ from egg_companion.world.policy import PolicyValidator
 from egg_companion.world.query import WorldQuery
 from egg_companion.world.context import CognitiveContext
 from egg_companion.world.metrics import MetricsCollector
+from egg_companion.world.bridge import KnowledgeGraphBridge
 
 __all__ = [
     "ActionType",
@@ -42,11 +46,14 @@ __all__ = [
     "AssertionState",
     "CoordinateFrame",
     "EpistemicKind",
+    "EvidenceCorrelationGroup",
+    "ObservabilityState",
     "ObjectType",
     "PropertyType",
     "RelationType",
     "SourceType",
     "TypedValue",
+    "Uncertainty",
     "ValueType",
     "EventAssertion",
     "RelationAssertion",
@@ -71,4 +78,5 @@ __all__ = [
     "WorldQuery",
     "CognitiveContext",
     "MetricsCollector",
+    "KnowledgeGraphBridge",
 ]

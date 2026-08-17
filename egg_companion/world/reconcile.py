@@ -15,6 +15,7 @@ from egg_companion.world.types import (
     AssertionKind,
     AssertionState,
     EpistemicKind,
+    EvidenceCorrelationGroup,
     TypedValue,
     WorldDelta,
 )
@@ -358,3 +359,97 @@ class Reconciler:
 
     def explain(self, entity_id: str, property_id: str) -> dict[str, Any]:
         return self._state.explain(entity_id, property_id)
+
+    def aggregate_confidence_with_correlation(
+        self,
+        confidences: list[float],
+        correlation_group: EvidenceCorrelationGroup | None = None,
+    ) -> float:
+        """Aggregate multiple confidence scores with correlation-aware diminishing returns.
+        
+        Without correlation, N observations would give confidence = 1 - prod(1-ci).
+        With correlation, effective independent count is reduced.
+        """
+        if not confidences:
+            return 0.0
+        
+        if len(confidences) == 1:
+            return confidences[0]
+        
+        # Base aggregation: 1 - product of (1-ci)
+        combined = 1.0
+        for c in confidences:
+            combined *= (1.0 - min(1.0, max(0.0, c)))
+        base_confidence = 1.0 - combined
+        
+        # Apply correlation factor if provided
+        if correlation_group is not None and correlation_group.observation_count > 1:
+            independence = correlation_group.independence_factor
+            effective_observations = 1 + (len(confidences) - 1) * independence
+            # Scale confidence by effective independent observations
+            scaled = base_confidence * (effective_observations / len(confidences))
+            return min(1.0, scaled)
+        
+        return base_confidence
+
+    def get_effective_independent_observations(
+        self,
+        entity_id: str,
+        property_id: str,
+        window_seconds: float = 10.0,
+    ) -> dict[str, Any]:
+        """Calculate effective independent observations for a property.
+        
+        Returns the effective independent count considering temporal correlation.
+        """
+        import datetime
+        
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT confidence, valid_from, source_id
+                FROM world_assertions
+                WHERE subject_id = ? AND property_id = ? AND state = 'accepted'
+                ORDER BY valid_from DESC""",
+                (entity_id, property_id),
+            ).fetchall()
+        
+        if not rows:
+            return {"total_observations": 0, "effective_independent": 0.0}
+        
+        total = len(rows)
+        confidences = [r[0] for r in rows]
+        
+        # Group by temporal proximity
+        groups = []
+        current_group = [confidences[0]]
+        
+        for i in range(1, len(rows)):
+            try:
+                prev_time = datetime.datetime.fromisoformat(rows[i-1][1])
+                curr_time = datetime.datetime.fromisoformat(rows[i][1])
+                delta = abs((curr_time - prev_time).total_seconds())
+                
+                if delta < window_seconds:
+                    current_group.append(confidences[i])
+                else:
+                    groups.append(current_group)
+                    current_group = [confidences[i]]
+            except Exception:
+                groups.append(current_group)
+                current_group = [confidences[i]]
+        
+        groups.append(current_group)
+        
+        # Calculate effective independent observations
+        effective = 0.0
+        for group in groups:
+            # Each group counts as ~1 independent observation
+            # with diminishing returns for additional observations in the group
+            effective += 1 + (len(group) - 1) * 0.1
+        
+        return {
+            "total_observations": total,
+            "effective_independent": round(effective, 2),
+            "groups": len(groups),
+            "window_seconds": window_seconds,
+        }

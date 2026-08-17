@@ -36,6 +36,11 @@ class MemoryPipeline:
         self.closed_episodes = 0
         self._observation_policy_cache: dict[str, object] | None = None
         self._observation_policy_cached_at = 0.0
+        
+        # World model integration (lazy initialization)
+        self._world_bridge = None
+        self._world_reconciler = None
+        self._world_normalizer = None
 
     def ingest(self, event: PerceptualEvent) -> tuple[bool, int]:
         accepted, drafts = self.segmenter.ingest(event)
@@ -389,9 +394,173 @@ class MemoryPipeline:
                 and alias_id != canonical_id
             ):
                 self.store.coalesce_identity_evidence([identity_alias])
+        
+        # World model integration: create WorldDelta and apply to world state
+        # This happens AFTER memory persistence so raw evidence survives if world model fails
+        self._apply_world_delta(event, confidences)
 
     def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
         return self.store.knowledge_graph_snapshot(node_limit)
+
+    def _apply_world_delta(self, event: PerceptualEvent, confidences: dict[str, float]) -> None:
+        """Create WorldDelta from PerceptualEvent and apply to world state.
+        
+        This runs AFTER memory persistence so raw evidence survives if world model fails.
+        """
+        try:
+            from egg_companion.world.normalize import ObservationNormalizer
+            from egg_companion.world.types import WorldDelta, TypedValue, ValueType
+            
+            if self._world_normalizer is None:
+                self._world_normalizer = ObservationNormalizer()
+            
+            delta = WorldDelta()
+            
+            # Extract detections from event payload
+            detections = event.payload.get("detections", [])
+            if isinstance(detections, (list, tuple)):
+                for detection in detections:
+                    if not isinstance(detection, dict):
+                        continue
+                    
+                    entity_id = detection.get("entity_id") or detection.get("object_id")
+                    if not entity_id:
+                        continue
+                    
+                    label = detection.get("label", "unknown")
+                    confidence = detection.get("confidence", 0.0)
+                    bbox = detection.get("bbox")
+                    behavior = detection.get("behavior")
+                    
+                    # Add property assertion for label
+                    delta.assertions.append({
+                        "subject_id": entity_id,
+                        "property_id": "label",
+                        "value": TypedValue(raw=label, value_type=ValueType.STRING),
+                        "epistemic_kind": "observation",
+                        "source_id": event.source_id,
+                        "confidence": confidence,
+                        "valid_from": event.occurred_at,
+                    })
+                    
+                    # Add bbox if available
+                    if bbox:
+                        delta.assertions.append({
+                            "subject_id": entity_id,
+                            "property_id": "bbox",
+                            "value": TypedValue(raw=bbox, value_type=ValueType.GEOMETRY),
+                            "epistemic_kind": "observation",
+                            "source_id": event.source_id,
+                            "confidence": confidence,
+                            "valid_from": event.occurred_at,
+                        })
+                    
+                    # Add behavior if available
+                    if behavior:
+                        delta.assertions.append({
+                            "subject_id": entity_id,
+                            "property_id": "behavior",
+                            "value": TypedValue(raw=behavior, value_type=ValueType.STRING),
+                            "epistemic_kind": "observation",
+                            "source_id": event.source_id,
+                            "confidence": confidence,
+                            "valid_from": event.occurred_at,
+                        })
+                    
+                    # Add last_seen timestamp
+                    delta.assertions.append({
+                        "subject_id": entity_id,
+                        "property_id": "last_seen",
+                        "value": TypedValue(raw=event.occurred_at, value_type=ValueType.DATETIME),
+                        "epistemic_kind": "observation",
+                        "source_id": event.source_id,
+                        "confidence": confidence,
+                        "valid_from": event.occurred_at,
+                    })
+            
+            # Extract explicit relations from event payload
+            relations = event.payload.get("relations", ())
+            if isinstance(relations, (list, tuple)):
+                for relation in relations:
+                    if not isinstance(relation, dict):
+                        continue
+                    source_id = relation.get("source_id")
+                    target_id = relation.get("target_id")
+                    predicate = relation.get("relation")
+                    if all(isinstance(v, str) and v for v in (source_id, target_id, predicate)):
+                        delta.relation_assertions.append({
+                            "source_entity_id": source_id,
+                            "relation_type_id": predicate,
+                            "target_entity_id": target_id,
+                            "confidence": relation.get("confidence", 0.0),
+                            "source_id": event.source_id,
+                            "valid_from": event.occurred_at,
+                        })
+            
+            # Add speech events
+            if event.event_type == "speech" or event.event_type == "ocr":
+                transcript = event.payload.get("transcript") or event.payload.get("text")
+                if transcript:
+                    delta.events.append({
+                        "event_type_id": "speech_utterance" if event.event_type == "speech" else "ocr_detection",
+                        "roles": {
+                            "speaker": event.entity_ids[0] if event.entity_ids else "unknown",
+                            "transcript": str(transcript)[:500],
+                        },
+                        "source_id": event.source_id,
+                        "observed_at": event.occurred_at,
+                    })
+            
+            # Apply delta if we have any assertions or relations
+            if delta.assertions or delta.relation_assertions or delta.events:
+                self._ensure_world_model()
+                if self._world_reconciler is not None:
+                    conflicts = self._world_reconciler.ingest(delta)
+                    # Log conflicts for debugging
+                    if conflicts:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"World model conflicts: {len(conflicts)}")
+        
+        except Exception as e:
+            # World model failure should not break memory persistence
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"World model delta application failed: {e}")
+
+    def _ensure_world_model(self) -> None:
+        """Lazy initialization of world model components."""
+        if self._world_reconciler is not None:
+            return
+        
+        try:
+            import sqlite3
+            from egg_companion.world.reconcile import Reconciler
+            from egg_companion.world.state import WorldStateStore
+            
+            # Create world model connection (separate from memory store)
+            world_db_path = self.store._read_connection.execute(
+                "PRAGMA database_list"
+            ).fetchone()
+            
+            # Use the same database file but separate connection for world model
+            db_path = self.store._db_path if hasattr(self.store, '_db_path') else ":memory:"
+            
+            world_conn = sqlite3.connect(db_path, check_same_thread=False)
+            world_conn.execute("PRAGMA journal_mode=WAL")
+            
+            world_state = WorldStateStore(world_conn)
+            self._world_reconciler = Reconciler(world_conn, world_state)
+            
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("World model initialized for pipeline integration")
+        
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to initialize world model: {e}")
+            self._world_reconciler = None
 
     def graph_node_detail(self, kind: str, source_id: str) -> dict[str, object] | None:
         return self.store.graph_node_detail(kind, source_id)
