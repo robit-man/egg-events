@@ -2138,6 +2138,94 @@ class OmniusClient:
             "engine": "omnius-legacy-advanced-ocr",
         }
 
+    async def detect_text_in_frame(
+        self,
+        image_png: bytes,
+        camera_id: str,
+    ) -> dict[str, object] | None:
+        """Detect if there is readable text in a full camera frame using VLM.
+        
+        Returns:
+            {
+                "has_text": bool,
+                "text_regions": [{"bbox": [x1,y1,x2,y2], "confidence": float, "description": str}],
+                "total_confidence": float,
+            }
+        """
+        image_data = base64.b64encode(image_png).decode("ascii")
+        payload = {
+            "model": self.config.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Analyze this camera frame for any visible text, including: "
+                        "signs, labels, screens, books, papers, badges, displays, "
+                        "writing on objects, or any other readable characters. "
+                        "For each text region found, provide its bounding box coordinates "
+                        "as [x1, y1, x2, y2] in normalized 0-1 range, confidence score, "
+                        "and a brief description of what the text says or where it appears. "
+                        "Return JSON only: "
+                        "{\"has_text\":boolean,\"text_regions\":[{\"bbox\":[number,number,number,number],"
+                        "\"confidence\":number,\"description\":string}],\"total_confidence\":number}. "
+                        "If no text is visible, has_text should be false with empty text_regions."
+                    ),
+                    "images": [image_data],
+                },
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 300},
+            "keep_alive": "5m",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with self._background_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
+                    json=payload,
+                ) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500
+]
+                        raise RuntimeError(f"Ornith VLM HTTP {response.status}: {detail}")
+                    result = await response.json()
+        try:
+            content = result["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError("Omnius VLM returned an invalid completion") from error
+        return self._parse_text_detection(content)
+
+    def _parse_text_detection(self, content: str) -> dict[str, object] | None:
+        """Parse VLM text detection response."""
+        import re
+        try:
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if not json_match:
+                return None
+            data = json.loads(json_match.group())
+            if not isinstance(data, dict):
+                return None
+            has_text = bool(data.get("has_text"))
+            regions = []
+            for region in data.get("text_regions", []):
+                if isinstance(region, dict) and "bbox" in region:
+                    bbox = region["bbox"]
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        regions.append({
+                            "bbox": [float(v) for v in bbox],
+                            "confidence": float(region.get("confidence", 0.5)),
+                            "description": str(region.get("description", "")),
+                        })
+            return {
+                "has_text": has_text,
+                "text_regions": regions,
+                "total_confidence": float(data.get("total_confidence", 0.0) if has_text else 0.0),
+            }
+        except Exception:
+            return None
+
     async def classify_masked_object_analysis(
         self,
         image_png: bytes,

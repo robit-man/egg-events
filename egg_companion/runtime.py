@@ -144,6 +144,7 @@ class _OcrCandidate:
     source_size: tuple[int, int] | None = None
     targets: tuple[_OcrTarget, ...] = ()
     trigger: str = "scheduled"
+    vlm_text_regions: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3142,6 +3143,107 @@ class CompanionRuntime:
             return
         now = time.monotonic()
         frame_key = f"frame:{observation.camera_id}"
+        
+        # VLM-driven text detection: check if there's text in the frame first
+        # This runs more frequently than full OCR but only triggers OCR when text is found
+        vlm_text_check_interval = 5.0  # Check every 5 seconds
+        vlm_key = f"vlm_text:{observation.camera_id}"
+        if now - self._last_ocr_candidate_at.get(vlm_key, 0.0) < vlm_text_check_interval:
+            return
+        
+        try:
+            image_png = await asyncio.to_thread(
+                self._encode_ocr_image,
+                frame,
+                None,
+                self.config.ocr.max_image_size,
+            )
+            
+            # Use VLM to detect if there's text in the frame
+            text_detection = await self._omnius.detect_text_in_frame(
+                image_png, observation.camera_id
+            )
+            
+            if text_detection is None or not text_detection.get("has_text"):
+                self._last_ocr_candidate_at[vlm_key] = now
+                return
+            
+            # VLM detected text - now run OCR on the regions
+            self._last_ocr_candidate_at[vlm_key] = now
+            self.telemetry.record_ocr(
+                "vlm_text_detected",
+                f"{observation.camera_id}:{len(text_detection.get('text_regions', []))} regions"
+            )
+            
+            # Build targets from VLM-detected text regions
+            targets: list[_OcrTarget] = []
+            for detection in observation.detections:
+                object_id = detection.attributes.get("object_id")
+                identity_id = detection.attributes.get("identity_id")
+                parent_id = str(
+                    object_id
+                    or identity_id
+                    or self._ocr_parent_for_detection(
+                        observation.camera_id, detection, now
+                    )
+                )
+                targets.append(
+                    _OcrTarget(
+                        parent_id,
+                        (
+                            "object"
+                            if object_id
+                            else "person"
+                            if identity_id
+                            and detection.attributes.get("identity_persistent")
+                            else "appearance_track"
+                            if identity_id
+                            else "object_category"
+                        ),
+                        str(detection.attributes.get("identity") or detection.label),
+                        float(
+                            detection.attributes.get("identity_confidence")
+                            or detection.confidence
+                        ),
+                        (
+                            float(detection.bbox.x1),
+                            float(detection.bbox.y1),
+                            float(detection.bbox.x2),
+                            float(detection.bbox.y2),
+                        ),
+                        tuple(
+                            (float(point[0]), float(point[1]))
+                            for point in detection.attributes.get("mask_polygon", ())
+                            if isinstance(point, (list, tuple)) and len(point) >= 2
+                        ),
+                    )
+                )
+            
+            # Queue OCR with VLM-detected text regions
+            self._ocr_candidates.put_nowait(
+                _OcrCandidate(
+                    observation.camera_id,
+                    image_png,
+                    observation.timestamp,
+                    "vlm_text",
+                    f"scene:{observation.camera_id}",
+                    "object_category",
+                    f"{observation.camera_id} scene",
+                    0.7,  # Higher confidence since VLM detected text
+                    source_size=(int(frame.shape[1]), int(frame.shape[0])),
+                    targets=tuple(targets),
+                    trigger="vlm-text-detection",
+                    vlm_text_regions=text_detection.get("text_regions", []),
+                )
+            )
+        except asyncio.QueueFull:
+            return
+        except Exception as error:
+            self.telemetry.record_ocr("error", error)
+            self.telemetry.record_runtime_error("ocr-vlm-detect", error)
+            return
+        
+        # Also queue standard OCR at reduced rate for completeness
         if now - self._last_ocr_candidate_at.get(frame_key, 0.0) < (
             self._activity.scaled_interval(self.config.ocr.full_frame_interval_seconds, now)
         ):
@@ -3624,13 +3726,14 @@ class CompanionRuntime:
                 "request", f"{candidate.camera_id}:{candidate.scope}:{candidate.parent_label}"
             )
             try:
-                result = (
-                    await asyncio.to_thread(
+                if candidate.scope == "vlm_text" and candidate.vlm_text_regions:
+                    result = await self._ocr_vlm_detected_regions(candidate)
+                elif candidate.scope == "frame":
+                    result = await asyncio.to_thread(
                         self._local_text_region_proposals, candidate.image_png
                     )
-                    if candidate.scope == "frame"
-                    else await self._run_advanced_ocr(candidate.image_png)
-                )
+                else:
+                    result = await self._run_advanced_ocr(candidate.image_png)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -3641,7 +3744,7 @@ class CompanionRuntime:
             if result is None:
                 self.telemetry.record_ocr("empty", candidate.parent_label)
                 continue
-            if candidate.scope == "frame" and not result.get("image_size"):
+            if candidate.scope in ("frame", "vlm_text") and not result.get("image_size"):
                 try:
                     import cv2
 
@@ -3680,8 +3783,90 @@ class CompanionRuntime:
                 },
             )
             self._queue_ocr_memory(candidate, text, result)
-            if candidate.scope == "frame" and candidate.targets:
+            if candidate.scope in ("frame", "vlm_text") and candidate.targets:
                 await self._queue_spatially_grounded_ocr(candidate, result)
+
+    async def _ocr_vlm_detected_regions(
+        self, candidate: _OcrCandidate
+    ) -> dict[str, object] | None:
+        """Crop each VLM-detected text region and run targeted OCR on it."""
+        import cv2
+
+        decoded = await asyncio.to_thread(
+            cv2.imdecode,
+            np.frombuffer(candidate.image_png, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        if decoded is None or not decoded.size:
+            return None
+
+        all_text_parts: list[str] = []
+        all_regions: list[dict[str, object]] = []
+        frame_h, frame_w = decoded.shape[:2]
+
+        for vlm_region in candidate.vlm_text_regions:
+            bbox = vlm_region.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = [
+                int(float(bbox[0]) * frame_w),
+                int(float(bbox[1]) * frame_h),
+                int(float(bbox[2]) * frame_w),
+                int(float(bbox[3]) * frame_h),
+            ]
+            x1 = max(0, min(x1, frame_w - 1))
+            y1 = max(0, min(y1, frame_h - 1))
+            x2 = max(x1 + 1, min(x2, frame_w))
+            y2 = max(y1 + 1, min(y2, frame_h))
+
+            crop = decoded[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            crop_png_list: list[bytes] = []
+            try:
+                success, buffer = cv2.imencode(".png", crop)
+                if success:
+                    crop_png_list.append(buffer.tobytes())
+            except Exception:
+                continue
+            if not crop_png_list:
+                continue
+
+            try:
+                region_result = await self._run_advanced_ocr(crop_png_list[0])
+            except Exception as error:
+                logger.debug("VLM region OCR failed", exc_info=error)
+                self.telemetry.record_ocr("error", error)
+                continue
+
+            region_text = str(region_result.get("text") or "").strip() if region_result else ""
+            if not region_text:
+                continue
+
+            all_text_parts.append(region_text)
+            all_regions.append({
+                "bbox": [x1, y1, x2, y2],
+                "text": region_text,
+                "confidence": region_result.get("confidence", 0.5) if region_result else 0.5,
+                "engine": region_result.get("engine", "advanced-ocr") if region_result else "advanced-ocr",
+                "vlm_description": vlm_region.get("description", ""),
+            })
+
+        if not all_text_parts:
+            return None
+
+        return {
+            "text": "\n".join(all_text_parts),
+            "regions": all_regions,
+            "confidence": max(
+                (float(r["confidence"]) for r in all_regions), default=0.5
+            ),
+            "engine": "vlm-region-ocr",
+            "vision_used": True,
+            "vlm_region_count": len(all_regions),
+            "image_size": [frame_w, frame_h],
+        }
 
     async def _queue_spatially_grounded_ocr(
         self, candidate: _OcrCandidate, result: dict[str, object]
