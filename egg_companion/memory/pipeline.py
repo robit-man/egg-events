@@ -447,6 +447,10 @@ class MemoryPipeline:
             import sqlite3
             from egg_companion.world.reconcile import Reconciler
             from egg_companion.world.state import WorldStateStore
+            from egg_companion.world.query import WorldQuery
+            from egg_companion.world.context import CognitiveContext
+            from egg_companion.world.relations import WorldGraphStore
+            from egg_companion.world.identity import IdentityGraph
             
             # Create world model connection (separate from memory store)
             world_db_path = self.store._read_connection.execute(
@@ -458,9 +462,17 @@ class MemoryPipeline:
             
             world_conn = sqlite3.connect(db_path, check_same_thread=False)
             world_conn.execute("PRAGMA journal_mode=WAL")
+            world_conn.execute("PRAGMA busy_timeout=5000")
+            world_conn.execute("PRAGMA foreign_keys=ON")
             
             world_state = WorldStateStore(world_conn)
             self._world_reconciler = Reconciler(world_conn, world_state)
+            
+            world_graph = WorldGraphStore(world_conn)
+            identity_graph = IdentityGraph(world_conn)
+            world_query = WorldQuery(world_state, world_graph, identity_graph)
+            world_context = CognitiveContext(world_query)
+            self.context.set_world_context(world_context)
             
             import logging
             logger = logging.getLogger(__name__)

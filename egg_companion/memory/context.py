@@ -21,6 +21,11 @@ class ContextAssembler:
             400, min(int(reflective_context_characters), 8000)
         )
         self._last_hits = ()
+        self._world_context = None
+
+    def set_world_context(self, world_context: object) -> None:
+        """Inject the CognitiveContext from the world model layer."""
+        self._world_context = world_context
 
     def build(
         self, query: str, live_scene: str, entity_ids: tuple[str, ...] = (),
@@ -106,12 +111,21 @@ class ContextAssembler:
         reflective_context = self.reflective_context(
             min(self.reflective_context_characters, max(400, self.config.context_max_characters // 3))
         )
+        world_state = self._build_world_state_section()
         header = (
             "CURRENT SENSORY CONTEXT (live, may be uncertain):\n"
             f"{live_scene}\n\n"
             "COGNITIVE CONTROL STATE (bounded attention/default-mode metadata; scores guide "
             "focus but are not facts):\n"
             f"{json.dumps(cognitive_state or {}, ensure_ascii=True, separators=(',', ':'))}\n\n"
+        )
+        if world_state:
+            header += (
+                "CURRENT RECONCILED WORLD STATE (derived from evidence; "
+                "use as grounded context for reasoning):\n"
+                f"{world_state}\n\n"
+            )
+        header += (
             "REFLECTIVE WORKING MODEL (derived, revisable, not raw chain-of-thought; "
             "use it as strategy and context, never as stronger evidence than its sources):\n"
             f"{reflective_context}\n\n"
@@ -125,6 +139,21 @@ class ContextAssembler:
         if len(header) + len(body) > maximum:
             body = body[: max(0, maximum - len(header) - 18)] + "...[TRUNCATED]"
         return header + body
+
+    def _build_world_state_section(self) -> str:
+        """Build a compact representation of the current world state."""
+        if self._world_context is None:
+            return ""
+        try:
+            from egg_companion.world.context import CognitiveContext
+            if not isinstance(self._world_context, CognitiveContext):
+                return ""
+            window = self._world_context.build_window(max_characters=1500, max_entities=8)
+            if not window.entities:
+                return ""
+            return self._world_context.serialize_for_llm(window)
+        except Exception:
+            return ""
 
     def reflective_context(self, maximum: int | None = None) -> str:
         maximum = max(
