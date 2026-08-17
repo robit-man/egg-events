@@ -70,7 +70,7 @@ def world_stores(db):
     normalizer = ObservationNormalizer()
     policy = PolicyValidator(db)
     metrics = MetricsCollector(db)
-    query = WorldQuery(state, graph, identity)
+    query = WorldQuery(state, graph, identity, reconciler=reconciler)
     context = CognitiveContext(query)
     return {
         "state": state,
@@ -860,8 +860,8 @@ class TestRevisionRestartSafety:
 
     def test_revision_loads_from_db(self, db):
         state1 = WorldStateStore(db)
-        state1.increment_revision("first")
-        state1.increment_revision("second")
+        state1.allocate_revision("first")
+        state1.allocate_revision("second")
         rev_after = state1.revision
 
         state2 = WorldStateStore(db)
@@ -870,10 +870,10 @@ class TestRevisionRestartSafety:
     def test_revision_increments_from_loaded(self, db):
         state1 = WorldStateStore(db)
         for _ in range(5):
-            state1.increment_revision()
+            state1.allocate_revision()
 
         state2 = WorldStateStore(db)
-        state2.increment_revision("after restart")
+        state2.allocate_revision("after restart")
         assert state2.revision == 6
 
 
@@ -1140,3 +1140,383 @@ class TestTransformTree:
         cal = tree2.get_calibration("cam0")
         assert cal is not None
         assert cal.camera_id == "cam0"
+
+
+class TestAtomicTransaction:
+    """Test that world_transaction provides true atomicity."""
+
+    def test_rollback_on_exception(self, db):
+        from egg_companion.world.state import WorldStateStore
+        from egg_companion.world.types import TypedValue, ValueType
+        state = WorldStateStore(db)
+        initial_rev = state.revision
+
+        try:
+            with state.world_transaction("test_rollback"):
+                state.upsert_property(
+                    "e1", "label",
+                    TypedValue(raw="should_rollback", value_type=ValueType.STRING),
+                    0.9, 0.8, "assert:1", ("ev:1",), "observation",
+                    utcnow().isoformat(), revision=999,
+                )
+                raise ValueError("force rollback")
+        except ValueError:
+            pass
+
+        row = state.get_property("e1", "label")
+        assert row is None
+        assert state.revision == initial_rev
+
+    def test_all_inner_commits_suppressed(self, db):
+        from egg_companion.world.state import WorldStateStore
+        from egg_companion.world.types import TypedValue, ValueType
+        state = WorldStateStore(db)
+
+        with state.world_transaction("multi_upsert"):
+            rev = state._current_revision
+            state.upsert_property(
+                "e1", "label",
+                TypedValue(raw="a", value_type=ValueType.STRING),
+                0.9, 0.8, "assert:1", ("ev:1",), "observation",
+                utcnow().isoformat(), revision=rev,
+            )
+            state.upsert_property(
+                "e1", "bbox",
+                TypedValue(raw=[0,0,10,10], value_type=ValueType.GEOMETRY),
+                0.9, 0.7, "assert:2", ("ev:1",), "observation",
+                utcnow().isoformat(), revision=rev,
+            )
+            state.upsert_relation(
+                "e1", "visible_from", "cam:cam0",
+                0.9, 0.8, "assert:3", ("ev:1",), "observation",
+                utcnow().isoformat(), revision=rev,
+            )
+
+        row = state.get_property("e1", "label")
+        assert row is not None
+        assert json.loads(row.value_json) == "a"
+        assert row.revision == rev
+        row2 = state.get_property("e1", "bbox")
+        assert row2.revision == rev
+
+
+class TestSingleRevisionPerDelta:
+    """Test that one WorldDelta gets one revision."""
+
+    def test_ingest_creates_one_revision(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+        initial_rev = state.revision
+
+        delta = WorldDelta()
+        for i in range(5):
+            delta.assertions.append({
+                "subject_id": f"entity_{i}",
+                "property_id": "label",
+                "value": TypedValue(raw=f"thing_{i}", value_type=ValueType.STRING),
+                "epistemic_kind": "observation",
+                "source_id": "test:cam",
+                "evidence_ids": ("ev:1",),
+                "confidence": 0.9,
+                "authority": 0.8,
+                "valid_from": utcnow().isoformat(),
+            })
+
+        reconciler.ingest(delta)
+
+        # All properties should share the same revision
+        revisions = set()
+        for i in range(5):
+            row = state.get_property(f"entity_{i}", "label")
+            if row:
+                revisions.add(row.revision)
+        assert len(revisions) == 1
+        assert state.revision == initial_rev + 1
+
+
+class TestRelationReconciliation:
+    """Test RelationReconciler authority and expiry."""
+
+    def _ensure_tables(self, conn):
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS relation_assertions (
+                assertion_id TEXT PRIMARY KEY,
+                source_entity_id TEXT NOT NULL,
+                relation_type_id TEXT NOT NULL,
+                target_entity_id TEXT NOT NULL,
+                epistemic_kind TEXT NOT NULL DEFAULT 'observation',
+                source_id TEXT NOT NULL,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                authority REAL NOT NULL DEFAULT 0.0,
+                valid_from TEXT NOT NULL,
+                valid_to TEXT,
+                observed_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'proposed',
+                revision_of TEXT,
+                ontology_revision INTEGER NOT NULL DEFAULT 1
+            );
+        """)
+
+    def test_higher_authority_supersedes(self, db):
+        from egg_companion.world.state import WorldStateStore
+        from egg_companion.world.reconcile import RelationReconciler
+        self._ensure_tables(db)
+        state = WorldStateStore(db)
+        rr = RelationReconciler(db, state)
+
+        # Insert initial relation
+        with state.world_transaction():
+            rev = state._current_revision
+            state.upsert_relation(
+                "e1", "near", "e2",
+                0.8, 0.5, "assert:1", ("ev:1",), "observation",
+                utcnow().isoformat(), revision=rev,
+            )
+            db.execute(
+                """INSERT INTO relation_assertions
+                (assertion_id, source_entity_id, relation_type_id, target_entity_id,
+                 epistemic_kind, source_id, evidence_ids_json, confidence, authority,
+                 valid_from, observed_at, recorded_at, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')""",
+                ("assert:1", "e1", "near", "e2", "observation", "test",
+                 '["ev:1"]', 0.8, 0.5, utcnow().isoformat(),
+                 utcnow().isoformat(), utcnow().isoformat()),
+            )
+
+        result = rr.reconcile_relation(
+            "e1", "near", "e2",
+            new_authority=0.9, new_confidence=0.9,
+            evidence_ids=("ev:2",), epistemic_kind="observation",
+            source_origin="test", valid_from=utcnow().isoformat(),
+        )
+        assert result == "superseded"
+
+    def test_lower_authority_rejected(self, db):
+        from egg_companion.world.state import WorldStateStore
+        from egg_companion.world.reconcile import RelationReconciler
+        self._ensure_tables(db)
+        state = WorldStateStore(db)
+        rr = RelationReconciler(db, state)
+
+        with state.world_transaction():
+            rev = state._current_revision
+            state.upsert_relation(
+                "e1", "near", "e2",
+                0.8, 0.8, "assert:1", ("ev:1",), "observation",
+                utcnow().isoformat(), revision=rev,
+            )
+            db.execute(
+                """INSERT INTO relation_assertions
+                (assertion_id, source_entity_id, relation_type_id, target_entity_id,
+                 epistemic_kind, source_id, evidence_ids_json, confidence, authority,
+                 valid_from, observed_at, recorded_at, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')""",
+                ("assert:1", "e1", "near", "e2", "observation", "test",
+                 '["ev:1"]', 0.8, 0.8, utcnow().isoformat(),
+                 utcnow().isoformat(), utcnow().isoformat()),
+            )
+
+        result = rr.reconcile_relation(
+            "e1", "near", "e2",
+            new_authority=0.5, new_confidence=0.5,
+            evidence_ids=("ev:2",), epistemic_kind="observation",
+            source_origin="test", valid_from=utcnow().isoformat(),
+        )
+        assert result == "rejected"
+
+
+class TestConflictQuerying:
+    """Test that WorldQuery.conflicts() actually returns data."""
+
+    def test_conflicts_populated(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+
+        # Create two conflicting assertions
+        delta1 = WorldDelta()
+        delta1.assertions.append({
+            "subject_id": "e1", "property_id": "label",
+            "value": TypedValue(raw="Alice", value_type=ValueType.STRING),
+            "epistemic_kind": "observation", "source_id": "cam:1",
+            "evidence_ids": ("ev:1",), "confidence": 0.9, "authority": 0.7,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta1)
+
+        delta2 = WorldDelta()
+        delta2.assertions.append({
+            "subject_id": "e1", "property_id": "label",
+            "value": TypedValue(raw="Bob", value_type=ValueType.STRING),
+            "epistemic_kind": "observation", "source_id": "cam:2",
+            "evidence_ids": ("ev:2",), "confidence": 0.9, "authority": 0.7,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta2)
+
+        conflicts = query.conflicts()
+        assert len(conflicts) > 0
+        assert conflicts[0].entity_id == "e1"
+        assert conflicts[0].property_id == "label"
+        assert len(conflicts[0].assertions) > 0
+
+
+class TestActionProposalPersistence:
+    """Test that all ActionProposal fields survive persist/retrieve."""
+
+    def test_full_roundtrip(self, db):
+        from egg_companion.world.actions import ActionStore
+        from egg_companion.world.types import ActionProposal
+        from datetime import datetime, timezone
+        store = ActionStore(db)
+        proposal = ActionProposal(
+            proposal_id="prop:001",
+            action_type="speak",
+            target_entity_ids=("e1", "e2"),
+            inputs={"text": "hello"},
+            preconditions=("entity_visible:e1",),
+            expected_effects=("audio_output:hello",),
+            source_evidence_ids=("ev:1",),
+            based_on_revision=42,
+            status="pending",
+            reason="test",
+            proposed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        store.propose(proposal)
+        retrieved = store.get_proposal("prop:001")
+        assert retrieved is not None
+        assert retrieved.preconditions == ("entity_visible:e1",)
+        assert retrieved.expected_effects == ("audio_output:hello",)
+        assert retrieved.based_on_revision == 42
+        assert retrieved.target_entity_ids == ("e1", "e2")
+        assert isinstance(retrieved.proposed_at, datetime)
+
+
+class TestSafeZonePolicyTarget:
+    """Test that safe-zone checks target_entity_ids, not proposal_id."""
+
+    def test_blocks_correct_target(self, db):
+        from egg_companion.world.policy import PolicyValidator
+        from egg_companion.world.types import ActionProposal
+        validator = PolicyValidator(db)
+        proposal = ActionProposal(
+            proposal_id="prop:xyz",
+            action_type="move_object",
+            target_entity_ids=("egg_bed",),
+        )
+        violations = validator.validate(proposal)
+        safe_zone_violations = [v for v in violations if v.rule_id == "safe_zone"]
+        assert len(safe_zone_violations) > 0
+        assert "egg_bed" in safe_zone_violations[0].reason
+
+    def test_allows_non_safe_target(self, db):
+        from egg_companion.world.policy import PolicyValidator
+        from egg_companion.world.types import ActionProposal
+        validator = PolicyValidator(db)
+        proposal = ActionProposal(
+            proposal_id="prop:xyz",
+            action_type="move_object",
+            target_entity_ids=("kitchen_table",),
+        )
+        violations = validator.validate(proposal)
+        safe_zone_violations = [v for v in violations if v.rule_id == "safe_zone"]
+        assert len(safe_zone_violations) == 0
+
+
+class TestContextWindowRanking:
+    """Test that build_window prioritizes focus_entity."""
+
+    def test_focus_entity_first(self, world_stores):
+        from egg_companion.world.context import CognitiveContext
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+
+        for i in range(5):
+            delta = WorldDelta()
+            delta.assertions.append({
+                "subject_id": f"entity_{i}", "property_id": "label",
+                "value": TypedValue(raw=f"thing_{i}", value_type=ValueType.STRING),
+                "epistemic_kind": "observation", "source_id": "test",
+                "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.7,
+                "valid_from": utcnow().isoformat(),
+            })
+            reconciler.ingest(delta)
+
+        ctx = CognitiveContext(query)
+        window = ctx.build_window(focus_entity="entity_3", max_entities=3)
+        assert len(window.entities) > 0
+        assert window.entities[0]["entity_id"] == "entity_3"
+
+
+class TestTypedPredictions:
+    """Test TypedPrediction records."""
+
+    def test_predict_returns_structure(self, world_stores):
+        from egg_companion.core.prediction import WorldStatePredictor, TypedPrediction
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+
+        delta = WorldDelta()
+        delta.assertions.append({
+            "subject_id": "e1", "property_id": "label",
+            "value": TypedValue(raw="person", value_type=ValueType.STRING),
+            "epistemic_kind": "observation", "source_id": "test",
+            "evidence_ids": ("ev:1",), "confidence": 0.9, "authority": 0.8,
+            "valid_from": utcnow().isoformat(),
+        })
+        delta.assertions.append({
+            "subject_id": "e1", "property_id": "behavior",
+            "value": TypedValue(raw="idle", value_type=ValueType.STRING),
+            "epistemic_kind": "observation", "source_id": "test",
+            "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.7,
+            "valid_from": utcnow().isoformat(),
+        })
+        delta.assertions.append({
+            "subject_id": "e1", "property_id": "current_location",
+            "value": TypedValue(raw={"frame": "cam_normalized", "position": [0.5, 0.5]}, value_type=ValueType.GEOMETRY),
+            "epistemic_kind": "observation", "source_id": "test",
+            "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.7,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta)
+
+        predictor = WorldStatePredictor(query)
+        preds = predictor.predict("e1", horizon_seconds=30.0)
+        assert len(preds) > 0
+        assert all(isinstance(p, TypedPrediction) for p in preds)
+        assert any(p.property == "current_location" for p in preds)
+
+
+class TestObservabilityTransitions:
+    """Test that missing entities get OBSERVED_ABSENT."""
+
+    def test_absent_entity_emitted(self):
+        from unittest.mock import MagicMock
+        from egg_companion.world.normalize import ObservationNormalizer
+        from egg_companion.world.types import ObservabilityState
+        normalizer = ObservationNormalizer()
+
+        event = MagicMock()
+        event.event_type = "vision"
+        event.source_id = "vision:cam0"
+        event.occurred_at = utcnow()
+        event.payload = {
+            "detections": [
+                {"entity_id": "e1", "label": "person", "confidence": 0.9,
+                 "bbox": [0, 0, 100, 100]}
+            ]
+        }
+        event.entity_ids = ("e1", "e2")  # e2 was expected but not detected
+
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:1",))
+        obs_values = [
+            a["value"].raw for a in delta.assertions
+            if a.get("property_id") == "observability"
+        ]
+        assert ObservabilityState.OBSERVED_PRESENT.value in obs_values
+        assert ObservabilityState.OBSERVED_ABSENT.value in obs_values

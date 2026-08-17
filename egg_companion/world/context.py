@@ -48,10 +48,36 @@ class CognitiveContext:
         include_actions: bool = True,
     ) -> ContextWindow:
         window = ContextWindow(max_characters=max_characters)
-        entity_ids = self._query.all_entity_ids()
+        all_ids = self._query.all_entity_ids()
+
+        # Rank entities: focus_entity always first, then by recency and confidence
+        ranked: list[tuple[float, str]] = []
+        for eid in all_ids:
+            priority = 0.0
+            if eid == focus_entity:
+                priority = 1000.0
+            ev = self._query.entity(eid)
+            if ev and ev.properties:
+                # Boost by recency
+                last_seen = ev.properties.get("last_seen", {})
+                if last_seen.get("value"):
+                    try:
+                        import datetime as _dt
+                        ts = _dt.datetime.fromisoformat(str(last_seen["value"]))
+                        age = (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds()
+                        priority += max(0.0, 10.0 - age / 30.0)
+                    except Exception:
+                        pass
+                # Boost by avg confidence
+                avg_conf = sum(p.get("confidence", 0) for p in ev.properties.values()) / max(len(ev.properties), 1)
+                priority += avg_conf * 5.0
+            ranked.append((priority, eid))
+
+        ranked.sort(reverse=True)
+
         entities = []
         total_chars = 0
-        for eid in entity_ids[:max_entities]:
+        for _, eid in ranked[:max_entities]:
             ev = self._query.entity(eid)
             if ev is None:
                 continue
@@ -76,9 +102,34 @@ class CognitiveContext:
                 break
             total_chars += char_count
             entities.append(entry)
+
         window.entities = entities
         window.total_characters = total_chars
         window.summary = self._query.summary()
+
+        # Populate conflicts
+        try:
+            conflicts = self._query.conflicts()
+            window.conflicts = [
+                {
+                    "entity_id": c.entity_id,
+                    "property_id": c.property_id,
+                    "current_value": c.current_value,
+                    "proposed_value": c.proposed_value,
+                    "reason": c.reason,
+                }
+                for c in conflicts
+            ]
+        except Exception:
+            window.conflicts = []
+
+        # Populate recent events from world state
+        if include_events:
+            try:
+                window.recent_events = self.recent_activity(seconds=300.0)
+            except Exception:
+                window.recent_events = []
+
         return window
 
     def for_entity(self, entity_id: str) -> EntityContext | None:
@@ -98,7 +149,25 @@ class CognitiveContext:
         )
 
     def recent_activity(self, seconds: float = 300.0) -> list[dict[str, Any]]:
-        return []
+        """Return recent world state mutations from the revision ledger."""
+        import datetime as _dt
+        cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds)).isoformat()
+        try:
+            conn = self._query._state._conn
+            with self._query._state._lock:
+                rows = conn.execute(
+                    """SELECT revision, description, created_at
+                    FROM world_state_revisions
+                    WHERE created_at >= ?
+                    ORDER BY revision DESC LIMIT 20""",
+                    (cutoff,),
+                ).fetchall()
+            return [
+                {"revision": r[0], "description": r[1], "created_at": r[2]}
+                for r in rows
+            ]
+        except Exception:
+            return []
 
     def serialize_for_llm(self, window: ContextWindow) -> str:
         parts = []

@@ -127,15 +127,15 @@ class PolicyValidator:
                     ))
             if "safe_zones" in conditions:
                 safe_zones = conditions["safe_zones"]
-                target = proposal.proposal_id
-                for zone in safe_zones:
-                    if zone in target:
-                        violations.append(PolicyViolation(
-                            rule_id=rule_id, rule_name=name,
-                            proposal_id=proposal.proposal_id,
-                            reason=f"Target '{target}' is in safe zone '{zone}'",
-                            blocked=bool(block),
-                        ))
+                for target_id in proposal.target_entity_ids:
+                    for zone in safe_zones:
+                        if zone in target_id:
+                            violations.append(PolicyViolation(
+                                rule_id=rule_id, rule_name=name,
+                                proposal_id=proposal.proposal_id,
+                                reason=f"Target entity '{target_id}' is in safe zone '{zone}'",
+                                blocked=bool(block),
+                            ))
             if require_approval:
                 violations.append(PolicyViolation(
                     rule_id=rule_id, rule_name=name,

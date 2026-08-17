@@ -19,7 +19,7 @@ from typing import Any
 from egg_companion.world.ontology import OntologyRegistry
 from egg_companion.world.state import WorldStateStore
 from egg_companion.world.relations import WorldGraphStore
-from egg_companion.world.types import EpistemicKind, TypedValue, ValueType
+from egg_companion.world.types import EpistemicKind, ObservabilityState, TypedValue, ValueType
 
 
 @dataclass
@@ -156,23 +156,21 @@ class KnowledgeGraphBridge:
 
         last_seen = world_state.get("last_seen")
         if not last_seen:
-            return "unknown"
+            return ObservabilityState.UNKNOWN.value
         
         import datetime
         try:
             last_seen_dt = datetime.datetime.fromisoformat(last_seen.get("value", ""))
             age_seconds = (datetime.datetime.now(datetime.timezone.utc) - last_seen_dt).total_seconds()
             
-            if age_seconds < 5:
-                return "observed_present"
-            elif age_seconds < 30:
-                return "observed_present"
+            if age_seconds < 30:
+                return ObservabilityState.OBSERVED_PRESENT.value
             elif age_seconds < 300:
-                return "not_observed"
+                return ObservabilityState.NOT_OBSERVED.value
             else:
-                return "unknown"
+                return ObservabilityState.UNKNOWN.value
         except Exception:
-            return "unknown"
+            return ObservabilityState.UNKNOWN.value
 
     def _compute_freshness(self, world_state: dict[str, Any], ontology_type: Any) -> dict[str, float]:
         """Compute freshness for each property based on ontology stale_after metadata."""

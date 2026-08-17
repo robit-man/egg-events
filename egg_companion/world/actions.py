@@ -32,7 +32,10 @@ class ActionStore:
                     proposed_at TEXT NOT NULL,
                     accepted INTEGER NOT NULL DEFAULT 0,
                     rejected INTEGER NOT NULL DEFAULT 0,
-                    reason TEXT NOT NULL DEFAULT ''
+                    reason TEXT NOT NULL DEFAULT '',
+                    preconditions_json TEXT NOT NULL DEFAULT '[]',
+                    expected_effects_json TEXT NOT NULL DEFAULT '[]',
+                    based_on_revision INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS action_executions (
@@ -62,17 +65,21 @@ class ActionStore:
             self._conn.execute(
                 """INSERT OR REPLACE INTO action_proposals
                 (proposal_id, action_type, target_entity_id, parameters_json,
-                 source_evidence_id, proposed_at, accepted, rejected, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 source_evidence_id, proposed_at, accepted, rejected, reason,
+                 preconditions_json, expected_effects_json, based_on_revision)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     proposal.proposal_id, proposal.action_type,
                     json.dumps(proposal.target_entity_ids),
                     json.dumps(proposal.inputs, default=str),
                     json.dumps(proposal.source_evidence_ids),
-                    proposal.proposed_at.isoformat(),
+                    proposal.proposed_at.isoformat() if hasattr(proposal.proposed_at, 'isoformat') else str(proposal.proposed_at),
                     int(proposal.status == "accepted"),
                     int(proposal.status == "rejected"),
                     proposal.reason,
+                    json.dumps(list(proposal.preconditions)),
+                    json.dumps(list(proposal.expected_effects)),
+                    proposal.based_on_revision,
                 ),
             )
             self._conn.commit()
@@ -111,18 +118,31 @@ class ActionStore:
     def get_proposal(self, proposal_id: str) -> ActionProposal | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT action_type, target_entity_id, parameters_json, source_evidence_id, proposed_at, accepted, rejected, reason FROM action_proposals WHERE proposal_id = ?",
+                """SELECT action_type, target_entity_id, parameters_json,
+                source_evidence_id, proposed_at, accepted, rejected, reason,
+                preconditions_json, expected_effects_json, based_on_revision
+                FROM action_proposals WHERE proposal_id = ?""",
                 (proposal_id,),
             ).fetchone()
             if row is None:
                 return None
             status = "rejected" if row[6] else ("accepted" if row[5] else "pending")
+            proposed_at = row[4]
+            try:
+                from datetime import datetime, timezone
+                if isinstance(proposed_at, str):
+                    proposed_at = datetime.fromisoformat(proposed_at)
+            except Exception:
+                pass
             return ActionProposal(
                 proposal_id=proposal_id, action_type=row[0],
                 target_entity_ids=tuple(json.loads(row[1])),
                 inputs=json.loads(row[2]),
+                preconditions=tuple(json.loads(row[8])) if row[8] else (),
+                expected_effects=tuple(json.loads(row[9])) if row[9] else (),
                 source_evidence_ids=tuple(json.loads(row[3])),
-                proposed_at=row[4], status=status, reason=row[7],
+                based_on_revision=int(row[10]) if row[10] else 0,
+                proposed_at=proposed_at, status=status, reason=row[7],
             )
 
     def pending_proposals(self) -> list[dict[str, Any]]:

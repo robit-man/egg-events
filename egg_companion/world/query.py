@@ -40,10 +40,12 @@ class WorldQuery:
         state_store: WorldStateStore,
         graph_store: WorldGraphStore,
         identity_graph: IdentityGraph,
+        reconciler: Any = None,
     ) -> None:
         self._state = state_store
         self._graph = graph_store
         self._identity = identity_graph
+        self._reconciler = reconciler
 
     def entity(self, entity_id: str) -> EntityViewState | None:
         props = self._state.get_entity_state(entity_id)
@@ -112,18 +114,37 @@ class WorldQuery:
         return self._state.explain(entity_id, property_id)
 
     def conflicts(self) -> list[ConflictInfo]:
-        conflict_rows = self._state.conflicts("") or []
-        return [
-            ConflictInfo(
+        # Get conflicts from the assertion log via the state store
+        conflict_rows = self._state.conflicts()
+        seen: set[tuple[str, str]] = set()
+        result: list[ConflictInfo] = []
+        for c in conflict_rows:
+            key = (c.entity_id, c.property_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Fetch assertion history to show both sides of the conflict
+            assertions = []
+            if self._reconciler is not None:
+                try:
+                    history = self._reconciler.get_assertion_history(c.entity_id, c.property_id)
+                    assertions = [
+                        a for a in history if a.get("state") in ("accepted", "conflicted")
+                    ]
+                except Exception:
+                    pass
+            proposed_value = None
+            if len(assertions) >= 2:
+                proposed_value = assertions[1].get("value")
+            result.append(ConflictInfo(
                 entity_id=c.entity_id,
                 property_id=c.property_id,
                 current_value=json.loads(c.value_json),
-                proposed_value=None,
-                reason="Multiple accepted assertions",
-                assertions=[],
-            )
-            for c in conflict_rows
-        ]
+                proposed_value=proposed_value,
+                reason=f"Multiple active assertions (authority={c.authority:.2f})",
+                assertions=assertions,
+            ))
+        return result
 
     def graph_neighbors(self, entity_id: str, relation_type: str | None = None) -> list[dict[str, Any]]:
         return self._graph.neighbors(entity_id, relation_type)

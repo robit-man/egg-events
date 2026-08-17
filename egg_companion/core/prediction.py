@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from egg_companion.world.query import WorldQuery
@@ -13,6 +15,18 @@ class PredictionResidual:
     movement: float
     action_change: float
     seen_count: int
+
+
+@dataclass(frozen=True)
+class TypedPrediction:
+    """A single typed prediction about a world entity."""
+    subject: str
+    property: str
+    expected_value: Any
+    horizon_seconds: float
+    uncertainty: float
+    based_on_revision: int = 0
+    reasoning: str = ""
 
 
 class WorldStatePredictor:
@@ -56,6 +70,77 @@ class WorldStatePredictor:
         residual = max(new_entity, movement, action_change, max(0.0, min(1.0, conflict)) * 0.5)
         self._states[entity_id] = (behavior, center, seen_count)
         return PredictionResidual(residual, new_entity, movement, action_change, seen_count)
+
+    def predict(self, entity_id: str, horizon_seconds: float = 30.0) -> list[TypedPrediction]:
+        """Produce typed predictions for an entity's near-future state."""
+        if self._query is None:
+            return []
+        try:
+            ev = self._query.entity(entity_id)
+        except Exception:
+            return []
+        if ev is None or not ev.properties:
+            return []
+
+        predictions: list[TypedPrediction] = []
+        revision = 0
+
+        # Predict location continuity
+        loc_prop = ev.properties.get("current_location")
+        if loc_prop:
+            loc_val = loc_prop.get("value")
+            confidence = loc_prop.get("confidence", 0.5)
+            age = self._property_age_seconds(loc_prop)
+            uncertainty = min(1.0, 0.2 + (age / horizon_seconds) * 0.5) if age is not None else 0.5
+            predictions.append(TypedPrediction(
+                subject=entity_id,
+                property="current_location",
+                expected_value=loc_val,
+                horizon_seconds=horizon_seconds,
+                uncertainty=uncertainty,
+                based_on_revision=loc_prop.get("revision", 0),
+                reasoning=f"Last seen at {loc_val} (conf={confidence:.2f})",
+            ))
+
+        # Predict behavior continuity
+        beh_prop = ev.properties.get("behavior")
+        if beh_prop:
+            beh_val = beh_prop.get("value")
+            predictions.append(TypedPrediction(
+                subject=entity_id,
+                property="behavior",
+                expected_value=beh_val,
+                horizon_seconds=min(15.0, horizon_seconds),
+                uncertainty=0.4,
+                based_on_revision=beh_prop.get("revision", 0),
+                reasoning=f"Current behavior: {beh_val}",
+            ))
+
+        # Predict observability decay
+        obs_prop = ev.properties.get("observability")
+        if obs_prop:
+            current_obs = obs_prop.get("value", "unknown")
+            if current_obs == "observed_present":
+                predictions.append(TypedPrediction(
+                    subject=entity_id,
+                    property="observability",
+                    expected_value="observed_absent",
+                    horizon_seconds=horizon_seconds * 2,
+                    uncertainty=0.6,
+                    reasoning="Currently present; likely absent without new observation",
+                ))
+
+        return predictions
+
+    def _property_age_seconds(self, prop_data: dict[str, Any]) -> float | None:
+        try:
+            valid_from = prop_data.get("valid_from", "")
+            if not valid_from:
+                return None
+            ts = datetime.fromisoformat(valid_from)
+            return (datetime.now(timezone.utc) - ts).total_seconds()
+        except Exception:
+            return None
 
     def _load_from_query(self, entity_id: str) -> tuple[str | None, tuple[float, float], int] | None:
         """Load entity state from WorldQuery if available."""

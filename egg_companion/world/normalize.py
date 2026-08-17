@@ -97,6 +97,8 @@ class ObservationNormalizer:
         if not isinstance(detections, (list, tuple)):
             return delta
 
+        detected_entity_ids: set[str] = set()
+
         for detection in detections:
             if not isinstance(detection, dict):
                 continue
@@ -109,6 +111,7 @@ class ObservationNormalizer:
             if not entity_id:
                 continue
 
+            detected_entity_ids.add(entity_id)
             label = detection.get("label", "unknown")
             confidence = float(detection.get("confidence", 0.0))
             bbox = detection.get("bbox")
@@ -235,6 +238,29 @@ class ObservationNormalizer:
                 "evidence_ids": evidence_ids,
                 "valid_from": observed_at,
             })
+
+        # Emit OBSERVED_ABSENT for entities that were previously tracked
+        # by this camera but are absent from the current frame
+        if entity_ids and detected_entity_ids:
+            missing_ids = set(entity_ids) - detected_entity_ids
+            camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
+            for missing_id in missing_ids:
+                if missing_id.startswith("camera_view:"):
+                    continue
+                delta.assertions.append({
+                    "subject_id": missing_id,
+                    "property_id": "observability",
+                    "value": TypedValue(
+                        raw=ObservabilityState.OBSERVED_ABSENT.value,
+                        value_type=ValueType.ENUM,
+                    ),
+                    "epistemic_kind": EpistemicKind.INFERENCE.value,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": 0.5,
+                    "authority": 0.4,
+                    "valid_from": observed_at,
+                })
 
         return delta
 

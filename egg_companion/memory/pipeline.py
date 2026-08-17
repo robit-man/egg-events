@@ -458,6 +458,7 @@ class MemoryPipeline:
             from egg_companion.world.context import CognitiveContext
             from egg_companion.world.relations import WorldGraphStore
             from egg_companion.world.identity import IdentityGraph
+            from egg_companion.world.ontology import OntologyRegistry
             
             # Create world model connection (separate from memory store)
             world_db_path = self.store._read_connection.execute(
@@ -473,11 +474,12 @@ class MemoryPipeline:
             world_conn.execute("PRAGMA foreign_keys=ON")
             
             world_state = WorldStateStore(world_conn)
-            self._world_reconciler = Reconciler(world_conn, world_state)
+            ontology = OntologyRegistry()
+            self._world_reconciler = Reconciler(world_conn, world_state, ontology)
             
             world_graph = WorldGraphStore(world_conn)
             identity_graph = IdentityGraph(world_conn)
-            self._world_query = WorldQuery(world_state, world_graph, identity_graph)
+            self._world_query = WorldQuery(world_state, world_graph, identity_graph, reconciler=self._world_reconciler)
             self._world_context = CognitiveContext(self._world_query)
             self.context.set_world_context(self._world_context)
             

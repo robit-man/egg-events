@@ -53,13 +53,20 @@ class RelationStateRow:
 
 
 class WorldStateStore:
-    """Materialized current-state projection backed by SQLite."""
+    """Materialized current-state projection backed by SQLite.
+
+    Atomicity guarantee: all inner mutation methods (upsert_property,
+    upsert_relation, close_relation) NEVER commit on their own.  Only
+    the ``world_transaction()`` context manager commits or rolls back.
+    """
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._conn = connection
         self._lock = threading.RLock()
         self._ensure_tables()
         self._revision = self._load_max_revision()
+        self._in_transaction = False
+        self._current_revision: int = 0
 
     def _load_max_revision(self) -> int:
         """Load the maximum persisted revision for restart safety."""
@@ -118,7 +125,13 @@ class WorldStateStore:
     def revision(self) -> int:
         return self._revision
 
-    def increment_revision(self, description: str = "") -> int:
+    def allocate_revision(self, description: str = "") -> int:
+        """Allocate a new revision within the current transaction.
+
+        When inside a transaction this is used by the reconciler to assign
+        one revision to all mutations in a single WorldDelta.  Outside a
+        transaction it creates and commits a standalone revision row.
+        """
         with self._lock:
             now = datetime.now(timezone.utc).isoformat()
             cursor = self._conn.execute(
@@ -126,8 +139,21 @@ class WorldStateStore:
                 (description, now),
             )
             self._revision = cursor.lastrowid
-            self._conn.commit()
+            self._current_revision = self._revision
+            if not self._in_transaction:
+                self._conn.commit()
             return self._revision
+
+    def _allocate_standalone_revision(self) -> int:
+        """Allocate revision outside a transaction (fallback)."""
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self._conn.execute(
+            "INSERT INTO world_state_revisions (description, created_at) VALUES (?, ?)",
+            ("standalone", now),
+        )
+        self._revision = cursor.lastrowid
+        self._conn.commit()
+        return self._revision
 
     def upsert_property(
         self,
@@ -140,9 +166,13 @@ class WorldStateStore:
         evidence_ids: tuple[str, ...],
         epistemic_kind: str,
         valid_from: str,
+        revision: int | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._revision += 1
+        rev = revision or (
+            self._current_revision if self._in_transaction
+            else self._allocate_standalone_revision()
+        )
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO current_property_state
@@ -162,10 +192,9 @@ class WorldStateStore:
                     epistemic_kind,
                     valid_from,
                     now,
-                    self._revision,
+                    rev,
                 ),
             )
-            self._conn.commit()
 
     def upsert_relation(
         self,
@@ -178,9 +207,13 @@ class WorldStateStore:
         evidence_ids: tuple[str, ...],
         epistemic_kind: str,
         valid_from: str,
+        revision: int | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._revision += 1
+        rev = revision or (
+            self._current_revision if self._in_transaction
+            else self._allocate_standalone_revision()
+        )
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO current_relation_state
@@ -199,10 +232,9 @@ class WorldStateStore:
                     epistemic_kind,
                     valid_from,
                     now,
-                    self._revision,
+                    rev,
                 ),
             )
-            self._conn.commit()
 
     def close_relation(
         self,
@@ -210,17 +242,20 @@ class WorldStateStore:
         relation_type_id: str,
         target_entity_id: str,
         valid_to: str,
+        revision: int | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._revision += 1
+        rev = revision or (
+            self._current_revision if self._in_transaction
+            else self._allocate_standalone_revision()
+        )
         with self._lock:
             self._conn.execute(
                 """UPDATE current_relation_state
                 SET valid_to = ?, updated_at = ?, revision = ?
                 WHERE source_entity_id = ? AND relation_type_id = ? AND target_entity_id = ?""",
-                (valid_to, now, self._revision, source_entity_id, relation_type_id, target_entity_id),
+                (valid_to, now, rev, source_entity_id, relation_type_id, target_entity_id),
             )
-            self._conn.commit()
 
     def get_property(self, entity_id: str, property_id: str) -> PropertyStateRow | None:
         with self._lock:
@@ -273,9 +308,42 @@ class WorldStateStore:
                 for row in rows
             ]
 
-    def conflicts(self, entity_id: str) -> list[PropertyStateRow]:
-        """Return properties with multiple accepted values (conflict)."""
-        return []
+    def conflicts(self, entity_id: str = "") -> list[PropertyStateRow]:
+        """Return properties that have multiple active accepted assertions.
+
+        Queries the assertion log for (entity_id, property_id) pairs that
+        have more than one accepted/conflicted assertion.  Returns the
+        corresponding current-state rows.
+        """
+        with self._lock:
+            if entity_id:
+                rows = self._conn.execute(
+                    """SELECT DISTINCT subject_id, property_id FROM world_assertions
+                    WHERE subject_id = ? AND state IN ('conflicted', 'accepted')
+                    GROUP BY subject_id, property_id HAVING COUNT(*) > 1""",
+                    (entity_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT DISTINCT subject_id, property_id FROM world_assertions
+                    WHERE state IN ('conflicted', 'accepted')
+                    GROUP BY subject_id, property_id HAVING COUNT(*) > 1"""
+                ).fetchall()
+            result = []
+            for subject, prop in rows:
+                row = self._conn.execute(
+                    "SELECT * FROM current_property_state WHERE entity_id = ? AND property_id = ?",
+                    (subject, prop),
+                ).fetchone()
+                if row:
+                    result.append(PropertyStateRow(
+                        entity_id=row[0], property_id=row[1], value_json=row[2],
+                        value_type=row[3], confidence=row[4], authority=row[5],
+                        assertion_id=row[6], evidence_ids_json=row[7],
+                        epistemic_kind=row[8], valid_from=row[9], valid_to=row[10],
+                        updated_at=row[11], revision=row[12],
+                    ))
+            return result
 
     def explain(self, entity_id: str, property_id: str) -> dict[str, Any]:
         """Explain why Egg believes a particular state."""
@@ -320,12 +388,24 @@ class WorldStateStore:
             ]
 
     @contextmanager
-    def world_transaction(self) -> Generator[None, None, None]:
-        """Context manager for atomic world state updates."""
+    def world_transaction(self, description: str = "world_delta") -> Generator[None, None, None]:
+        """Atomic world state transaction.
+
+        Sets ``_in_transaction = True`` so that inner methods never commit
+        independently.  Allocates a single revision for all mutations in
+        this transaction.  Commits everything atomically at the end; rolls
+        back on any exception.
+        """
         with self._lock:
+            self._in_transaction = True
+            previous_revision = self._revision
             try:
+                self._current_revision = self.allocate_revision(description)
                 yield
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
+                self._revision = previous_revision
                 raise
+            finally:
+                self._in_transaction = False
