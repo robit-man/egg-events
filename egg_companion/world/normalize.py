@@ -14,6 +14,7 @@ from egg_companion.world.ontology import OntologyRegistry
 from egg_companion.world.sources import AuthorityPolicy
 from egg_companion.world.types import (
     EpistemicKind,
+    ObservabilityState,
     TypedValue,
     ValueType,
     WorldDelta,
@@ -196,6 +197,21 @@ class ObservationNormalizer:
                 "subject_id": entity_id,
                 "property_id": "last_seen",
                 "value": TypedValue(raw=observed_at, value_type=ValueType.DATETIME),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
+                "confidence": confidence,
+                "authority": 0.9,
+                "valid_from": observed_at,
+            })
+
+            delta.assertions.append({
+                "subject_id": entity_id,
+                "property_id": "observability",
+                "value": TypedValue(
+                    raw=ObservabilityState.OBSERVED_PRESENT.value,
+                    value_type=ValueType.ENUM,
+                ),
                 "epistemic_kind": EpistemicKind.OBSERVATION.value,
                 "source_id": source_id,
                 "evidence_ids": evidence_ids,

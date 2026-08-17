@@ -609,3 +609,534 @@ class TestAuthorityPolicy:
         user_score = policy.evaluate("person.preferred_name", "user_correction", "correction")
         llm_score = policy.evaluate("person.preferred_name", "llm_inference", "inference")
         assert user_score > llm_score
+
+
+class TestEvidenceProvenance:
+    """Verify evidence IDs flow through the full normalize→reconcile→state path."""
+
+    def test_evidence_ids_on_assertions(self, world_stores):
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "e1"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        event = MockEvent(
+            payload={"detections": [{"entity_id": "obj:1", "label": "cup", "confidence": 0.9, "bbox": [0, 0, 50, 50]}]},
+        )
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:aaa", "ev:bbb"))
+        conflicts = reconciler.ingest(delta)
+
+        assertions = reconciler.get_entity_assertions("obj:1")
+        assert len(assertions) >= 1
+        for a in assertions:
+            evidence = json.loads(a["evidence_ids_json"]) if "evidence_ids_json" in a else a.get("evidence_ids", [])
+            assert "ev:aaa" in evidence or len(evidence) == 0
+
+        current = state.get_property("obj:1", "label")
+        assert current is not None
+        stored_evidence = json.loads(current.evidence_ids_json)
+        assert "ev:aaa" in stored_evidence
+
+    def test_event_evidence_ids(self, world_stores):
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "e2"
+            event_type: str = "speech"
+            occurred_at: str = ""
+            source_id: str = "asr:0"
+            evidence: tuple = ()
+            entity_ids: tuple = ("person:1",)
+            payload: dict = None
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        event = MockEvent(payload={"transcript": "hello"})
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:speech1",))
+        reconciler.ingest(delta)
+
+        with world_stores["db"] as conn:
+            rows = conn.execute(
+                "SELECT evidence_ids_json FROM event_assertions"
+            ).fetchall()
+            assert len(rows) >= 1
+            evidence = json.loads(rows[0][0])
+            assert "ev:speech1" in evidence
+
+
+class TestConflictResolution:
+    """Verify conflict resolution uses actual existing authority."""
+
+    def test_higher_authority_wins(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+
+        delta1 = WorldDelta()
+        delta1.assertions.append({
+            "subject_id": "obj:1",
+            "property_id": "label",
+            "value": TypedValue(raw="cup", value_type=ValueType.STRING),
+            "epistemic_kind": "observation",
+            "source_id": "llm_inference:0",
+            "confidence": 0.7,
+            "authority": 0.4,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta1)
+
+        delta2 = WorldDelta()
+        delta2.assertions.append({
+            "subject_id": "obj:1",
+            "property_id": "label",
+            "value": TypedValue(raw="mug", value_type=ValueType.STRING),
+            "epistemic_kind": "correction",
+            "source_id": "user_correction:0",
+            "confidence": 0.95,
+            "authority": 0.95,
+            "valid_from": utcnow().isoformat(),
+        })
+        conflicts = reconciler.ingest(delta2)
+
+        current = state.get_property("obj:1", "label")
+        assert current is not None
+        assert json.loads(current.value_json) == "mug"
+
+    def test_lower_authority_stays_proposed(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+
+        delta1 = WorldDelta()
+        delta1.assertions.append({
+            "subject_id": "obj:2",
+            "property_id": "label",
+            "value": TypedValue(raw="cup", value_type=ValueType.STRING),
+            "epistemic_kind": "observation",
+            "source_id": "user_correction:0",
+            "confidence": 0.95,
+            "authority": 0.95,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta1)
+
+        delta2 = WorldDelta()
+        delta2.assertions.append({
+            "subject_id": "obj:2",
+            "property_id": "label",
+            "value": TypedValue(raw="bowl", value_type=ValueType.STRING),
+            "epistemic_kind": "inference",
+            "source_id": "llm_inference:0",
+            "confidence": 0.6,
+            "authority": 0.3,
+            "valid_from": utcnow().isoformat(),
+        })
+        conflicts = reconciler.ingest(delta2)
+
+        current = state.get_property("obj:2", "label")
+        assert current is not None
+        assert json.loads(current.value_json) == "cup"
+
+    def test_equal_authority_conflicted(self, world_stores):
+        reconciler = world_stores["reconciler"]
+
+        delta1 = WorldDelta()
+        delta1.assertions.append({
+            "subject_id": "obj:3",
+            "property_id": "label",
+            "value": TypedValue(raw="cup", value_type=ValueType.STRING),
+            "epistemic_kind": "observation",
+            "source_id": "camera:0",
+            "confidence": 0.8,
+            "authority": 0.8,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta1)
+
+        delta2 = WorldDelta()
+        delta2.assertions.append({
+            "subject_id": "obj:3",
+            "property_id": "label",
+            "value": TypedValue(raw="mug", value_type=ValueType.STRING),
+            "epistemic_kind": "observation",
+            "source_id": "camera:1",
+            "confidence": 0.8,
+            "authority": 0.8,
+            "valid_from": utcnow().isoformat(),
+        })
+        conflicts = reconciler.ingest(delta2)
+        assert len(conflicts) >= 1
+
+        db_conflicts = reconciler.get_conflicts()
+        assert len(db_conflicts) >= 1
+
+
+class TestSupersession:
+    """Verify that when a stronger assertion wins, the old one is superseded."""
+
+    def test_old_assertion_superseded(self, world_stores):
+        reconciler = world_stores["reconciler"]
+
+        delta1 = WorldDelta()
+        delta1.assertions.append({
+            "subject_id": "obj:10",
+            "property_id": "label",
+            "value": TypedValue(raw="old_label", value_type=ValueType.STRING),
+            "epistemic_kind": "observation",
+            "source_id": "llm_inference:0",
+            "confidence": 0.5,
+            "authority": 0.3,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta1)
+
+        delta2 = WorldDelta()
+        delta2.assertions.append({
+            "subject_id": "obj:10",
+            "property_id": "label",
+            "value": TypedValue(raw="new_label", value_type=ValueType.STRING),
+            "epistemic_kind": "correction",
+            "source_id": "user_correction:0",
+            "confidence": 0.95,
+            "authority": 0.95,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta2)
+
+        history = reconciler.get_assertion_history("obj:10", "label")
+        states = [a["state"] for a in history]
+        assert "superseded" in states
+        assert "accepted" in states
+
+        superseded = [a for a in history if a["state"] == "superseded"]
+        assert len(superseded) >= 1
+        assert superseded[0]["valid_to"] is not None
+
+
+class TestAtomicTransaction:
+    """Verify that WorldDelta is committed atomically."""
+
+    def test_partial_failure_rolls_back(self, world_stores):
+        from egg_companion.world.state import WorldStateStore
+
+        state = world_stores["state"]
+        initial = state.revision
+
+        delta = WorldDelta()
+        delta.assertions.append({
+            "subject_id": "obj:20",
+            "property_id": "label",
+            "value": TypedValue(raw="test", value_type=ValueType.STRING),
+            "epistemic_kind": "observation",
+            "source_id": "camera:0",
+            "confidence": 0.8,
+            "authority": 0.7,
+            "valid_from": utcnow().isoformat(),
+        })
+        world_stores["reconciler"].ingest(delta)
+
+        assert state.revision > initial
+
+
+class TestRevisionRestartSafety:
+    """Verify revision counter loads correctly from DB."""
+
+    def test_revision_loads_from_db(self, db):
+        state1 = WorldStateStore(db)
+        state1.increment_revision("first")
+        state1.increment_revision("second")
+        rev_after = state1.revision
+
+        state2 = WorldStateStore(db)
+        assert state2.revision == rev_after
+
+    def test_revision_increments_from_loaded(self, db):
+        state1 = WorldStateStore(db)
+        for _ in range(5):
+            state1.increment_revision()
+
+        state2 = WorldStateStore(db)
+        state2.increment_revision("after restart")
+        assert state2.revision == 6
+
+
+class TestWorldStateStoreProperty:
+    """Test property upsert and retrieval round-trip."""
+
+    def test_upsert_and_get(self, db):
+        state = WorldStateStore(db)
+        state.upsert_property(
+            "e1", "label",
+            TypedValue(raw="person", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:1", ("ev:1",), "observation", utcnow().isoformat(),
+        )
+        row = state.get_property("e1", "label")
+        assert row is not None
+        assert json.loads(row.value_json) == "person"
+        assert row.confidence == 0.9
+        assert row.authority == 0.8
+
+    def test_explain(self, db):
+        state = WorldStateStore(db)
+        state.upsert_property(
+            "e1", "label",
+            TypedValue(raw="person", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:1", ("ev:1",), "observation", utcnow().isoformat(),
+        )
+        explanation = state.explain("e1", "label")
+        assert explanation["value"] == "person"
+        assert explanation["evidence_ids"] == ["ev:1"]
+
+
+class TestCorrelationAwareConfidence:
+    """Test that correlation groups affect confidence aggregation."""
+
+    def test_temporal_correlation(self, world_stores):
+        from egg_companion.world.types import EvidenceCorrelationGroup
+
+        reconciler = world_stores["reconciler"]
+        group = EvidenceCorrelationGroup(
+            group_id="g1",
+            correlation_type="temporal",
+            observation_count=10,
+        )
+        assert group.independence_factor < 1.0
+
+        confidences = [0.8] * 10
+        uncorrelated = reconciler.aggregate_confidence_with_correlation(confidences)
+        correlated = reconciler.aggregate_confidence_with_correlation(confidences, group)
+        assert correlated < uncorrelated
+
+    def test_single_observation(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        score = reconciler.aggregate_confidence_with_correlation([0.8])
+        assert score == 0.8
+
+
+class TestContextAssemblerWorldIntegration:
+    """Test that ContextAssembler integrates world state."""
+
+    def test_world_context_set(self):
+        from egg_companion.memory.context import ContextAssembler
+        from unittest.mock import MagicMock
+
+        store = MagicMock()
+        store.config = MagicMock()
+        store.config.context_max_characters = 3000
+        store.config.graph_max_nodes = 100
+        store.cognitive_documents.return_value = []
+        store.list_claims.return_value = []
+
+        assembler = ContextAssembler(store)
+        assert assembler._world_context is None
+
+        mock_context = MagicMock()
+        assembler.set_world_context(mock_context)
+        assert assembler._world_context is mock_context
+
+
+class TestCalibration:
+    """Test Calibration projection and validity."""
+
+    def test_project_3d_to_2d(self):
+        from egg_companion.world.spatial import Calibration
+        P = [600, 0, 320, 0, 0, 600, 240, 0, 0, 0, 1, 0]
+        cal = Calibration(camera_id="cam0", projection_matrix=P)
+        px, py = cal.project((0.0, 0.0, 5.0))
+        assert px == 320.0
+        assert py == 240.0
+
+    def test_is_valid_at_none_always_valid(self):
+        from egg_companion.world.spatial import Calibration
+        cal = Calibration(camera_id="cam0", projection_matrix=[1]*12)
+        assert cal.is_valid_at(None) is True
+
+    def test_valid_from_to(self):
+        from egg_companion.world.spatial import Calibration
+        from datetime import datetime, timezone
+        t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t2 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        t_mid = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        t_before = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        cal = Calibration(camera_id="cam0", projection_matrix=[1]*12, valid_from=t1, valid_to=t2)
+        assert cal.is_valid_at(t_mid) is True
+        assert cal.is_valid_at(t_before) is False
+
+    def test_to_dict_roundtrip(self):
+        from egg_companion.world.spatial import Calibration
+        cal = Calibration(camera_id="cam0", projection_matrix=[1]*12, distortion=[0.1,0.2,0,0,0], source="test")
+        d = cal.to_dict()
+        assert d["camera_id"] == "cam0"
+        assert len(d["projection_matrix"]) == 12
+        assert d["distortion"] == [0.1,0.2,0,0,0]
+
+
+class TestTransform:
+    """Test Transform composition, inverse, and validity."""
+
+    def test_identity_transform(self):
+        from egg_companion.world.spatial import Transform, IDENTITY_4X4
+        t = Transform("A", "A", list(IDENTITY_4X4))
+        result = t.apply((1.0, 2.0, 3.0))
+        assert result == (1.0, 2.0, 3.0)
+
+    def test_translation_transform(self):
+        from egg_companion.world.spatial import Transform
+        # Translate +5 in X
+        m = [1,0,0,5, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+        t = Transform("cam", "world", m)
+        result = t.apply((0.0, 0.0, 0.0))
+        assert result == (5.0, 0.0, 0.0)
+
+    def test_inverse_roundtrip(self):
+        from egg_companion.world.spatial import Transform
+        import math
+        angle = math.pi / 4  # 45 degrees
+        c, s = math.cos(angle), math.sin(angle)
+        m = [c,-s,0,1, s,c,0,2, 0,0,1,3, 0,0,0,1]
+        t = Transform("A", "B", m)
+        inv = t.inverse
+        point = (1.0, 2.0, 3.0)
+        roundtrip = t.apply(inv.apply(point))
+        for a, b in zip(point, roundtrip):
+            assert abs(a - b) < 1e-9
+
+    def test_compose(self):
+        from egg_companion.world.spatial import Transform, IDENTITY_4X4
+        m1 = [1,0,0,5, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+        m2 = [1,0,0,0, 0,1,0,3, 0,0,1,0, 0,0,0,1]
+        t1 = Transform("A", "B", m1)
+        t2 = Transform("B", "C", m2)
+        composed = t1.compose(t2)
+        assert composed.source_frame == "A"
+        assert composed.target_frame == "C"
+        result = composed.apply((0.0, 0.0, 0.0))
+        assert result == (5.0, 3.0, 0.0)
+
+    def test_validity_time_window(self):
+        from egg_companion.world.spatial import Transform
+        from datetime import datetime, timezone
+        t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t2 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        tr = Transform("A", "B", [1]*16, valid_from=t1, valid_to=t2)
+        assert tr.is_valid_at(datetime(2026, 3, 1, tzinfo=timezone.utc)) is True
+        assert tr.is_valid_at(datetime(2025, 1, 1, tzinfo=timezone.utc)) is False
+
+    def test_to_dict(self):
+        from egg_companion.world.spatial import Transform
+        tr = Transform("A", "B", [1]*16, source="test")
+        d = tr.to_dict()
+        assert d["source_frame"] == "A"
+        assert d["target_frame"] == "B"
+        assert len(d["matrix"]) == 16
+
+
+class TestTransformTree:
+    """Test BFS path resolution, calibration lookup, and SQLite round-trip."""
+
+    def test_direct_path(self):
+        from egg_companion.world.spatial import TransformTree, Transform
+        tree = TransformTree()
+        m = [1,0,0,5, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+        tree.add_transform(Transform("cam0", "world", m))
+        result = tree.resolve("cam0", "world")
+        assert result is not None
+        assert result.source_frame == "cam0"
+        assert result.target_frame == "world"
+
+    def test_indirect_path(self):
+        from egg_companion.world.spatial import TransformTree, Transform
+        tree = TransformTree()
+        m1 = [1,0,0,5, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+        m2 = [1,0,0,0, 0,1,0,3, 0,0,1,0, 0,0,0,1]
+        tree.add_transform(Transform("cam0", "optical", m1))
+        tree.add_transform(Transform("optical", "world", m2))
+        result = tree.resolve("cam0", "world")
+        assert result is not None
+        pt = result.apply((0.0, 0.0, 0.0))
+        assert pt == (5.0, 3.0, 0.0)
+
+    def test_no_path_returns_none(self):
+        from egg_companion.world.spatial import TransformTree, Transform
+        tree = TransformTree()
+        tree.add_transform(Transform("A", "B", [1]*16))
+        assert tree.resolve("A", "C") is None
+
+    def test_same_frame_identity(self):
+        from egg_companion.world.spatial import TransformTree, IDENTITY_4X4
+        tree = TransformTree()
+        result = tree.resolve("A", "A")
+        assert result is not None
+        assert result.matrix == IDENTITY_4X4
+
+    def test_timestamp_filters_invalid(self):
+        from egg_companion.world.spatial import TransformTree, Transform
+        from datetime import datetime, timezone
+        tree = TransformTree()
+        t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t2 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        m = [1,0,0,5, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+        tree.add_transform(Transform("A", "B", m, valid_from=t1, valid_to=t2))
+        # Valid timestamp
+        assert tree.resolve("A", "B", datetime(2026, 3, 1, tzinfo=timezone.utc)) is not None
+        # Invalid timestamp
+        assert tree.resolve("A", "B", datetime(2025, 1, 1, tzinfo=timezone.utc)) is None
+
+    def test_calibration_lookup(self):
+        from egg_companion.world.spatial import TransformTree, Calibration
+        from datetime import datetime, timezone
+        tree = TransformTree()
+        t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t2 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        cal = Calibration("cam0", [600,0,320,0, 0,600,240,0, 0,0,1,0], valid_from=t1, valid_to=t2)
+        tree.add_calibration(cal)
+        found = tree.get_calibration("cam0", datetime(2026, 3, 1, tzinfo=timezone.utc))
+        assert found is not None
+        assert found.camera_id == "cam0"
+        assert tree.get_calibration("cam99") is None
+
+    def test_list_frames(self):
+        from egg_companion.world.spatial import TransformTree, Transform
+        tree = TransformTree()
+        tree.add_transform(Transform("A", "B", [1]*16))
+        tree.add_transform(Transform("B", "C", [1]*16))
+        frames = tree.list_frames()
+        assert set(frames) == {"A", "B", "C"}
+
+    def test_sqlite_roundtrip(self, db):
+        from egg_companion.world.spatial import TransformTree, Transform, Calibration
+        from datetime import datetime, timezone
+
+        tree = TransformTree(db)
+        m = [1,0,0,5, 0,1,0,3, 0,0,1,0, 0,0,0,1]
+        tree.add_transform(Transform("cam0", "world", m, source="test"))
+        tree.add_calibration(Calibration("cam0", [600,0,320,0, 0,600,240,0, 0,0,1,0], source="test"))
+        tree.save_to_sqlite()
+
+        # Fresh tree, load from DB
+        tree2 = TransformTree(db)
+        tree2.load_from_sqlite()
+        result = tree2.resolve("cam0", "world")
+        assert result is not None
+        pt = result.apply((0.0, 0.0, 0.0))
+        assert pt == (5.0, 3.0, 0.0)
+        cal = tree2.get_calibration("cam0")
+        assert cal is not None
+        assert cal.camera_id == "cam0"

@@ -145,11 +145,15 @@ class KnowledgeGraphBridge:
         )
 
     def _compute_observability(self, entity_id: str, world_state: dict[str, Any]) -> str:
-        """Compute observability state from world state."""
-        location = world_state.get("current_location")
-        if not location:
-            return "unknown"
+        """Compute observability state from world state.
         
+        Uses explicit observability property first, then falls back to
+        last_seen age heuristic.
+        """
+        obs_prop = world_state.get("observability")
+        if obs_prop and isinstance(obs_prop.get("value"), str):
+            return obs_prop["value"]
+
         last_seen = world_state.get("last_seen")
         if not last_seen:
             return "unknown"
@@ -162,35 +166,37 @@ class KnowledgeGraphBridge:
             if age_seconds < 5:
                 return "observed_present"
             elif age_seconds < 30:
-                return "recently_observed"
+                return "observed_present"
             elif age_seconds < 300:
-                return "stale"
+                return "not_observed"
             else:
                 return "unknown"
         except Exception:
             return "unknown"
 
     def _compute_freshness(self, world_state: dict[str, Any], ontology_type: Any) -> dict[str, float]:
-        """Compute freshness for each property based on ontology persistence rules."""
+        """Compute freshness for each property based on ontology stale_after metadata."""
         freshness = {}
         
-        persistence_rules = {
-            "label": float("inf"),
-            "preferred_name": float("inf"),
-            "category": float("inf"),
-            "current_location": 300.0,
-            "last_seen": 300.0,
-            "behavior": 30.0,
-            "bbox": 5.0,
-        }
+        prop_types = {}
+        for pt in self._ontology.list_property_types():
+            if pt.stale_after is not None:
+                prop_types[pt.id] = pt
         
         for prop_id, prop_data in world_state.items():
-            max_age = persistence_rules.get(prop_id, 300.0)
+            pt = prop_types.get(prop_id)
+            if pt is None or pt.stale_after is None:
+                freshness[prop_id] = 1.0
+                continue
+            max_age = pt.stale_after
             try:
                 import datetime
                 valid_from = datetime.datetime.fromisoformat(prop_data.get("valid_from", ""))
                 age_seconds = (datetime.datetime.now(datetime.timezone.utc) - valid_from).total_seconds()
-                freshness[prop_id] = max(0.0, 1.0 - (age_seconds / max_age)) if max_age < float("inf") else 1.0
+                if pt.decay_model == "exponential":
+                    freshness[prop_id] = max(0.0, 2.0 ** (-age_seconds / max_age))
+                else:
+                    freshness[prop_id] = max(0.0, 1.0 - (age_seconds / max_age))
             except Exception:
                 freshness[prop_id] = 0.5
         

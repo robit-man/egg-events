@@ -3,11 +3,17 @@
 Provides a central catalog of object types, property types, relation types,
 event types, action types, function types, and source types.  The registry
 is the authoritative schema for what Egg can represent in its world model.
+
+Proposals and modifications are persisted to SQLite for durability.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import threading
+from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from egg_companion.world.types import (
@@ -24,10 +30,11 @@ from egg_companion.world.types import (
 
 
 class OntologyRegistry:
-    """Thread-safe in-process ontology catalog with SQLite persistence."""
+    """Thread-safe ontology catalog with SQLite persistence for proposals."""
 
-    def __init__(self) -> None:
+    def __init__(self, connection: sqlite3.Connection | None = None) -> None:
         self._lock = threading.RLock()
+        self._conn = connection
         self._object_types: dict[str, ObjectType] = {}
         self._property_types: dict[str, PropertyType] = {}
         self._relation_types: dict[str, RelationType] = {}
@@ -37,7 +44,58 @@ class OntologyRegistry:
         self._source_types: dict[str, SourceType] = {}
         self._proposals: list[OntologyProposal] = []
         self._version: int = 1
+        if self._conn is not None:
+            self._ensure_tables()
+            self._version = self._load_version()
         self._register_defaults()
+
+    def _ensure_tables(self) -> None:
+        with self._lock:
+            self._conn.executescript(  # type: ignore[union-attr]
+                """
+                CREATE TABLE IF NOT EXISTS ontology_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    definition_json TEXT NOT NULL DEFAULT '{}',
+                    source TEXT NOT NULL DEFAULT 'llm_inference',
+                    created_at TEXT NOT NULL,
+                    validated INTEGER NOT NULL DEFAULT 0,
+                    accepted INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS ontology_modifications (
+                    modification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    type_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    source TEXT NOT NULL DEFAULT 'system',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ontology_version (
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
+    def _load_version(self) -> int:
+        with self._lock:
+            row = self._conn.execute(  # type: ignore[union-attr]
+                "SELECT COALESCE(MAX(version), 1) FROM ontology_version"
+            ).fetchone()
+            return int(row[0]) if row else 1
+
+    def _save_version(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(  # type: ignore[union-attr]
+                "INSERT INTO ontology_version (version, updated_at) VALUES (?, ?)",
+                (self._version, now),
+            )
+            self._conn.commit()  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # Registration
@@ -122,9 +180,52 @@ class OntologyRegistry:
     def submit_proposal(self, proposal: OntologyProposal) -> None:
         with self._lock:
             self._proposals.append(proposal)
+            if self._conn is not None:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO ontology_proposals
+                    (proposal_id, kind, definition_json, source, created_at, validated, accepted)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        proposal.proposal_id,
+                        proposal.kind,
+                        json.dumps(proposal.definition, default=str),
+                        proposal.source,
+                        proposal.created_at.isoformat() if isinstance(proposal.created_at, datetime) else str(proposal.created_at),
+                        int(proposal.validated),
+                        int(proposal.accepted),
+                    ),
+                )
+                self._conn.commit()
 
     def pending_proposals(self) -> list[OntologyProposal]:
         return [p for p in self._proposals if not p.validated]
+
+    def record_modification(
+        self,
+        kind: str,
+        type_id: str,
+        field_name: str,
+        old_value: Any,
+        new_value: Any,
+        source: str = "system",
+    ) -> None:
+        """Record an ontology modification for audit trail."""
+        if self._conn is None:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO ontology_modifications
+                (kind, type_id, field_name, old_value, new_value, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    kind, type_id, field_name,
+                    json.dumps(old_value, default=str),
+                    json.dumps(new_value, default=str),
+                    source, now,
+                ),
+            )
+            self._conn.commit()
 
     def describe(self, type_id: str) -> dict[str, Any] | None:
         for registry in (
@@ -184,28 +285,42 @@ _DEFAULT_OBJECT_TYPES = [
 ]
 
 _DEFAULT_PROPERTY_TYPES = [
-    PropertyType(id="label", value_type=ValueType.STRING, cardinality="one"),
-    PropertyType(id="preferred_name", value_type=ValueType.STRING, cardinality="one"),
-    PropertyType(id="category", value_type=ValueType.STRING, cardinality="one"),
+    PropertyType(id="label", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=None),
+    PropertyType(id="preferred_name", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=None),
+    PropertyType(id="category", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=None),
     PropertyType(id="current_location", value_type=ValueType.ENTITY_REF, cardinality="one",
-                 volatility="dynamic"),
+                 volatility="dynamic", stale_after=300.0, decay_model="linear"),
     PropertyType(id="last_seen", value_type=ValueType.DATETIME, cardinality="one",
-                 volatility="dynamic"),
+                 volatility="dynamic", stale_after=300.0, decay_model="exponential"),
     PropertyType(id="location", value_type=ValueType.GEOMETRY, cardinality="one",
-                 volatility="dynamic"),
+                 volatility="dynamic", stale_after=300.0, decay_model="linear"),
     PropertyType(id="behavior", value_type=ValueType.STRING, cardinality="one",
-                 volatility="dynamic"),
+                 volatility="dynamic", stale_after=30.0, decay_model="linear"),
     PropertyType(id="bbox", value_type=ValueType.GEOMETRY, cardinality="one",
-                 volatility="dynamic"),
-    PropertyType(id="confidence_score", value_type=ValueType.FLOAT, cardinality="one"),
-    PropertyType(id="transcript", value_type=ValueType.STRING, cardinality="one"),
-    PropertyType(id="role", value_type=ValueType.STRING, cardinality="one"),
+                 volatility="dynamic", stale_after=5.0, decay_model="linear"),
+    PropertyType(id="confidence_score", value_type=ValueType.FLOAT, cardinality="one",
+                 stale_after=300.0),
+    PropertyType(id="transcript", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=600.0),
+    PropertyType(id="role", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=None),
     PropertyType(id="source_direction", value_type=ValueType.FLOAT, cardinality="one",
-                 unit="degrees"),
-    PropertyType(id="camera_id", value_type=ValueType.STRING, cardinality="one"),
-    PropertyType(id="field_of_view", value_type=ValueType.JSON, cardinality="one"),
-    PropertyType(id="bounds", value_type=ValueType.JSON, cardinality="one"),
-    PropertyType(id="label_source", value_type=ValueType.STRING, cardinality="one"),
+                 unit="degrees", stale_after=300.0),
+    PropertyType(id="camera_id", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=None),
+    PropertyType(id="field_of_view", value_type=ValueType.JSON, cardinality="one",
+                 stale_after=None),
+    PropertyType(id="bounds", value_type=ValueType.JSON, cardinality="one",
+                 stale_after=None),
+    PropertyType(id="label_source", value_type=ValueType.STRING, cardinality="one",
+                 stale_after=None),
+    PropertyType(id="observability", value_type=ValueType.STRING, cardinality="one",
+                 volatility="dynamic", stale_after=300.0, decay_model="linear"),
+    PropertyType(id="visible_text", value_type=ValueType.STRING, cardinality="one",
+                 volatility="dynamic", stale_after=60.0, decay_model="linear"),
 ]
 
 _DEFAULT_RELATION_TYPES = [
@@ -245,6 +360,7 @@ _DEFAULT_EVENT_TYPES = [
     EventType(id="label_correction", roles={"entity": "entity", "old_label": "string",
                                              "new_label": "string"}),
     EventType(id="conversation_turn", roles={"speaker": "person", "transcript": "string"}),
+    EventType(id="ocr_detection", roles={"target": "entity", "transcript": "string"}),
 ]
 
 _DEFAULT_ACTION_TYPES = [

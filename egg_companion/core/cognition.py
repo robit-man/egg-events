@@ -17,12 +17,21 @@ from egg_companion.models import (
 class CognitiveAttentionController:
     """Prediction-error attention with habituation and separate speech permission."""
 
-    def __init__(self, config: CognitiveAttentionConfig, proactive_enabled: bool) -> None:
+    def __init__(
+        self,
+        config: CognitiveAttentionConfig,
+        proactive_enabled: bool,
+        world_query: object | None = None,
+    ) -> None:
         self.config = config
         self.proactive_enabled = proactive_enabled
-        self._predictor = WorldStatePredictor()
+        self._predictor = WorldStatePredictor(query=world_query)
         self._last_proactive: datetime | None = None
         self._uncertainty_questions: deque[datetime] = deque()
+
+    def set_world_query(self, world_query: object) -> None:
+        """Wire in a WorldQuery after construction (for lazy init)."""
+        self._predictor.set_query(world_query)
 
     def allow_uncertainty_question(self, now: datetime) -> bool:
         while self._uncertainty_questions and (now - self._uncertainty_questions[0]).total_seconds() >= 3600:

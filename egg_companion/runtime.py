@@ -2158,12 +2158,16 @@ class CompanionRuntime:
         self._memory_events.put_nowait(event)
 
     async def _persist_memory_events(self) -> None:
+        world_query_wired = False
         while True:
             event = await self._memory_events.get()
             try:
                 if self._memory is None:
                     continue
                 accepted, closed = await asyncio.to_thread(self._memory.ingest, event)
+                if not world_query_wired and self._memory.world_query is not None:
+                    self._cognitive_attention.set_world_query(self._memory.world_query)
+                    world_query_wired = True
                 self.telemetry.record_memory(
                     accepted,
                     closed,

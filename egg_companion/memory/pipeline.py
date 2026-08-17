@@ -41,6 +41,13 @@ class MemoryPipeline:
         self._world_bridge = None
         self._world_reconciler = None
         self._world_normalizer = None
+        self._world_query = None
+        self._world_context = None
+
+    @property
+    def world_query(self) -> object | None:
+        """Expose WorldQuery for external wiring (e.g. attention controller)."""
+        return self._world_query
 
     def ingest(self, event: PerceptualEvent) -> tuple[bool, int]:
         accepted, drafts = self.segmenter.ingest(event)
@@ -470,9 +477,9 @@ class MemoryPipeline:
             
             world_graph = WorldGraphStore(world_conn)
             identity_graph = IdentityGraph(world_conn)
-            world_query = WorldQuery(world_state, world_graph, identity_graph)
-            world_context = CognitiveContext(world_query)
-            self.context.set_world_context(world_context)
+            self._world_query = WorldQuery(world_state, world_graph, identity_graph)
+            self._world_context = CognitiveContext(self._world_query)
+            self.context.set_world_context(self._world_context)
             
             import logging
             logger = logging.getLogger(__name__)

@@ -212,6 +212,8 @@ class PropertyType:
     unit: str | None = None
     description: str = ""
     volatility: str = "stable"
+    stale_after: float | None = None
+    decay_model: str = "none"  # none, linear, exponential
 
 
 @dataclass
