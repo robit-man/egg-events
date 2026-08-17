@@ -378,22 +378,93 @@ class TestReconciler:
 
 class TestObservationNormalizer:
     def test_normalize_detection(self, world_stores):
+        from dataclasses import dataclass
+        from typing import Any
+        
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:1"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+            
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+        
         normalizer = world_stores["normalizer"]
         detection = {
+            "entity_id": "entity:1",
             "label": "person",
             "confidence": 0.85,
             "bbox": [10, 20, 100, 200],
             "behavior": "standing",
         }
-        delta = normalizer.normalize_detection(detection, "cam0", utcnow().isoformat(), (480, 640))
+        event = MockEvent(
+            payload={"detections": [detection], "frame_shape": (480, 640)},
+            evidence=("ev:1",),
+        )
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:1",), frame_shape=(480, 640))
         assert len(delta.assertions) >= 3
-        assert delta.assertions[0]["subject_id"] is not None
+        assert delta.assertions[0]["subject_id"] == "entity:1"
+        assert delta.assertions[0]["evidence_ids"] == ("ev:1",)
+        assert delta.assertions[0]["authority"] > 0
 
     def test_normalize_speech(self, world_stores):
+        from dataclasses import dataclass
+        
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:2"
+            event_type: str = "speech"
+            occurred_at: str = ""
+            source_id: str = "asr:0"
+            evidence: tuple = ()
+            entity_ids: tuple = ("person:1",)
+            payload: dict = None
+            
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+        
         normalizer = world_stores["normalizer"]
-        delta = normalizer.normalize_speech("person:1", "Hello Egg", utcnow().isoformat())
+        event = MockEvent(
+            payload={"transcript": "Hello Egg"},
+            evidence=("ev:2",),
+        )
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:2",))
         assert len(delta.events) == 1
         assert delta.events[0]["event_type_id"] == "speech_utterance"
+        assert delta.events[0]["evidence_ids"] == ("ev:2",)
+
+    def test_authority_is_computed(self, world_stores):
+        from dataclasses import dataclass
+        
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:3"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "detector:0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+            
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+        
+        normalizer = world_stores["normalizer"]
+        event = MockEvent(
+            payload={"detections": [{"entity_id": "obj:1", "label": "cup", "confidence": 0.9, "bbox": [0, 0, 50, 50]}]},
+        )
+        delta = normalizer.normalize_event(event)
+        for a in delta.assertions:
+            assert "authority" in a
+            assert 0 < a["authority"] <= 1.0
 
 
 class TestEventStore:

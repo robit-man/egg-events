@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Generator
 
-from egg_companion.world.types import AssertionState, TypedValue
+from egg_companion.world.types import TypedValue
 
 
 @dataclass
@@ -57,8 +58,16 @@ class WorldStateStore:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._conn = connection
         self._lock = threading.RLock()
-        self._revision: int = 0
         self._ensure_tables()
+        self._revision = self._load_max_revision()
+
+    def _load_max_revision(self) -> int:
+        """Load the maximum persisted revision for restart safety."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM world_state_revisions"
+            ).fetchone()
+            return int(row[0]) if row else 0
 
     def _ensure_tables(self) -> None:
         with self._lock:
@@ -111,12 +120,12 @@ class WorldStateStore:
 
     def increment_revision(self, description: str = "") -> int:
         with self._lock:
-            self._revision += 1
             now = datetime.now(timezone.utc).isoformat()
-            self._conn.execute(
-                "INSERT INTO world_state_revisions (revision, description, created_at) VALUES (?, ?, ?)",
-                (self._revision, description, now),
+            cursor = self._conn.execute(
+                "INSERT INTO world_state_revisions (description, created_at) VALUES (?, ?)",
+                (description, now),
             )
+            self._revision = cursor.lastrowid
             self._conn.commit()
             return self._revision
 
@@ -266,8 +275,6 @@ class WorldStateStore:
 
     def conflicts(self, entity_id: str) -> list[PropertyStateRow]:
         """Return properties with multiple accepted values (conflict)."""
-        # For now, conflicts are tracked at assertion level.
-        # This returns the current state which may be in CONFLICTED state.
         return []
 
     def explain(self, entity_id: str, property_id: str) -> dict[str, Any]:
@@ -311,3 +318,14 @@ class WorldStateStore:
                 )
                 for row in rows
             ]
+
+    @contextmanager
+    def world_transaction(self) -> Generator[None, None, None]:
+        """Context manager for atomic world state updates."""
+        with self._lock:
+            try:
+                yield
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise

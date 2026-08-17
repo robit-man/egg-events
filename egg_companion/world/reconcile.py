@@ -9,12 +9,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from egg_companion.world.assertions import EventAssertion, RelationAssertion, WorldAssertion
 from egg_companion.world.state import WorldStateStore
 from egg_companion.world.types import (
     AssertionKind,
     AssertionState,
-    EpistemicKind,
     EvidenceCorrelationGroup,
     TypedValue,
     WorldDelta,
@@ -28,6 +26,8 @@ class ConflictRecord:
     property_id: str
     current_value: Any
     proposed_value: Any
+    existing_authority: float
+    existing_confidence: float
     reason: str
 
 
@@ -169,10 +169,12 @@ class Reconciler:
             self._conn.commit()
         return aid
 
-    def _check_conflict(self, entity_id: str, property_id: str, value: Any, source_id: str) -> ConflictRecord | None:
+    def _check_conflict(
+        self, entity_id: str, property_id: str, value: Any, source_id: str
+    ) -> ConflictRecord | None:
         with self._lock:
             row = self._conn.execute(
-                """SELECT assertion_id, value_json, authority FROM world_assertions
+                """SELECT assertion_id, value_json, authority, confidence FROM world_assertions
                 WHERE subject_id = ? AND property_id = ? AND state IN ('accepted', 'conflicted')
                 ORDER BY authority DESC, valid_from DESC LIMIT 1""",
                 (entity_id, property_id),
@@ -188,18 +190,50 @@ class Reconciler:
                 property_id=property_id,
                 current_value=current_value,
                 proposed_value=value,
-                reason=f"New value '{value}' conflicts with accepted '{current_value}' (authority={row[2]:.2f})",
+                existing_authority=float(row[2]),
+                existing_confidence=float(row[3]),
+                reason=(
+                    f"New value '{value}' conflicts with accepted "
+                    f"'{current_value}' (authority={float(row[2]):.2f})"
+                ),
             )
 
-    def _resolve_conflict(self, conflict: ConflictRecord, new_authority: float, existing_authority: float) -> AssertionState:
-        if new_authority > existing_authority:
+    def _resolve_conflict(
+        self, conflict: ConflictRecord, new_authority: float
+    ) -> AssertionState:
+        if new_authority > conflict.existing_authority:
             return AssertionState.ACCEPTED
-        elif new_authority == existing_authority:
+        elif new_authority == conflict.existing_authority:
             return AssertionState.CONFLICTED
         else:
             return AssertionState.PROPOSED
 
-    def _promote_to_current(self, assertion_id: str, entity_id: str, property_id: str, value: TypedValue, confidence: float, authority: float, evidence_ids: tuple[str, ...], epistemic_kind: str, valid_from: str) -> None:
+    def _supersede_assertion(
+        self, old_assertion_id: str, new_valid_from: str
+    ) -> None:
+        """Mark an existing assertion as superseded and close its valid_to."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE world_assertions
+                SET state = 'superseded', valid_to = ?, recorded_at = ?
+                WHERE assertion_id = ? AND state = 'accepted'""",
+                (new_valid_from, now, old_assertion_id),
+            )
+            self._conn.commit()
+
+    def _promote_to_current(
+        self,
+        assertion_id: str,
+        entity_id: str,
+        property_id: str,
+        value: TypedValue,
+        confidence: float,
+        authority: float,
+        evidence_ids: tuple[str, ...],
+        epistemic_kind: str,
+        valid_from: str,
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE world_assertions SET state = 'accepted' WHERE assertion_id = ?",
@@ -218,7 +252,28 @@ class Reconciler:
             valid_from=valid_from,
         )
 
-    def _promote_relation_to_current(self, assertion_id: str, source: str, relation: str, target: str, confidence: float, authority: float, evidence_ids: tuple[str, ...], epistemic_kind: str, valid_from: str) -> None:
+    def _mark_conflicted(self, assertion_id: str) -> None:
+        """Mark an assertion as conflicted."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE world_assertions SET state = 'conflicted' WHERE assertion_id = ?",
+                (assertion_id,),
+            )
+            self._conn.commit()
+
+    def _promote_relation_to_current(
+        self,
+        assertion_id: str,
+        source: str,
+        relation: str,
+        target: str,
+        confidence: float,
+        authority: float,
+        evidence_ids: tuple[str, ...],
+        epistemic_kind: str,
+        valid_from: str,
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE relation_assertions SET state = 'accepted' WHERE assertion_id = ?",
@@ -239,59 +294,81 @@ class Reconciler:
 
     def ingest(self, delta: WorldDelta) -> list[ConflictRecord]:
         conflicts: list[ConflictRecord] = []
-        for a in delta.assertions:
-            entity_id = a["subject_id"]
-            prop_id = a.get("property_id", "")
-            value = a["value"]
-            source_id = a.get("source_id", "unknown")
-            confidence = a.get("confidence", 0.0)
-            authority = a.get("authority", 0.5)
-            evidence_ids = tuple(a.get("evidence_ids", ()))
-            epistemic_kind = a.get("epistemic_kind", "observation")
-            valid_from = a.get("valid_from", datetime.now(timezone.utc).isoformat())
-            conflict = self._check_conflict(entity_id, prop_id, value.raw, source_id)
-            if conflict is not None:
-                conflicts.append(conflict)
-            aid = self._insert_assertion(a, "property")
-            state = self._resolve_conflict(conflict, authority, 0.5) if conflict else AssertionState.ACCEPTED
-            if state == AssertionState.ACCEPTED:
-                self._promote_to_current(aid, entity_id, prop_id, value, confidence, authority, evidence_ids, epistemic_kind, valid_from)
-        for ra in delta.relation_assertions:
-            aid = self._insert_assertion(ra, "relation")
-            self._promote_relation_to_current(
-                aid,
-                ra["source_entity_id"],
-                ra["relation_type_id"],
-                ra["target_entity_id"],
-                ra.get("confidence", 0.0),
-                ra.get("authority", 0.5),
-                tuple(ra.get("evidence_ids", ())),
-                ra.get("epistemic_kind", "observation"),
-                ra["valid_from"],
-            )
-        for ea in delta.events:
-            aid = self._next_id("event")
-            now = datetime.now(timezone.utc).isoformat()
-            with self._lock:
-                self._conn.execute(
-                    """INSERT INTO event_assertions
-                    (assertion_id, event_type_id, roles_json, epistemic_kind, source_id,
-                     evidence_ids_json, confidence, valid_from, observed_at, recorded_at, state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')""",
-                    (
-                        aid,
-                        ea["event_type_id"],
-                        json.dumps(ea.get("roles", {})),
-                        ea.get("epistemic_kind", "observation"),
-                        ea.get("source_id", ""),
-                        json.dumps(list(ea.get("evidence_ids", ()))),
-                        ea.get("confidence", 0.0),
-                        ea.get("observed_at", now),
-                        ea.get("observed_at", now),
-                        now,
-                    ),
+
+        with self._state.world_transaction():
+            for a in delta.assertions:
+                entity_id = a["subject_id"]
+                prop_id = a.get("property_id", "")
+                value = a["value"]
+                source_id = a.get("source_id", "unknown")
+                confidence = a.get("confidence", 0.0)
+                authority = a.get("authority", 0.5)
+                evidence_ids = tuple(a.get("evidence_ids", ()))
+                epistemic_kind = a.get("epistemic_kind", "observation")
+                valid_from = a.get("valid_from", datetime.now(timezone.utc).isoformat())
+
+                conflict = self._check_conflict(entity_id, prop_id, value.raw, source_id)
+
+                aid = self._insert_assertion(a, "property")
+
+                if conflict is not None:
+                    conflicts.append(conflict)
+                    state = self._resolve_conflict(conflict, authority)
+
+                    if state == AssertionState.ACCEPTED:
+                        self._supersede_assertion(conflict.assertion_id, valid_from)
+                        self._promote_to_current(
+                            aid, entity_id, prop_id, value, confidence, authority,
+                            evidence_ids, epistemic_kind, valid_from,
+                        )
+                    elif state == AssertionState.CONFLICTED:
+                        self._mark_conflicted(aid)
+                        self._mark_conflicted(conflict.assertion_id)
+                    else:
+                        pass  # Leave as proposed
+                else:
+                    self._promote_to_current(
+                        aid, entity_id, prop_id, value, confidence, authority,
+                        evidence_ids, epistemic_kind, valid_from,
+                    )
+
+            for ra in delta.relation_assertions:
+                aid = self._insert_assertion(ra, "relation")
+                self._promote_relation_to_current(
+                    aid,
+                    ra["source_entity_id"],
+                    ra["relation_type_id"],
+                    ra["target_entity_id"],
+                    ra.get("confidence", 0.0),
+                    ra.get("authority", 0.5),
+                    tuple(ra.get("evidence_ids", ())),
+                    ra.get("epistemic_kind", "observation"),
+                    ra["valid_from"],
                 )
-                self._conn.commit()
+
+            for ea in delta.events:
+                aid = self._next_id("event")
+                now = datetime.now(timezone.utc).isoformat()
+                with self._lock:
+                    self._conn.execute(
+                        """INSERT INTO event_assertions
+                        (assertion_id, event_type_id, roles_json, epistemic_kind, source_id,
+                         evidence_ids_json, confidence, valid_from, observed_at, recorded_at, state)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')""",
+                        (
+                            aid,
+                            ea["event_type_id"],
+                            json.dumps(ea.get("roles", {})),
+                            ea.get("epistemic_kind", "observation"),
+                            ea.get("source_id", ""),
+                            json.dumps(list(ea.get("evidence_ids", ()))),
+                            ea.get("confidence", 0.0),
+                            ea.get("observed_at", now),
+                            ea.get("observed_at", now),
+                            now,
+                        ),
+                    )
+
         return conflicts
 
     def get_entity_assertions(self, entity_id: str) -> list[dict[str, Any]]:
@@ -316,7 +393,9 @@ class Reconciler:
                 for row in rows
             ]
 
-    def get_assertion_history(self, entity_id: str, property_id: str) -> list[dict[str, Any]]:
+    def get_assertion_history(
+        self, entity_id: str, property_id: str
+    ) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT assertion_id, value_json, epistemic_kind, source_id, confidence,
@@ -365,31 +444,22 @@ class Reconciler:
         confidences: list[float],
         correlation_group: EvidenceCorrelationGroup | None = None,
     ) -> float:
-        """Aggregate multiple confidence scores with correlation-aware diminishing returns.
-        
-        Without correlation, N observations would give confidence = 1 - prod(1-ci).
-        With correlation, effective independent count is reduced.
-        """
         if not confidences:
             return 0.0
-        
         if len(confidences) == 1:
             return confidences[0]
-        
-        # Base aggregation: 1 - product of (1-ci)
+
         combined = 1.0
         for c in confidences:
             combined *= (1.0 - min(1.0, max(0.0, c)))
         base_confidence = 1.0 - combined
-        
-        # Apply correlation factor if provided
+
         if correlation_group is not None and correlation_group.observation_count > 1:
             independence = correlation_group.independence_factor
             effective_observations = 1 + (len(confidences) - 1) * independence
-            # Scale confidence by effective independent observations
             scaled = base_confidence * (effective_observations / len(confidences))
             return min(1.0, scaled)
-        
+
         return base_confidence
 
     def get_effective_independent_observations(
@@ -398,12 +468,8 @@ class Reconciler:
         property_id: str,
         window_seconds: float = 10.0,
     ) -> dict[str, Any]:
-        """Calculate effective independent observations for a property.
-        
-        Returns the effective independent count considering temporal correlation.
-        """
-        import datetime
-        
+        import datetime as dt
+
         with self._lock:
             rows = self._conn.execute(
                 """SELECT confidence, valid_from, source_id
@@ -412,23 +478,22 @@ class Reconciler:
                 ORDER BY valid_from DESC""",
                 (entity_id, property_id),
             ).fetchall()
-        
+
         if not rows:
             return {"total_observations": 0, "effective_independent": 0.0}
-        
+
         total = len(rows)
         confidences = [r[0] for r in rows]
-        
-        # Group by temporal proximity
-        groups = []
+
+        groups: list[list[float]] = []
         current_group = [confidences[0]]
-        
+
         for i in range(1, len(rows)):
             try:
-                prev_time = datetime.datetime.fromisoformat(rows[i-1][1])
-                curr_time = datetime.datetime.fromisoformat(rows[i][1])
+                prev_time = dt.datetime.fromisoformat(rows[i - 1][1])
+                curr_time = dt.datetime.fromisoformat(rows[i][1])
                 delta = abs((curr_time - prev_time).total_seconds())
-                
+
                 if delta < window_seconds:
                     current_group.append(confidences[i])
                 else:
@@ -437,16 +502,13 @@ class Reconciler:
             except Exception:
                 groups.append(current_group)
                 current_group = [confidences[i]]
-        
+
         groups.append(current_group)
-        
-        # Calculate effective independent observations
+
         effective = 0.0
         for group in groups:
-            # Each group counts as ~1 independent observation
-            # with diminishing returns for additional observations in the group
             effective += 1 + (len(group) - 1) * 0.1
-        
+
         return {
             "total_observations": total,
             "effective_independent": round(effective, 2),

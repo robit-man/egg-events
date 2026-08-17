@@ -1,128 +1,335 @@
-"""ObservationNormalizer: converts PerceptualEvent into WorldDelta."""
+"""ObservationNormalizer: converts PerceptualEvent into WorldDelta.
+
+All normalization of raw perceptual events into structured world assertions
+flows through this module.  The pipeline should never manually construct
+WorldDelta with label/bbox/behavior semantics.
+"""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+from egg_companion.world.ontology import OntologyRegistry
+from egg_companion.world.sources import AuthorityPolicy
+from egg_companion.world.types import (
+    EpistemicKind,
+    TypedValue,
+    ValueType,
+    WorldDelta,
+)
 
 
 class ObservationNormalizer:
-    """Converts raw perceptual events into structured WorldDelta."""
+    """Converts raw perceptual events into structured WorldDelta.
 
-    def normalize_detection(
+    Uses AuthorityPolicy to compute authority for each assertion.
+    Accepts evidence_ids from the caller so that provenance is never lost.
+    """
+
+    def __init__(
         self,
-        detection: dict[str, Any],
-        camera_id: str,
-        observed_at: str,
+        authority_policy: AuthorityPolicy | None = None,
+        ontology: OntologyRegistry | None = None,
+    ) -> None:
+        self._authority = authority_policy or AuthorityPolicy()
+        self._ontology = ontology or OntologyRegistry()
+
+    def normalize_event(
+        self,
+        event: Any,
+        *,
+        evidence_ids: tuple[str, ...] = (),
+        confidences: dict[str, float] | None = None,
         frame_shape: tuple[int, int] | None = None,
     ) -> WorldDelta:
-        """Normalize a single detection into a WorldDelta."""
+        """Normalize a PerceptualEvent into a WorldDelta.
+
+        This is the single entry point for all normalization.  The pipeline
+        should call this and nothing else.
+        """
+        confidences = confidences or {}
+        source_id = getattr(event, "source_id", "unknown")
+        source_type = self._source_type_from_id(source_id)
+        occurred_at = getattr(event, "occurred_at", datetime.now(timezone.utc))
+        if isinstance(occurred_at, datetime):
+            occurred_at = occurred_at.isoformat()
+        event_type = getattr(event, "event_type", "")
+        payload = getattr(event, "payload", {})
+        entity_ids = getattr(event, "entity_ids", ())
+
+        if event_type in ("vision", "object", "identity"):
+            return self._normalize_visual_event(
+                payload, source_id, source_type, occurred_at,
+                evidence_ids=evidence_ids, confidences=confidences,
+                frame_shape=frame_shape, entity_ids=entity_ids,
+            )
+        elif event_type == "speech":
+            return self._normalize_speech_event(
+                payload, source_id, source_type, occurred_at,
+                evidence_ids=evidence_ids, confidences=confidences,
+                entity_ids=entity_ids,
+            )
+        elif event_type == "ocr":
+            return self._normalize_ocr_event(
+                payload, source_id, source_type, occurred_at,
+                evidence_ids=evidence_ids, confidences=confidences,
+                entity_ids=entity_ids,
+            )
+        else:
+            return WorldDelta()
+
+    def _normalize_visual_event(
+        self,
+        payload: dict[str, Any],
+        source_id: str,
+        source_type: str,
+        observed_at: str,
+        *,
+        evidence_ids: tuple[str, ...] = (),
+        confidences: dict[str, float],
+        frame_shape: tuple[int, int] | None,
+        entity_ids: tuple[str, ...] = (),
+    ) -> WorldDelta:
         delta = WorldDelta()
-        entity_id = (
-            detection.get("identity_id")
-            or detection.get("object_id")
-            or f"detected:{detection.get('label', 'unknown')}"
-        )
-        label = detection.get("label", "unknown")
-        confidence = float(detection.get("confidence", 0.0))
-        bbox = detection.get("bbox")
-        behavior = detection.get("behavior")
+        detections = payload.get("detections", [])
+        if not isinstance(detections, (list, tuple)):
+            return delta
 
-        delta.observations.append({
-            "entity_id": entity_id,
-            "label": label,
-            "confidence": confidence,
-            "camera_id": camera_id,
-            "observed_at": observed_at,
-        })
+        for detection in detections:
+            if not isinstance(detection, dict):
+                continue
 
-        delta.assertions.append({
-            "subject_id": entity_id,
-            "property_id": "label",
-            "value": TypedValue(raw=label, value_type=ValueType.STRING),
-            "epistemic_kind": "observation",
-            "source_id": f"camera:{camera_id}",
-            "confidence": confidence,
-            "valid_from": observed_at,
-        })
+            entity_id = (
+                detection.get("entity_id")
+                or detection.get("object_id")
+                or detection.get("identity_id")
+            )
+            if not entity_id:
+                continue
 
-        if bbox:
+            label = detection.get("label", "unknown")
+            confidence = float(detection.get("confidence", 0.0))
+            bbox = detection.get("bbox")
+            behavior = detection.get("behavior")
+
+            authority = self._authority.evaluate(
+                property_type=f"{self._entity_type_from_label(label)}.label",
+                source_type=source_type,
+                epistemic_kind=EpistemicKind.OBSERVATION.value,
+            )
+
             delta.assertions.append({
                 "subject_id": entity_id,
-                "property_id": "bbox",
-                "value": TypedValue(raw=bbox, value_type=ValueType.GEOMETRY),
-                "epistemic_kind": "observation",
-                "source_id": f"camera:{camera_id}",
+                "property_id": "label",
+                "value": TypedValue(raw=label, value_type=ValueType.STRING),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
                 "confidence": confidence,
+                "authority": authority,
                 "valid_from": observed_at,
             })
 
-        if behavior:
+            if bbox:
+                bbox_authority = self._authority.evaluate(
+                    property_type="*.bbox",
+                    source_type=source_type,
+                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                )
+                delta.assertions.append({
+                    "subject_id": entity_id,
+                    "property_id": "bbox",
+                    "value": TypedValue(raw=bbox, value_type=ValueType.GEOMETRY),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": confidence,
+                    "authority": bbox_authority,
+                    "valid_from": observed_at,
+                })
+
+            if behavior:
+                behavior_authority = self._authority.evaluate(
+                    property_type="*.behavior",
+                    source_type=source_type,
+                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                )
+                delta.assertions.append({
+                    "subject_id": entity_id,
+                    "property_id": "behavior",
+                    "value": TypedValue(raw=behavior, value_type=ValueType.STRING),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": confidence,
+                    "authority": behavior_authority,
+                    "valid_from": observed_at,
+                })
+
+            if bbox and frame_shape:
+                h, w = frame_shape
+                center_x = ((bbox[0] + bbox[2]) / 2) / w
+                center_y = ((bbox[1] + bbox[3]) / 2) / h
+                loc_authority = self._authority.evaluate(
+                    property_type="*.current_location",
+                    source_type=source_type,
+                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                )
+                delta.assertions.append({
+                    "subject_id": entity_id,
+                    "property_id": "current_location",
+                    "value": TypedValue(
+                        raw={"frame": f"{source_id.split(':')[-1]}_normalized",
+                             "position": [round(center_x, 4), round(center_y, 4)]},
+                        value_type=ValueType.GEOMETRY,
+                    ),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": confidence * 0.8,
+                    "authority": loc_authority,
+                    "valid_from": observed_at,
+                })
+
             delta.assertions.append({
                 "subject_id": entity_id,
-                "property_id": "behavior",
-                "value": TypedValue(raw=behavior, value_type=ValueType.STRING),
-                "epistemic_kind": "observation",
-                "source_id": f"camera:{camera_id}",
+                "property_id": "last_seen",
+                "value": TypedValue(raw=observed_at, value_type=ValueType.DATETIME),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
                 "confidence": confidence,
+                "authority": 0.9,
                 "valid_from": observed_at,
             })
 
-        if bbox and frame_shape:
-            h, w = frame_shape
-            center_x = ((bbox[0] + bbox[2]) / 2) / w
-            center_y = ((bbox[1] + bbox[3]) / 2) / h
-            delta.assertions.append({
-                "subject_id": entity_id,
-                "property_id": "current_location",
-                "value": TypedValue(
-                    raw={"frame": f"{camera_id}_normalized", "position": [round(center_x, 4), round(center_y, 4)]},
-                    value_type=ValueType.GEOMETRY,
+            camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
+            delta.relation_assertions.append({
+                "source_entity_id": entity_id,
+                "relation_type_id": "visible_from",
+                "target_entity_id": f"camera_view:{camera_id}",
+                "confidence": confidence,
+                "authority": self._authority.evaluate(
+                    property_type="*.visible_from",
+                    source_type=source_type,
+                    epistemic_kind=EpistemicKind.OBSERVATION.value,
                 ),
-                "epistemic_kind": "observation",
-                "source_id": f"camera:{camera_id}",
-                "confidence": confidence * 0.8,
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
                 "valid_from": observed_at,
             })
-
-        delta.relation_assertions.append({
-            "source_entity_id": entity_id,
-            "relation_type_id": "visible_from",
-            "target_entity_id": f"camera_view:{camera_id}",
-            "confidence": confidence,
-            "source_id": f"camera:{camera_id}",
-            "valid_from": observed_at,
-        })
 
         return delta
 
-    def normalize_speech(
+    def _normalize_speech_event(
         self,
-        speaker_id: str | None,
-        transcript: str,
+        payload: dict[str, Any],
+        source_id: str,
+        source_type: str,
         observed_at: str,
-        source_id: str = "asr",
+        *,
+        evidence_ids: tuple[str, ...] = (),
+        confidences: dict[str, float],
+        entity_ids: tuple[str, ...] = (),
     ) -> WorldDelta:
-        """Normalize a speech utterance into a WorldDelta."""
         delta = WorldDelta()
-        turn_id = f"turn:{observed_at}"
+        transcript = payload.get("transcript", "")
+        if not transcript:
+            return delta
+
+        speaker_id = entity_ids[0] if entity_ids else payload.get("speaker", "unknown")
+        authority = self._authority.evaluate(
+            property_type="conversation_turn.transcript",
+            source_type=source_type,
+            epistemic_kind=EpistemicKind.OBSERVATION.value,
+        )
+
         delta.events.append({
             "event_type_id": "speech_utterance",
-            "roles": {"speaker": speaker_id or "unknown", "transcript": transcript},
+            "roles": {"speaker": speaker_id, "transcript": str(transcript)[:500]},
             "source_id": source_id,
+            "evidence_ids": evidence_ids,
+            "confidence": confidences.get("transcript", 0.8),
             "observed_at": observed_at,
         })
-        if speaker_id:
+
+        if speaker_id and speaker_id != "unknown":
             delta.relation_assertions.append({
                 "source_entity_id": speaker_id,
                 "relation_type_id": "speaking_to",
                 "target_entity_id": "agent:egg",
                 "confidence": 0.8,
+                "authority": authority,
                 "source_id": source_id,
+                "evidence_ids": evidence_ids,
                 "valid_from": observed_at,
             })
+
         return delta
+
+    def _normalize_ocr_event(
+        self,
+        payload: dict[str, Any],
+        source_id: str,
+        source_type: str,
+        observed_at: str,
+        *,
+        evidence_ids: tuple[str, ...] = (),
+        confidences: dict[str, float],
+        entity_ids: tuple[str, ...] = (),
+    ) -> WorldDelta:
+        delta = WorldDelta()
+        text = payload.get("text", "")
+        if not text:
+            return delta
+
+        target_id = entity_ids[0] if entity_ids else payload.get("target_id", "unknown")
+        authority = self._authority.evaluate(
+            property_type="physical_object.label",
+            source_type=source_type,
+            epistemic_kind=EpistemicKind.OBSERVATION.value,
+        )
+
+        delta.events.append({
+            "event_type_id": "ocr_detection",
+            "roles": {
+                "target": target_id,
+                "transcript": str(text)[:500],
+            },
+            "source_id": source_id,
+            "evidence_ids": evidence_ids,
+            "confidence": confidences.get("text", 0.6),
+            "observed_at": observed_at,
+        })
+
+        if text and target_id and target_id != "unknown":
+            delta.assertions.append({
+                "subject_id": target_id,
+                "property_id": "visible_text",
+                "value": TypedValue(raw=text, value_type=ValueType.STRING),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
+                "confidence": confidences.get("text", 0.6),
+                "authority": authority,
+                "valid_from": observed_at,
+            })
+
+        return delta
+
+    @staticmethod
+    def _source_type_from_id(source_id: str) -> str:
+        if ":" not in source_id:
+            return source_id
+        return source_id.split(":", 1)[0]
+
+    @staticmethod
+    def _entity_type_from_label(label: str) -> str:
+        label_lower = label.lower()
+        if label_lower in ("person", "man", "woman", "child", "egg"):
+            return "person"
+        return "physical_object"
 
     def merge_deltas(self, *deltas: WorldDelta) -> WorldDelta:
         merged = WorldDelta()

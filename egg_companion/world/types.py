@@ -323,17 +323,22 @@ class ResolvedState:
 class ActionProposal:
     proposal_id: str
     action_type: str
+    target_entity_ids: tuple[str, ...] = ()
     inputs: dict[str, Any] = field(default_factory=dict)
     preconditions: tuple[str, ...] = ()
     expected_effects: tuple[str, ...] = ()
+    source_evidence_ids: tuple[str, ...] = ()
     based_on_revision: int = 0
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    status: str = "pending"  # pending, accepted, rejected
+    reason: str = ""
+    proposed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
 class ActionExecution:
     execution_id: str
     proposal_id: str
+    result: Any = None
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
     success: bool | None = None
@@ -346,6 +351,7 @@ class ActionOutcome:
     execution_id: str
     success: bool
     result: Any = None
+    side_effects: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
     observed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

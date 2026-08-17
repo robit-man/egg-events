@@ -66,10 +66,12 @@ class ActionStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     proposal.proposal_id, proposal.action_type,
-                    proposal.target_entity_id,
-                    json.dumps(proposal.parameters, default=str),
-                    proposal.source_evidence_id, proposal.proposed_at,
-                    int(proposal.accepted), int(proposal.rejected),
+                    json.dumps(proposal.target_entity_ids),
+                    json.dumps(proposal.inputs, default=str),
+                    json.dumps(proposal.source_evidence_ids),
+                    proposal.proposed_at.isoformat(),
+                    int(proposal.status == "accepted"),
+                    int(proposal.status == "rejected"),
                     proposal.reason,
                 ),
             )
@@ -83,8 +85,9 @@ class ActionStore:
                 VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     execution.execution_id, execution.proposal_id,
-                    execution.started_at, execution.completed_at,
-                    int(execution.success),
+                    execution.started_at.isoformat(),
+                    execution.completed_at.isoformat() if execution.completed_at else None,
+                    int(execution.success) if execution.success is not None else 0,
                     json.dumps(execution.result, default=str) if execution.result else None,
                 ),
             )
@@ -98,9 +101,9 @@ class ActionStore:
                 VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     outcome.outcome_id, outcome.execution_id,
-                    outcome.observed_at, int(outcome.success),
-                    outcome.result,
-                    json.dumps(outcome.side_effects),
+                    outcome.observed_at.isoformat(), int(outcome.success),
+                    json.dumps(outcome.result, default=str) if outcome.result else "",
+                    json.dumps(outcome.side_effects, default=str),
                 ),
             )
             self._conn.commit()
@@ -113,11 +116,13 @@ class ActionStore:
             ).fetchone()
             if row is None:
                 return None
+            status = "rejected" if row[6] else ("accepted" if row[5] else "pending")
             return ActionProposal(
                 proposal_id=proposal_id, action_type=row[0],
-                target_entity_id=row[1], parameters=json.loads(row[2]),
-                source_evidence_id=row[3], proposed_at=row[4],
-                accepted=bool(row[5]), rejected=bool(row[6]), reason=row[7],
+                target_entity_ids=tuple(json.loads(row[1])),
+                inputs=json.loads(row[2]),
+                source_evidence_ids=tuple(json.loads(row[3])),
+                proposed_at=row[4], status=status, reason=row[7],
             )
 
     def pending_proposals(self) -> list[dict[str, Any]]:
