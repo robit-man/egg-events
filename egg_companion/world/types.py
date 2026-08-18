@@ -300,6 +300,10 @@ class WorldDelta:
     relation_assertions: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     identity_hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    # One entry per camera that produced a frame this tick, even with zero
+    # detections — lets the reconciler diff "who's visible now" against
+    # prior state to emit OBSERVED_ABSENT transitions.
+    camera_frames: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

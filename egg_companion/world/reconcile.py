@@ -16,7 +16,9 @@ from egg_companion.world.types import (
     AssertionKind,
     AssertionState,
     EvidenceCorrelationGroup,
+    ObservabilityState,
     TypedValue,
+    ValueType,
     WorldDelta,
 )
 
@@ -514,7 +516,86 @@ class Reconciler:
                         ),
                     )
 
+            self._emit_absence_transitions(delta, revision)
+
         return conflicts
+
+    def _emit_absence_transitions(self, delta: WorldDelta, revision: int) -> None:
+        """Mark entities OBSERVED_ABSENT when a camera's current frame no
+        longer contains something it previously saw.
+
+        This must run here rather than in the (stateless) normalizer: only
+        the reconciler can see prior materialized state, so only it can
+        tell "was visible, now isn't" apart from "was never visible".
+        Presence/absence is a recency-ordered state machine, not a
+        competing-authority fact, so the new value is promoted directly
+        rather than routed through the standard authority-conflict path
+        (which would otherwise let the higher, fixed authority of the
+        original OBSERVED_PRESENT assertion block every future absence
+        transition from ever taking effect).
+        """
+        for frame in delta.camera_frames:
+            camera_id = frame["camera_id"]
+            currently_visible = set(frame.get("visible_entity_ids", ()))
+            context = {
+                "source_id": frame.get("source_id", "unknown"),
+                "evidence_ids": tuple(frame.get("evidence_ids", ())),
+                "valid_from": frame.get("valid_from", datetime.now(timezone.utc).isoformat()),
+            }
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT crs.source_entity_id
+                    FROM current_relation_state crs
+                    JOIN current_property_state cps
+                      ON cps.entity_id = crs.source_entity_id
+                      AND cps.property_id = 'observability'
+                    WHERE crs.relation_type_id = 'visible_from'
+                      AND crs.target_entity_id = ?
+                      AND crs.valid_to IS NULL
+                      AND cps.value_json = ?
+                    """,
+                    (camera_id, json.dumps(ObservabilityState.OBSERVED_PRESENT.value)),
+                ).fetchall()
+            previously_visible = {row[0] for row in rows}
+            missing_ids = previously_visible - currently_visible
+            if not missing_ids:
+                continue
+
+            for missing_id in missing_ids:
+                a = {
+                    "subject_id": missing_id,
+                    "property_id": "observability",
+                    "value": TypedValue(
+                        raw=ObservabilityState.OBSERVED_ABSENT.value,
+                        value_type=ValueType.ENUM,
+                    ),
+                    "epistemic_kind": "inference",
+                    "source_id": context["source_id"],
+                    "evidence_ids": context["evidence_ids"],
+                    "confidence": 0.5,
+                    "authority": 0.4,
+                    "valid_from": context["valid_from"],
+                }
+                aid = self._insert_assertion(a, "property")
+                active_id = self._active_assertion_id(missing_id, "observability")
+                if active_id is not None:
+                    self._supersede_assertion(active_id, context["valid_from"])
+                self._promote_to_current(
+                    aid, missing_id, "observability", a["value"],
+                    a["confidence"], a["authority"], a["evidence_ids"],
+                    a["epistemic_kind"], a["valid_from"], revision=revision,
+                )
+
+    def _active_assertion_id(self, entity_id: str, property_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT assertion_id FROM world_assertions
+                WHERE subject_id = ? AND property_id = ? AND state = 'accepted'
+                ORDER BY valid_from DESC LIMIT 1""",
+                (entity_id, property_id),
+            ).fetchone()
+            return row[0] if row else None
 
     def get_entity_assertions(self, entity_id: str) -> list[dict[str, Any]]:
         with self._lock:

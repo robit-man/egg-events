@@ -26,6 +26,7 @@ from egg_companion.ocr import (
     OcrRefinementPolicy,
     OcrResolution,
     image_phash,
+    parse_utc_datetime,
     resolve_text_observations,
     should_skip_dedup,
 )
@@ -156,6 +157,7 @@ class _OcrCandidate:
     targets: tuple[_OcrTarget, ...] = ()
     trigger: str = "scheduled"
     vlm_text_regions: tuple[dict[str, object], ...] = ()
+    source_evidence_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2063,6 +2065,8 @@ class CompanionRuntime:
                 evidence=(evidence,),
                 entity_ids=tuple(str(item["id"]) for item in entities),
                 payload={
+                    "detections": detections,
+                    "frame_shape": list(frame.shape[:2]) if frame is not None else None,
                     "labels": [item["label"] for item in detections],
                     "scene_labels": list(observation.semantic_labels),
                     "behaviors": [item["behavior"] for item in detections if item["behavior"]],
@@ -3246,10 +3250,14 @@ class CompanionRuntime:
             image_png = await asyncio.to_thread(
                 self._encode_ocr_image, frame, None, self.config.ocr.max_image_size,
             )
-            # Dedup check — skip if identical image was OCR'd recently
+            # Dedup check — skip if identical image was OCR'd recently for
+            # this camera.  Scoping the key by camera_id (not just phash)
+            # avoids a hash collision on one camera silently skipping a
+            # legitimately different scene on another.
             phash = image_phash(image_png, self.config.ocr.dedup.hash_size)
+            dedup_key = f"{observation.camera_id}:{phash}" if phash else None
             if self.config.ocr.dedup.enabled and should_skip_dedup(
-                phash, self._ocr_dedup_seen,
+                dedup_key, self._ocr_dedup_seen,
                 self.config.ocr.dedup.window_seconds, now,
             ):
                 self.telemetry.record_ocr("dedup_skip", observation.camera_id)
@@ -3700,7 +3708,14 @@ class CompanionRuntime:
             "image_size": [source_width, source_height],
         }
 
-    async def _run_advanced_ocr(self, image_png: bytes) -> dict[str, object] | None:
+    async def _run_advanced_ocr(
+        self,
+        image_png: bytes,
+        *,
+        explicit_read_request: bool = False,
+        vlm_text_positive: bool = False,
+        dynamic_display: bool = False,
+    ) -> dict[str, object] | None:
         """Run both local and Omnius OCR independently, return combined result.
 
         Local provides a fast provisional result. Omnius refines per policy.
@@ -3733,7 +3748,12 @@ class CompanionRuntime:
             local_text = str(local_result.get("text") or "") if local_result else ""
             needs_refinement = (
                 local_result is None
-                or self._ocr_refinement.needs_refinement(local_conf, local_text)
+                or self._ocr_refinement.needs_refinement(
+                    local_conf, local_text,
+                    explicit_read_request=explicit_read_request,
+                    vlm_text_positive=vlm_text_positive,
+                    dynamic_display=dynamic_display,
+                )
             )
             if needs_refinement:
                 scratch_path = (
@@ -3807,7 +3827,11 @@ class CompanionRuntime:
                         self._local_text_region_proposals, candidate.image_png,
                     )
                 else:
-                    result = await self._run_advanced_ocr(candidate.image_png)
+                    result = await self._run_advanced_ocr(
+                        candidate.image_png,
+                        vlm_text_positive=bool(candidate.vlm_text_regions),
+                        dynamic_display=self._ocr_text_type(candidate) == "dynamic",
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -3980,35 +4004,49 @@ class CompanionRuntime:
                 continue
             for item in items:
                 try:
+                    source_evidence_id = str(item.get("evidence_id", "unknown"))
+                    camera_id = str(item.get("camera_id", "unknown"))
+                    captured_at = parse_utc_datetime(item.get("captured_at"))
                     media_key = item.get("media_key")
                     if not media_key or self._memory is None:
                         continue
                     media_path = Path(self.config.memory.storage_dir) / "media" / media_key
                     if not media_path.exists():
+                        self._queue_ocr_terminal_marker(
+                            source_evidence_id, camera_id, "source_media_unavailable",
+                        )
                         continue
                     image_bytes = await asyncio.to_thread(media_path.read_bytes)
                     phash = image_phash(image_bytes, self.config.ocr.dedup.hash_size)
+                    dedup_key = f"{camera_id}:{phash}" if phash else None
                     if self.config.ocr.dedup.enabled and should_skip_dedup(
-                        phash, self._ocr_dedup_seen,
+                        dedup_key, self._ocr_dedup_seen,
                         self.config.ocr.dedup.window_seconds,
                     ):
                         continue
                     job = self._ocr_job_ledger.enqueue(
-                        camera_id=str(item.get("camera_id", "unknown")),
+                        camera_id=camera_id,
                         image_phash=phash,
-                        observed_at=datetime.now(timezone.utc),
+                        observed_at=captured_at,
                         source_scope="backfill",
-                        parent_id=str(item.get("evidence_id", "unknown")),
+                        parent_id=f"camera_view:{camera_id}",
+                        source_evidence_id=source_evidence_id,
                     )
                     if job is None:
                         continue
                     result = await self._run_advanced_ocr(image_bytes)
                     if result is None:
                         self._ocr_job_ledger.fail(job.job_id, "no text found")
+                        self._queue_ocr_terminal_marker(
+                            source_evidence_id, camera_id, "no_text_found",
+                        )
                         continue
                     text = str(result.get("text") or "").strip()
                     if not text:
                         self._ocr_job_ledger.fail(job.job_id, "empty result")
+                        self._queue_ocr_terminal_marker(
+                            source_evidence_id, camera_id, "empty_result",
+                        )
                         continue
                     self._ocr_job_ledger.update_local_result(
                         job.job_id, text,
@@ -4025,15 +4063,20 @@ class CompanionRuntime:
                         job.job_id, text, str(result.get("engine", "unknown")),
                     )
                     backfill_candidate = _OcrCandidate(
-                        camera_id=str(item.get("camera_id", "unknown")),
+                        camera_id=camera_id,
                         image_png=image_bytes,
-                        observed_at=item.get("captured_at", datetime.now(timezone.utc)),
+                        observed_at=captured_at,
                         scope="backfill",
-                        parent_id=str(item.get("evidence_id", "scene:unknown")),
-                        parent_type="object_category",
-                        parent_label=f"{item.get('camera_id', 'unknown')} scene",
+                        # Ground to the camera's scene, not the source vision
+                        # evidence row — an evidence id is provenance, never
+                        # a physical object.  source_evidence_id below carries
+                        # that provenance separately.
+                        parent_id=f"camera_view:{camera_id}",
+                        parent_type="camera_view",
+                        parent_label=f"{camera_id} scene",
                         confidence=float(result.get("confidence", 0.5)),
                         trigger="retroactive-backfill",
+                        source_evidence_id=source_evidence_id,
                     )
                     try:
                         self._queue_ocr_memory(backfill_candidate, text, result)
@@ -4378,6 +4421,7 @@ class CompanionRuntime:
                 "trigger": candidate.trigger,
                 "parent_id": candidate.parent_id,
                 "parent_label": candidate.parent_label,
+                "source_evidence_id": candidate.source_evidence_id,
                 "vision_used": bool(result.get("vision_used")),
                 "engine": result.get("engine", "omnius-advanced-ocr"),
                 "ocr_confidence": result.get("confidence"),
@@ -4401,11 +4445,77 @@ class CompanionRuntime:
                 (evidence,),
                 tuple(entity_ids),
                 payload={
+                    "text": normalized,
+                    "target_id": candidate.parent_id,
+                    "text_type": self._ocr_text_type(candidate),
+                    "ocr_confidence": ocr_confidence,
+                    "ocr_engine": str(result.get("engine") or "omnius-advanced-ocr"),
+                    "regions": result.get("regions", []),
+                    "scope": candidate.scope,
+                    "trigger": candidate.trigger,
                     "labels": ["ocr", candidate.parent_label],
                     "entities": descriptors,
                     "relations": relations,
                     "skip_pairwise_co_observation": True,
                 },
+            )
+        )
+
+    _DYNAMIC_DISPLAY_LABEL_KEYWORDS = (
+        "tv", "television", "monitor", "screen", "display", "laptop",
+        "cell phone", "phone", "tablet", "clock",
+    )
+
+    @classmethod
+    def _ocr_text_type(cls, candidate: _OcrCandidate) -> str:
+        """Static (signs, books, packaging) vs dynamic (screens, clocks) text.
+
+        Dynamic text is expected to change between observations, which
+        affects OCR dedup/refinement policy downstream.
+        """
+        label = (candidate.parent_label or "").lower()
+        if any(keyword in label for keyword in cls._DYNAMIC_DISPLAY_LABEL_KEYWORDS):
+            return "dynamic"
+        return "static"
+
+    def _queue_ocr_terminal_marker(
+        self, source_evidence_id: str, camera_id: str, status: str
+    ) -> None:
+        """Record a status-only OCR evidence row for source evidence that
+        will never yield text (missing media, empty/failed OCR attempt).
+
+        Without this, backfill's unprocessed-evidence scan — which only
+        checks for the *presence* of a corresponding OCR evidence row —
+        would reconsider the same unprocessable evidence on every scan
+        forever.  The event carries no ``text``, so the normalizer's
+        ``if not text: return delta`` guard keeps it from touching world
+        state; it exists purely to mark this source evidence as visited.
+        """
+        if self._memory is None:
+            return
+        now = datetime.now(timezone.utc)
+        evidence = EvidenceRef(
+            str(uuid4()),
+            "ocr",
+            now,
+            "camera-advanced-ocr",
+            camera_id,
+            media_key=None,
+            quality=0.0,
+            metadata={
+                "source_evidence_id": source_evidence_id,
+                "status": status,
+            },
+        )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "ocr",
+                now,
+                camera_id,
+                (evidence,),
+                (),
+                payload={"skip_pairwise_co_observation": True},
             )
         )
 

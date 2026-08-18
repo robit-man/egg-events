@@ -432,13 +432,21 @@ class WorldStateStore:
         min_confidence: float = 0.0,
         entity_prefix: str = "",
         max_age_seconds: float | None = None,
+        limit: int | None = None,
     ) -> list[str]:
         """Remove entities whose last_updated < stale_before and confidence < threshold.
+
+        ``limit``, when given, bounds how many entities are deleted (oldest
+        first) — the cap is enforced in SQL so callers can never delete more
+        than they asked for by slicing the return value afterward.
 
         Returns list of pruned entity_ids.
         """
         with self._lock:
-            query = "SELECT entity_id, MIN(confidence) as min_conf FROM current_property_state WHERE updated_at < ?"
+            query = (
+                "SELECT entity_id, MIN(confidence) as min_conf, MIN(updated_at) as oldest "
+                "FROM current_property_state WHERE updated_at < ?"
+            )
             params: list[Any] = [stale_before]
             if entity_prefix:
                 query += " AND entity_id LIKE ?"
@@ -447,11 +455,14 @@ class WorldStateStore:
                 query += " AND updated_at < datetime(?, ?)"
                 cutoff = datetime.now(timezone.utc).isoformat()
                 params.extend([cutoff, f"-{int(max_age_seconds)} seconds"])
-            query += " GROUP BY entity_id HAVING min_conf < ?"
+            query += " GROUP BY entity_id HAVING min_conf < ? ORDER BY oldest ASC"
             params.append(min_confidence)
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
             rows = self._conn.execute(query, params).fetchall()
             pruned = []
-            for entity_id, _ in rows:
+            for entity_id, _, _ in rows:
                 self._conn.execute(
                     "DELETE FROM current_property_state WHERE entity_id = ?",
                     (entity_id,),
@@ -469,19 +480,15 @@ class WorldStateStore:
         max_confidence: float = 0.4,
         min_observations: int = 0,
     ) -> list[str]:
-        """Remove entities with confidence below threshold.
+        """Remove entities whose highest recorded property confidence is below threshold.
 
         If min_observations > 0, only prune entities with observation_count <= that value.
         """
         with self._lock:
-            query = """
-                SELECT entity_id, MAX(CAST(value_json AS REAL)) as max_conf
-                FROM current_property_state
-                WHERE property_id = 'observation_count' OR property_id = 'label'
-            """
+            query = "SELECT entity_id, MAX(confidence) as max_conf FROM current_property_state"
             params: list[Any] = []
             if entity_prefix:
-                query += " AND entity_id LIKE ?"
+                query += " WHERE entity_id LIKE ?"
                 params.append(f"{entity_prefix}%")
             query += " GROUP BY entity_id HAVING max_conf < ?"
             params.append(max_confidence)
@@ -495,39 +502,6 @@ class WorldStateStore:
                     ).fetchone()
                     if obs_row and obs_row[0] > min_observations:
                         continue
-                self._conn.execute(
-                    "DELETE FROM current_property_state WHERE entity_id = ?",
-                    (entity_id,),
-                )
-                self._conn.execute(
-                    "DELETE FROM current_relation_state WHERE source_entity_id = ? OR target_entity_id = ?",
-                    (entity_id, entity_id),
-                )
-                pruned.append(entity_id)
-            return pruned
-
-    def prune_contextually_impossible(
-        self,
-        impossible_labels: set[str] | None = None,
-        entity_prefix: str = "det:",
-    ) -> list[str]:
-        """Remove entities whose label matches a set of impossible/hallucinated categories."""
-        if impossible_labels is None:
-            impossible_labels = set()
-        with self._lock:
-            placeholders = ",".join("?" for _ in impossible_labels) if impossible_labels else "''"
-            query = f"""
-                SELECT DISTINCT entity_id
-                FROM current_property_state
-                WHERE property_id = 'label'
-                AND entity_id LIKE ?
-                AND LOWER(REPLACE(REPLACE(value_json, '"', ''), ' ', '')) IN ({placeholders})
-            """
-            params: list[Any] = [f"{entity_prefix}%"]
-            params.extend(l.lower().replace(" ", "") for l in impossible_labels)
-            rows = self._conn.execute(query, params).fetchall()
-            pruned = []
-            for (entity_id,) in rows:
                 self._conn.execute(
                     "DELETE FROM current_property_state WHERE entity_id = ?",
                     (entity_id,),

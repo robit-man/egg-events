@@ -28,94 +28,6 @@ class ObservationNormalizer:
     Accepts evidence_ids from the caller so that provenance is never lost.
     """
 
-    # Labels that are clearly hallucinated for a home/office environment
-    # with 4 cameras.  These will never appear in reality.
-    IMPOSSIBLE_LABELS: set[str] = {
-        "astronaut", "bomb", "abacus", "altar", "angel", "archway",
-        "bank vault", "baptism", "bedpan", "blacksmith", "blowfish",
-        "blue artist", "bowling ball", "bronze statue", "chinese tower",
-        "church bench", "computer tower", "dinosaur", "eiffel tower",
-        "golf cap", "tokyo tower", "water tower", "volcano", "waterfall",
-        "zoo", "castle", "dome", "fountain", "greenhouse", "pagoda",
-        "stadium", "temple", "cathedral", "church", "lighthouse",
-        "monument", "pyramid", "statue", "tower", "helicopter", "horse",
-        "elephant", "igloo", "kennel", "bakery", "casino", "army",
-        "baptism", "barrel", "basket", "bin", "binder", "block",
-        "blowfish", "blue artist", "bolo tie", "bomb", "bonnet",
-        "boom microphone", "bottle opener", "bowling ball", "bread",
-        "bubble", "bureau", "bust", "cabinet", "cake", "cake stand",
-        "calculator", "can", "cape", "cardigan", "cash machine",
-        "castle", "chain", "chainlink fence", "chandelier", "chime",
-        "chinese tower", "chopstick", "church", "church bench",
-        "cliff", "closet", "cocktail shaker", "comic book",
-        "computer keyboard", "computer room", "computer tower",
-        "computer", "condiment", "cork", "cowboy hat", "cradle",
-        "crate", "cross", "crown", "crutch", "cup", "cutoff",
-        "dam", "desk", "desk chair", "dial telephone", "diaper",
-        "diamond", "dining table", "dinosaur", "dishwasher",
-        "dock", "dog", "doll", "domestic cat", "drum", "drumstick",
-        "dumbbell", "dumpster", "easel", "egg", "eiffel tower",
-        "electric fan", "electric guitar", "electric razor",
-        "envelope", "eraser", "eyepatch", "face powder", "ferris wheel",
-        "file cabinet", "fire engine", "fire screen", "flagpole",
-        "flute", "folding chair", "football helmet", "fountain",
-        "frame", "french horn", "frying pan", "fur coat", "garbage truck",
-        "gasmask", "gazebo", "genie", "giant panda", "goblet",
-        "golf cap", "golf cart", "golf club", "gong", "goose",
-        "grand piano", "greenhouse", "guillotine", "hair dryer",
-        "hair spray", "halter top", "hamper", "hammock", "handkerchief",
-        "hard disc drive", "harmonica", "harp", "hatbox", "head scarf",
-        "headphone", "helicopter", "helmet", "hippopotamus", "hoe",
-        "home plate", "hook", "horse", "hotdog", "hourglass",
-        "house", "ice cream", "igloo", "iron", "jack-o-lantern",
-        "jacuzzi", "jean", "jellyfish", "joystick", "kennel",
-        "kettle", "keypad", "kilt", "kimono", "knitting needle",
-        "labyrinth", "lampshade", "laptop", "lawn mower", "level",
-        "lighthouse", "lipstick", "lobster", "loudspeaker", "luggage",
-        "mailbox", "manhole", "mask", "masher", "matchstick",
-        "maypole", "measuring cup", "medicine", "microwave",
-        "military uniform", "milk can", "miniskirt", "minivan",
-        "missile", "mixer", "monarch", "monopoly", "monument",
-        "mop", "mortar", "mortarboard", "mosque", "motor scooter",
-        "motorcycle", "mouse", "mousetrap", "mug", "mule",
-        "multitool", "nailfile", "necklace", "needle", "newspaper",
-        "nosegay", "oboe", "ocarina", "ottoman", "overcoat",
-        "overhead projector", "ox", "padlock", "pagoda", "paintbrush",
-        "palette", "pan", "panda", "paper towel", "parachute",
-        "parking meter", "patio", "pay-phone", "pedestal", "pencil box",
-        "pencil sharpener", "perfume", "petri dish", "phonograph record",
-        "pickup truck", "piggy bank", "pillow", "pizza", "plastic bag",
-        "plunger", "polar bear", "polo shirt", "pool table", "pop bottle",
-        "postbox", "pot", "pottery", "power drill", "prayer rug",
-        "projectile", "projector", "punching bag", "purse", "pyramid",
-        "quilt", "racket", "radar", "radio", "rain barrel", "record player",
-        "recreation room", "refrigerator", "remote control", "restaurant",
-        "revolver", "rifle", "ring", "robocop", "rocket", "rocking chair",
-        "rotisserie", "ruler", "running shoe", "safe", "sailboat",
-        "saltshaker", "sandals", "sarong", "scale", "school bus",
-        "scoreboard", "scrubbing brush", "sewing machine", "shield",
-        "shoe", "shopping cart", "shower cap", "shower curtain",
-        "ski", "skirt", "sleeping bag", "sliding door", "slippers",
-        "slot machine", "smartphone", "smokestack", "snail", "snake",
-        "snowplow", "soccer ball", "sock", "sombrero", "space heater",
-        "spatula", "speedboat", "spider web", "spinning wheel",
-        "spotlight", "statue", "steam engine", "steering wheel",
-        "stethoscope", "stopwatch", "stove", "strawberry", "stretcher",
-        "studio couch", "submarine", "suitcase", "sunglasses",
-        "sunhat", "supertanker", "sweatshirt", "swimming trunks",
-        "swing", "switch", "syringe", "table lamp", "tank",
-        "tape player", "teapot", "teddy", "television", "tennis ball",
-        "thimble", "throne", "tiara", "tiger", "toaster",
-        "tokyo tower", "trolley", "trophy", "trumpet", "turtle",
-        "typewriter", "umbrella", "unicycle", "upright piano",
-        "vacuum cleaner", "vase", "vending machine", "violin",
-        "volleyball", "waffle iron", "wall clock", "wallet",
-        "water tower", "watermelon", "weber grill", "whistle",
-        "wig", "wind chime", "windmill", "wine bottle", "wine glass",
-        "wok", "wood-burning stove", "wool", "wrecking ball",
-        "yacht", "yo-yo", "zucchini",
-    }
-
     def __init__(
         self,
         authority_policy: AuthorityPolicy | None = None,
@@ -187,35 +99,29 @@ class ObservationNormalizer:
         if not isinstance(detections, (list, tuple)):
             return delta
 
-        detected_entity_ids: set[str] = set()
+        camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
+        visible_entity_ids: set[str] = set()
 
         for detection in detections:
             if not isinstance(detection, dict):
                 continue
 
+            label = detection.get("label", "unknown")
             entity_id = (
                 detection.get("entity_id")
                 or detection.get("object_id")
                 or detection.get("identity_id")
+                or (f"det:{label}" if label and label != "unknown" else None)
             )
             if not entity_id:
                 continue
 
-            detected_entity_ids.add(entity_id)
-            label = detection.get("label", "unknown")
             confidence = float(detection.get("confidence", 0.0))
             bbox = detection.get("bbox")
             behavior = detection.get("behavior")
 
             # Filter: reject detections below confidence threshold
             if confidence < self._min_confidence:
-                continue
-
-            # Filter: reject contextually impossible labels for det:* entities
-            if (
-                entity_id.startswith("det:")
-                and label.lower().replace(" ", "") in self.IMPOSSIBLE_LABELS
-            ):
                 continue
 
             authority = self._authority.evaluate(
@@ -325,8 +231,8 @@ class ObservationNormalizer:
                 "authority": 0.9,
                 "valid_from": observed_at,
             })
+            visible_entity_ids.add(entity_id)
 
-            camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
             delta.relation_assertions.append({
                 "source_entity_id": entity_id,
                 "relation_type_id": "visible_from",
@@ -342,28 +248,26 @@ class ObservationNormalizer:
                 "valid_from": observed_at,
             })
 
-        # Emit OBSERVED_ABSENT for entities that were previously tracked
-        # by this camera but are absent from the current frame
-        if entity_ids and detected_entity_ids:
-            missing_ids = set(entity_ids) - detected_entity_ids
-            camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
-            for missing_id in missing_ids:
-                if missing_id.startswith("camera_view:"):
-                    continue
-                delta.assertions.append({
-                    "subject_id": missing_id,
-                    "property_id": "observability",
-                    "value": TypedValue(
-                        raw=ObservabilityState.OBSERVED_ABSENT.value,
-                        value_type=ValueType.ENUM,
-                    ),
-                    "epistemic_kind": EpistemicKind.INFERENCE.value,
-                    "source_id": source_id,
-                    "evidence_ids": evidence_ids,
-                    "confidence": 0.5,
-                    "authority": 0.4,
-                    "valid_from": observed_at,
-                })
+        # Record that this camera produced a frame this tick — even with
+        # zero detections — so the Reconciler can diff against prior state
+        # to emit OBSERVED_ABSENT.  This must not be derived from
+        # relation_assertions alone: a frame with zero detections has none,
+        # but still means "the camera looked and saw nobody", which is
+        # exactly the case absence-tracking needs to catch.
+        #
+        # OBSERVED_ABSENT is intentionally not emitted here.  This method is
+        # stateless — it only sees entities present in *this* event — so it
+        # cannot correctly tell "previously visible, now missing" apart from
+        # "never visible to begin with".  That diff requires querying prior
+        # world state, which only the Reconciler has access to; see
+        # Reconciler._emit_absence_transitions.
+        delta.camera_frames.append({
+            "camera_id": f"camera_view:{camera_id}",
+            "visible_entity_ids": sorted(visible_entity_ids),
+            "source_id": source_id,
+            "evidence_ids": evidence_ids,
+            "valid_from": observed_at,
+        })
 
         return delta
 
@@ -429,7 +333,10 @@ class ObservationNormalizer:
         if not text:
             return delta
 
-        target_id = entity_ids[0] if entity_ids else payload.get("target_id", "unknown")
+        target_id = str(
+            payload.get("target_id")
+            or (entity_ids[0] if entity_ids else "unknown")
+        )
         authority = self._authority.evaluate(
             property_type="physical_object.label",
             source_type=source_type,
@@ -440,6 +347,13 @@ class ObservationNormalizer:
         text_type = payload.get("text_type", "static")
         is_dynamic = text_type == "dynamic"
 
+        raw_ocr_confidence = payload.get("ocr_confidence")
+        text_confidence = (
+            float(raw_ocr_confidence)
+            if isinstance(raw_ocr_confidence, (int, float))
+            else confidences.get("text", 0.6)
+        )
+
         delta.events.append({
             "event_type_id": "ocr_detection",
             "roles": {
@@ -448,7 +362,7 @@ class ObservationNormalizer:
             },
             "source_id": source_id,
             "evidence_ids": evidence_ids,
-            "confidence": confidences.get("text", 0.6),
+            "confidence": text_confidence,
             "observed_at": observed_at,
         })
 
@@ -466,7 +380,7 @@ class ObservationNormalizer:
             "epistemic_kind": EpistemicKind.OBSERVATION.value,
             "source_id": source_id,
             "evidence_ids": evidence_ids,
-            "confidence": confidences.get("text", 0.6),
+            "confidence": text_confidence,
             "authority": authority,
             "valid_from": observed_at,
         }
@@ -498,4 +412,5 @@ class ObservationNormalizer:
             merged.relation_assertions.extend(d.relation_assertions)
             merged.events.extend(d.events)
             merged.identity_hypotheses.extend(d.identity_hypotheses)
+            merged.camera_frames.extend(d.camera_frames)
         return merged

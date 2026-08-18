@@ -8,13 +8,31 @@ import sqlite3
 import struct
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+
+def parse_utc_datetime(value: Any) -> datetime:
+    """Parse a datetime that may arrive as a datetime, ISO string, or None.
+
+    Historical/backfilled evidence carries its original observation time
+    (e.g. ``captured_at`` from SQLite, which round-trips as text) — this
+    must not be confused with the wall-clock time OCR processing happens.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif value:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    else:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +194,8 @@ class OcrRefinementPolicy:
 
     local_confidence_threshold: float = 0.72
     min_text_length_for_refinement: int = 6
+    disagreement_threshold: float = 0.20
+    short_text_vlm_confirm_length: int = 8
     max_refinements_per_minute: int = 20
     _refinement_count: int = field(default=0, repr=False)
     _window_start: float = field(default=-1.0, repr=False)
@@ -185,8 +205,19 @@ class OcrRefinementPolicy:
         local_confidence: float,
         local_text: str,
         now: float | None = None,
+        *,
+        explicit_read_request: bool = False,
+        vlm_text_positive: bool = False,
+        local_disagreement: float = 0.0,
+        dynamic_display: bool = False,
     ) -> bool:
-        """Return True if local result is below quality threshold and budget allows."""
+        """Return True if the local result warrants Omnius refinement.
+
+        Text length is a cost heuristic, not an epistemic gate: short,
+        low-confidence reads (signage like "STOP" or "EXIT", room numbers)
+        are exactly the kind of result that benefits most from refinement,
+        so length alone must never suppress an otherwise-warranted escalation.
+        """
         now = now if now is not None else time.monotonic()
         if self._window_start < 0:
             object.__setattr__(self, "_window_start", now)
@@ -195,6 +226,16 @@ class OcrRefinementPolicy:
             object.__setattr__(self, "_window_start", now)
         if self._refinement_count >= self.max_refinements_per_minute:
             return False
+
+        if explicit_read_request:
+            return True
+        if local_disagreement > self.disagreement_threshold:
+            return True
+        if vlm_text_positive and len(local_text) <= self.short_text_vlm_confirm_length:
+            return True
+        if dynamic_display:
+            return local_confidence < self.local_confidence_threshold
+
         if len(local_text) < self.min_text_length_for_refinement:
             return False
         return local_confidence < self.local_confidence_threshold
@@ -216,6 +257,7 @@ class OcrJob:
     observed_at: datetime
     source_scope: str
     parent_id: str
+    source_evidence_id: str | None = None
     status: str = "pending"
     local_text: str | None = None
     local_confidence: float | None = None
@@ -263,9 +305,18 @@ class OcrJobLedger:
                 completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ocr_jobs_status ON ocr_jobs(status);
-            CREATE INDEX IF NOT EXISTS idx_ocr_jobs_phash ON ocr_jobs(image_phash, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_ocr_jobs_phash ON ocr_jobs(image_phash, parent_id, observed_at);
             CREATE INDEX IF NOT EXISTS idx_ocr_jobs_camera ON ocr_jobs(camera_id, observed_at);
             """
+        )
+        existing_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(ocr_jobs)").fetchall()
+        }
+        if "source_evidence_id" not in existing_columns:
+            self._conn.execute("ALTER TABLE ocr_jobs ADD COLUMN source_evidence_id TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocr_jobs_source_evidence "
+            "ON ocr_jobs(source_evidence_id)"
         )
         self._conn.commit()
 
@@ -276,14 +327,26 @@ class OcrJobLedger:
         observed_at: datetime,
         source_scope: str,
         parent_id: str,
+        source_evidence_id: str | None = None,
     ) -> OcrJob | None:
-        """Create a job if no identical phash was processed recently (idempotent)."""
+        """Create a job if the same target/region was seen with an identical
+        phash recently (idempotent).
+
+        Scoping by ``parent_id`` in addition to phash matters: without it, a
+        phash collision between two unrelated targets (different objects,
+        different cameras) would silently skip a job for a target that was
+        never actually processed.
+        """
         if image_phash is not None:
             row = self._conn.execute(
                 "SELECT job_id FROM ocr_jobs "
-                "WHERE image_phash = ? AND observed_at > ? AND status != 'failed' "
+                "WHERE image_phash = ? AND parent_id = ? AND observed_at > ? "
+                "AND status != 'failed' "
                 "ORDER BY observed_at DESC LIMIT 1",
-                (image_phash, (observed_at - __import__("datetime").timedelta(seconds=300)).isoformat()),
+                (
+                    image_phash, parent_id,
+                    (observed_at - timedelta(seconds=300)).isoformat(),
+                ),
             ).fetchone()
             if row is not None:
                 return None
@@ -292,15 +355,20 @@ class OcrJobLedger:
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             "INSERT INTO ocr_jobs "
-            "(job_id, camera_id, image_phash, observed_at, source_scope, parent_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (job_id, camera_id, image_phash, observed_at.isoformat(), source_scope, parent_id, now),
+            "(job_id, camera_id, image_phash, observed_at, source_scope, parent_id, "
+            "source_evidence_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                job_id, camera_id, image_phash, observed_at.isoformat(),
+                source_scope, parent_id, source_evidence_id, now,
+            ),
         )
         self._conn.commit()
         return OcrJob(
             job_id=job_id,
             camera_id=camera_id,
             image_phash=image_phash,
+            source_evidence_id=source_evidence_id,
             observed_at=observed_at,
             source_scope=source_scope,
             parent_id=parent_id,
@@ -308,7 +376,8 @@ class OcrJobLedger:
 
     def dequeue_pending(self, limit: int = 4) -> list[OcrJob]:
         rows = self._conn.execute(
-            "SELECT job_id, camera_id, image_phash, observed_at, source_scope, parent_id "
+            "SELECT job_id, camera_id, image_phash, observed_at, source_scope, parent_id, "
+            "source_evidence_id "
             "FROM ocr_jobs WHERE status = 'pending' ORDER BY observed_at ASC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -316,7 +385,7 @@ class OcrJobLedger:
             OcrJob(
                 job_id=r[0], camera_id=r[1], image_phash=r[2],
                 observed_at=datetime.fromisoformat(r[3]),
-                source_scope=r[4], parent_id=r[5],
+                source_scope=r[4], parent_id=r[5], source_evidence_id=r[6],
             )
             for r in rows
         ]
@@ -427,8 +496,9 @@ class OcrBackfillScheduler:
                 "WHERE e.modality = 'vision' "
                 "AND e.media_key IS NOT NULL "
                 "AND e.evidence_id NOT IN ("
-                "  SELECT DISTINCT json_extract(e2.payload_json, '$.metadata.parent_id') "
-                "  FROM evidence e2 WHERE e2.modality = 'ocr'"
+                "  SELECT DISTINCT json_extract(e2.payload_json, '$.source_evidence_id') "
+                "  FROM evidence e2 WHERE e2.modality = 'ocr' "
+                "  AND json_extract(e2.payload_json, '$.source_evidence_id') IS NOT NULL"
                 ") "
                 "ORDER BY e.captured_at DESC LIMIT ?",
                 (limit,),
@@ -451,8 +521,9 @@ class OcrBackfillScheduler:
                 "WHERE e.modality = 'vision' "
                 "AND e.media_key IS NOT NULL "
                 "AND e.evidence_id NOT IN ("
-                "  SELECT DISTINCT json_extract(e2.payload_json, '$.metadata.parent_id') "
-                "  FROM evidence e2 WHERE e2.modality = 'ocr'"
+                "  SELECT DISTINCT json_extract(e2.payload_json, '$.source_evidence_id') "
+                "  FROM evidence e2 WHERE e2.modality = 'ocr' "
+                "  AND json_extract(e2.payload_json, '$.source_evidence_id') IS NOT NULL"
                 ")"
             ).fetchone()
             return int(row[0]) if row else 0
@@ -476,8 +547,9 @@ class OcrBackfillScheduler:
                 "WHERE e.modality = 'vision' "
                 "AND e.media_key IS NOT NULL "
                 "AND e.evidence_id NOT IN ("
-                "  SELECT DISTINCT json_extract(e2.payload_json, '$.metadata.parent_id') "
-                "  FROM evidence e2 WHERE e2.modality = 'ocr'"
+                "  SELECT DISTINCT json_extract(e2.payload_json, '$.source_evidence_id') "
+                "  FROM evidence e2 WHERE e2.modality = 'ocr' "
+                "  AND json_extract(e2.payload_json, '$.source_evidence_id') IS NOT NULL"
                 ") "
                 "ORDER BY e.captured_at DESC LIMIT ? OFFSET ?",
                 (limit, offset),

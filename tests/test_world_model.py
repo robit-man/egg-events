@@ -905,6 +905,72 @@ class TestWorldStateStoreProperty:
         assert explanation["evidence_ids"] == ["ev:1"]
 
 
+class TestWorldStatePruning:
+    """Prune paths must use real epistemic confidence, and any deletion cap
+    must be enforced in SQL — never by slicing a list after rows are already
+    gone, which silently deletes more than the caller asked for."""
+
+    def test_prune_low_confidence_uses_confidence_column_not_label_json(self, db):
+        """A JSON label string like "mug" cast as REAL is 0.0 in SQLite —
+        the old query computed MAX(CAST(value_json AS REAL)) over the
+        'label' property, which made every entity look like confidence 0.0
+        regardless of its real confidence and pruned it incorrectly."""
+        state = WorldStateStore(db)
+        state.upsert_property(
+            "det:mug-1", "label",
+            TypedValue(raw="mug", value_type=ValueType.STRING),
+            0.91, 0.8, "assert:1", (), "observation", utcnow().isoformat(),
+        )
+        pruned = state.prune_low_confidence(entity_prefix="det:", max_confidence=0.4)
+        assert pruned == []
+        assert state.get_property("det:mug-1", "label") is not None
+
+    def test_prune_low_confidence_still_prunes_genuinely_low_confidence(self, db):
+        state = WorldStateStore(db)
+        state.upsert_property(
+            "det:blur-1", "label",
+            TypedValue(raw="unknown", value_type=ValueType.STRING),
+            0.10, 0.3, "assert:1", (), "observation", utcnow().isoformat(),
+        )
+        pruned = state.prune_low_confidence(entity_prefix="det:", max_confidence=0.4)
+        assert pruned == ["det:blur-1"]
+        assert state.get_property("det:blur-1", "label") is None
+
+    def test_prune_stale_entities_limit_is_enforced_in_sql(self, db):
+        state = WorldStateStore(db)
+        old = "2020-01-01T00:00:00+00:00"
+        for i in range(5):
+            state.upsert_property(
+                f"det:stale-{i}", "label",
+                TypedValue(raw=f"thing-{i}", value_type=ValueType.STRING),
+                0.1, 0.3, f"assert:{i}", (), "observation", old,
+            )
+        pruned = state.prune_stale_entities(
+            stale_before="2099-01-01T00:00:00+00:00",
+            entity_prefix="det:", min_confidence=0.9, limit=2,
+        )
+        # The whole point of `limit`: it bounds actual deletions, not just
+        # the returned list — re-querying confirms only 2 rows are gone.
+        assert len(pruned) == 2
+        assert state.entity_count("det:") == 3
+
+    def test_prune_stale_entities_without_limit_deletes_all_matches(self, db):
+        state = WorldStateStore(db)
+        old = "2020-01-01T00:00:00+00:00"
+        for i in range(3):
+            state.upsert_property(
+                f"det:stale-{i}", "label",
+                TypedValue(raw=f"thing-{i}", value_type=ValueType.STRING),
+                0.1, 0.3, f"assert:{i}", (), "observation", old,
+            )
+        pruned = state.prune_stale_entities(
+            stale_before="2099-01-01T00:00:00+00:00",
+            entity_prefix="det:", min_confidence=0.9,
+        )
+        assert len(pruned) == 3
+        assert state.entity_count("det:") == 0
+
+
 class TestCorrelationAwareConfidence:
     """Test that correlation groups affect confidence aggregation."""
 
@@ -1425,6 +1491,60 @@ class TestSafeZonePolicyTarget:
         safe_zone_violations = [v for v in violations if v.rule_id == "safe_zone"]
         assert len(safe_zone_violations) == 0
 
+    def test_does_not_false_positive_on_substring_match(self, db):
+        """A target whose id merely *contains* a safe-zone name as a
+        substring (but isn't actually located there) must not be blocked —
+        e.g. "object:egg_bedspread" is not "egg_bed"."""
+        from egg_companion.world.policy import PolicyValidator
+        from egg_companion.world.types import ActionProposal
+        validator = PolicyValidator(db)
+        proposal = ActionProposal(
+            proposal_id="prop:xyz",
+            action_type="move_object",
+            target_entity_ids=("object:egg_bedspread",),
+        )
+        violations = validator.validate(proposal)
+        safe_zone_violations = [v for v in violations if v.rule_id == "safe_zone"]
+        assert len(safe_zone_violations) == 0
+
+    def test_blocks_target_located_in_zone_via_world_relations(self, db):
+        """A target that is transitively located_in a safe-zone entity
+        (per materialized world state) must be blocked even though its
+        own id has nothing to do with the zone name."""
+        from egg_companion.world.policy import PolicyValidator
+        from egg_companion.world.types import ActionProposal
+
+        state = WorldStateStore(db)
+        state.upsert_relation(
+            "object:small-toy", "located_in", "zone:egg_bed",
+            0.9, 0.8, "assert:1", (), "observation", utcnow().isoformat(),
+        )
+        validator = PolicyValidator(db)
+        proposal = ActionProposal(
+            proposal_id="prop:xyz",
+            action_type="move_object",
+            target_entity_ids=("object:small-toy",),
+        )
+        violations = validator.validate(proposal)
+        safe_zone_violations = [v for v in violations if v.rule_id == "safe_zone"]
+        assert len(safe_zone_violations) > 0
+
+    def test_missing_world_tables_fail_open_to_no_violation(self, db):
+        """Standalone PolicyValidator usage without WorldStateStore tables
+        on the connection must not crash — it just can't determine
+        location, so it can't claim the target is in a zone."""
+        from egg_companion.world.policy import PolicyValidator
+        from egg_companion.world.types import ActionProposal
+        validator = PolicyValidator(db)
+        proposal = ActionProposal(
+            proposal_id="prop:xyz",
+            action_type="move_object",
+            target_entity_ids=("object:whatever",),
+        )
+        violations = validator.validate(proposal)
+        safe_zone_violations = [v for v in violations if v.rule_id == "safe_zone"]
+        assert len(safe_zone_violations) == 0
+
 
 class TestContextWindowRanking:
     """Test that build_window prioritizes focus_entity."""
@@ -1493,24 +1613,32 @@ class TestTypedPredictions:
 
 
 class TestObservabilityTransitions:
-    """Test that missing entities get OBSERVED_ABSENT."""
+    """OBSERVED_ABSENT requires comparison against prior materialized state
+    (what was this camera seeing before?), which only the reconciler has —
+    the normalizer converts a single event and has no state to compare
+    against, so it must never guess absence from event-local data alone.
+    """
 
-    def test_absent_entity_emitted(self):
+    @staticmethod
+    def _vision_event(detections):
         from unittest.mock import MagicMock
-        from egg_companion.world.normalize import ObservationNormalizer
-        from egg_companion.world.types import ObservabilityState
-        normalizer = ObservationNormalizer()
-
         event = MagicMock()
         event.event_type = "vision"
         event.source_id = "vision:cam0"
         event.occurred_at = utcnow()
-        event.payload = {
-            "detections": [
-                {"entity_id": "e1", "label": "person", "confidence": 0.9,
-                 "bbox": [0, 0, 100, 100]}
-            ]
-        }
+        event.payload = {"detections": detections}
+        event.entity_ids = ()
+        return event
+
+    def test_normalizer_alone_does_not_infer_absence(self):
+        from egg_companion.world.normalize import ObservationNormalizer
+        from egg_companion.world.types import ObservabilityState
+        normalizer = ObservationNormalizer()
+
+        event = self._vision_event([
+            {"entity_id": "e1", "label": "person", "confidence": 0.9,
+             "bbox": [0, 0, 100, 100]},
+        ])
         event.entity_ids = ("e1", "e2")  # e2 was expected but not detected
 
         delta = normalizer.normalize_event(event, evidence_ids=("ev:1",))
@@ -1519,4 +1647,45 @@ class TestObservabilityTransitions:
             if a.get("property_id") == "observability"
         ]
         assert ObservabilityState.OBSERVED_PRESENT.value in obs_values
-        assert ObservabilityState.OBSERVED_ABSENT.value in obs_values
+        assert ObservabilityState.OBSERVED_ABSENT.value not in obs_values
+
+    def test_reconciler_emits_absent_when_camera_stops_seeing_entity(self, world_stores):
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+
+        frame1 = self._vision_event([
+            {"entity_id": "e1", "label": "person", "confidence": 0.9, "bbox": [0, 0, 10, 10]},
+            {"entity_id": "e2", "label": "person", "confidence": 0.9, "bbox": [20, 20, 30, 30]},
+        ])
+        reconciler.ingest(normalizer.normalize_event(frame1, evidence_ids=("ev:1",)))
+        assert json.loads(state.get_property("e1", "observability").value_json) == "observed_present"
+        assert json.loads(state.get_property("e2", "observability").value_json) == "observed_present"
+
+        # Second frame from the same camera no longer sees e2.
+        frame2 = self._vision_event([
+            {"entity_id": "e1", "label": "person", "confidence": 0.9, "bbox": [0, 0, 10, 10]},
+        ])
+        reconciler.ingest(normalizer.normalize_event(frame2, evidence_ids=("ev:2",)))
+        assert json.loads(state.get_property("e1", "observability").value_json) == "observed_present"
+        assert json.loads(state.get_property("e2", "observability").value_json) == "observed_absent"
+
+    def test_reconciler_reinstates_present_after_absence(self, world_stores):
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+
+        seen = self._vision_event([
+            {"entity_id": "e1", "label": "person", "confidence": 0.9, "bbox": [0, 0, 10, 10]},
+        ])
+        reconciler.ingest(normalizer.normalize_event(seen, evidence_ids=("ev:1",)))
+
+        gone = self._vision_event([])
+        reconciler.ingest(normalizer.normalize_event(gone, evidence_ids=("ev:2",)))
+        assert json.loads(state.get_property("e1", "observability").value_json) == "observed_absent"
+
+        back = self._vision_event([
+            {"entity_id": "e1", "label": "person", "confidence": 0.9, "bbox": [0, 0, 10, 10]},
+        ])
+        reconciler.ingest(normalizer.normalize_event(back, evidence_ids=("ev:3",)))
+        assert json.loads(state.get_property("e1", "observability").value_json) == "observed_present"

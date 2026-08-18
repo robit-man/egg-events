@@ -8,6 +8,7 @@ from egg_companion.ocr.jobs import (
     OcrReadinessTracker,
     OcrRefinementPolicy,
     image_phash,
+    parse_utc_datetime,
     should_skip_dedup,
 )
 from egg_companion.ocr.resolve import (
@@ -24,6 +25,7 @@ __all__ = [
     "OcrRefinementPolicy",
     "OcrResolution",
     "image_phash",
+    "parse_utc_datetime",
     "resolve_text_observations",
     "should_skip_dedup",
 ]

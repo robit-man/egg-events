@@ -128,14 +128,14 @@ class PolicyValidator:
             if "safe_zones" in conditions:
                 safe_zones = conditions["safe_zones"]
                 for target_id in proposal.target_entity_ids:
-                    for zone in safe_zones:
-                        if zone in target_id:
-                            violations.append(PolicyViolation(
-                                rule_id=rule_id, rule_name=name,
-                                proposal_id=proposal.proposal_id,
-                                reason=f"Target entity '{target_id}' is in safe zone '{zone}'",
-                                blocked=bool(block),
-                            ))
+                    zone = self._located_in_zone(target_id, safe_zones)
+                    if zone is not None:
+                        violations.append(PolicyViolation(
+                            rule_id=rule_id, rule_name=name,
+                            proposal_id=proposal.proposal_id,
+                            reason=f"Target entity '{target_id}' is located_in safe zone '{zone}'",
+                            blocked=bool(block),
+                        ))
             if require_approval:
                 violations.append(PolicyViolation(
                     rule_id=rule_id, rule_name=name,
@@ -144,6 +144,54 @@ class PolicyValidator:
                     blocked=False,
                 ))
         return violations
+
+    def _located_in_zone(
+        self, entity_id: str, safe_zones: list[str], max_depth: int = 5
+    ) -> str | None:
+        """Return the first safe zone entity_id is transitively located_in.
+
+        Walks ``located_in`` edges in the materialized world state rather
+        than substring-matching the zone name against the entity id — an
+        entity named e.g. "object:egg_bedspread" must never be treated as
+        being inside the "egg_bed" zone just because the string appears in
+        its id.
+        """
+
+        def matches(candidate: str) -> str | None:
+            for zone in safe_zones:
+                if candidate == zone or candidate.endswith(f":{zone}"):
+                    return zone
+            return None
+
+        with self._lock:
+            visited: set[str] = set()
+            frontier = [entity_id]
+            for _ in range(max_depth):
+                if not frontier:
+                    break
+                next_frontier: list[str] = []
+                for current in frontier:
+                    if current in visited:
+                        continue
+                    visited.add(current)
+                    zone = matches(current)
+                    if zone is not None:
+                        return zone
+                    try:
+                        rows = self._conn.execute(
+                            "SELECT target_entity_id FROM current_relation_state "
+                            "WHERE source_entity_id = ? AND relation_type_id = 'located_in' "
+                            "AND valid_to IS NULL",
+                            (current,),
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        # World state tables aren't present on this connection
+                        # (e.g. standalone PolicyValidator usage) — without
+                        # location data we can't say the target is in a zone.
+                        return None
+                    next_frontier.extend(row[0] for row in rows)
+                frontier = next_frontier
+        return None
 
     def log_violation(self, violation: PolicyViolation) -> None:
         import datetime

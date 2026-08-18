@@ -76,18 +76,14 @@ class DefaultModeNetwork:
         state = WorldStateStore(self.store.root / "memory.sqlite3")
         pruned_total: list[str] = []
 
-        # 1. Remove contextually impossible entities (hallucinations)
-        pruned_impossible = state.prune_contextually_impossible()
-        pruned_total.extend(pruned_impossible)
-
-        # 2. Remove low-confidence det:* entities
+        # 1. Remove low-confidence det:* entities
         pruned_low_conf = state.prune_low_confidence(
             entity_prefix="det:",
             max_confidence=self._pruning_config.min_confidence,
         )
         pruned_total.extend(pruned_low_conf)
 
-        # 3. Remove stale entities not seen recently
+        # 2. Remove stale entities not seen recently
         stale_cutoff = (
             now.timestamp() - self._pruning_config.stale_after_hours * 3600
         )
@@ -101,23 +97,24 @@ class DefaultModeNetwork:
         )
         pruned_total.extend(pruned_stale)
 
-        # 4. Cap total det:* entities
+        # 3. Cap total det:* entities — the SQL layer enforces the limit
+        # directly so the delete count can never exceed the requested excess.
         det_count = state.entity_count("det:")
+        pruned_cap: list[str] = []
         if det_count > self._pruning_config.max_det_entities:
-            # Remove oldest/lowest-confidence until under cap
             excess = det_count - self._pruning_config.max_det_entities
             pruned_cap = state.prune_stale_entities(
                 stale_before=now.isoformat(),
                 entity_prefix="det:",
                 min_confidence=0.9,
-            )[:excess]
+                limit=excess,
+            )
             pruned_total.extend(pruned_cap)
 
         return {
-            "pruned_impossible": len(pruned_impossible),
             "pruned_low_confidence": len(pruned_low_conf),
             "pruned_stale": len(pruned_stale),
-            "pruned_cap": len(pruned_total) - len(pruned_impossible) - len(pruned_low_conf) - len(pruned_stale),
+            "pruned_cap": len(pruned_cap),
             "total_pruned": len(pruned_total),
             "det_entities_remaining": state.entity_count("det:"),
         }

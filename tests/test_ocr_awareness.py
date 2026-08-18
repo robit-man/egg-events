@@ -166,3 +166,107 @@ def test_ocr_event_persists_parent_content_fragments_and_explicit_relations(tmp_
     assert "co_observed_with" not in relations
     assert any(node["subtype"] == "content" for node in graph["nodes"])
     assert any(node["subtype"] == "ocr" and node["label"] == "WELCOME\nGate 3" for node in graph["nodes"])
+
+
+def test_ocr_event_with_full_payload_reaches_world_model_visible_text(tmp_path) -> None:
+    """End-to-end regression test for the OCR V2 integration bug: an OCR
+    PerceptualEvent shaped like what _queue_ocr_memory actually publishes
+    (text/target_id/confidence/engine/regions, plus the entities/relations
+    used by the associative memory graph) must result in a queryable
+    visible_text property in the operational world model — not just an
+    associative-graph edge."""
+    config = _config(tmp_path)
+    store = MemoryStore(config.memory)
+    pipeline = MemoryPipeline(config, store)
+    now = datetime.now(timezone.utc)
+    evidence = EvidenceRef(
+        "ocr-evidence-2",
+        "ocr",
+        now,
+        "camera-advanced-ocr",
+        "camera-0",
+        quality=0.9,
+        metadata={"text": "ROOM 312", "parent_id": "object-door-sign"},
+    )
+    event = PerceptualEvent(
+        "ocr-event-2",
+        "ocr",
+        now,
+        "camera-0",
+        (evidence,),
+        ("object-door-sign", "content-room312"),
+        payload={
+            "text": "ROOM 312",
+            "target_id": "object-door-sign",
+            "text_type": "static",
+            "ocr_confidence": 0.9,
+            "ocr_engine": "omnius-advanced-ocr",
+            "regions": [],
+            "scope": "frame",
+            "trigger": "scheduled",
+            "labels": ["ocr", "door sign"],
+            "entities": [
+                {"id": "object-door-sign", "type": "object", "label": "door sign", "confidence": 0.9},
+                {"id": "content-room312", "type": "content", "label": "ROOM 312", "confidence": 0.9},
+            ],
+            "relations": [
+                {"source_id": "object-door-sign", "relation": "contains_text", "target_id": "content-room312", "confidence": 0.9},
+            ],
+            "skip_pairwise_co_observation": True,
+        },
+    )
+
+    pipeline._persist_event(event)
+
+    assert pipeline._world_query is not None
+    value = pipeline._world_query.property_value("object-door-sign", "visible_text")
+    assert value == "ROOM 312"
+
+
+def test_vision_event_with_detections_reaches_world_model(tmp_path) -> None:
+    """End-to-end regression test: a live-camera vision PerceptualEvent
+    shaped like what _queue_vision_memory actually publishes (a top-level
+    "detections" list, not just "entities") must populate the operational
+    world model — this is what the ObservationNormalizer's _normalize_
+    visual_event has always required, but the live pipeline never sent it
+    before this fix, so det:* labels never reached current_property_state
+    outside of the one-time startup backfill."""
+    config = _config(tmp_path)
+    store = MemoryStore(config.memory)
+    pipeline = MemoryPipeline(config, store)
+    now = datetime.now(timezone.utc)
+    evidence = EvidenceRef(
+        "vision-evidence-1",
+        "vision",
+        now,
+        "camera",
+        "camera-0",
+        quality=0.9,
+        metadata={"detections": []},
+    )
+    event = PerceptualEvent(
+        "vision-event-1",
+        "vision",
+        now,
+        "camera-0",
+        (evidence,),
+        (),
+        payload={
+            "detections": [
+                {"label": "mug", "confidence": 0.91, "bbox": {"x1": 0, "y1": 0, "x2": 50, "y2": 50}},
+            ],
+            "frame_shape": [480, 640],
+            "labels": ["mug"],
+            "scene_labels": [],
+            "behaviors": [],
+            "boundary_entity_ids": [],
+            "boundary_behaviors": [],
+            "entities": [],
+        },
+    )
+
+    pipeline._persist_event(event)
+
+    assert pipeline._world_query is not None
+    value = pipeline._world_query.property_value("det:mug", "label")
+    assert value == "mug"

@@ -475,7 +475,7 @@ class MemoryPipeline:
             world_conn.execute("PRAGMA foreign_keys=ON")
             
             world_state = WorldStateStore(world_conn)
-            ontology = OntologyRegistry()
+            ontology = OntologyRegistry(world_conn)
             self._world_reconciler = Reconciler(world_conn, world_state, ontology)
             
             world_graph = WorldGraphStore(world_conn)
