@@ -193,6 +193,23 @@ class PolicyValidator:
                 frontier = next_frontier
         return None
 
+    def record_action(self, action_type: str, proposal_id: str) -> None:
+        """Log that an action was actually taken, for max_per_minute limiting.
+
+        validate() reads policy_action_log to enforce frequency rules, but
+        nothing wrote to it — the rule was silently a no-op regardless of
+        how many times an action fired.  Callers should invoke this only
+        for proposals that were not blocked, right before acting on them.
+        """
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO policy_action_log (action_type, proposal_id, recorded_at) VALUES (?, ?, ?)",
+                (action_type, proposal_id, now),
+            )
+            self._conn.commit()
+
     def log_violation(self, violation: PolicyViolation) -> None:
         import datetime
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from egg_companion.config import DefaultModeConfig, EggConfig
@@ -13,6 +14,8 @@ from egg_companion.memory.segmentation import EventSegmenter
 from egg_companion.memory.store import MemoryStore
 from egg_companion.cognition.default_mode import DefaultModeNetwork
 from egg_companion.models import EpisodeDraft, EvidenceRef, PerceptualEvent
+from egg_companion.world.policy import PolicyViolation
+from egg_companion.world.types import ActionExecution, ActionOutcome, ActionProposal
 
 
 class MemoryPipeline:
@@ -43,6 +46,8 @@ class MemoryPipeline:
         self._world_normalizer = None
         self._world_query = None
         self._world_context = None
+        self._action_store = None
+        self._policy_validator = None
         self._ensure_world_model()
 
     @property
@@ -460,6 +465,8 @@ class MemoryPipeline:
             from egg_companion.world.relations import WorldGraphStore
             from egg_companion.world.identity import IdentityGraph
             from egg_companion.world.ontology import OntologyRegistry
+            from egg_companion.world.actions import ActionStore
+            from egg_companion.world.policy import PolicyValidator
             
             # Create world model connection (separate from memory store)
             world_db_path = self.store._read_connection.execute(
@@ -483,6 +490,9 @@ class MemoryPipeline:
             self._world_query = WorldQuery(world_state, world_graph, identity_graph, reconciler=self._world_reconciler)
             self._world_context = CognitiveContext(self._world_query)
             self.context.set_world_context(self._world_context)
+
+            self._action_store = ActionStore(world_conn)
+            self._policy_validator = PolicyValidator(world_conn)
             
             import logging
             logger = logging.getLogger(__name__)
@@ -493,6 +503,74 @@ class MemoryPipeline:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to initialize world model: {e}")
             self._world_reconciler = None
+
+    def propose_action(
+        self,
+        action_type: str,
+        *,
+        inputs: dict[str, object] | None = None,
+        target_entity_ids: tuple[str, ...] = (),
+        source_evidence_ids: tuple[str, ...] = (),
+    ) -> tuple[ActionProposal, list[PolicyViolation]]:
+        """Create, persist, and policy-check an ActionProposal.
+
+        Callers must not act on the proposed effect if any returned
+        violation has ``blocked=True`` — the proposal is recorded either
+        way (accepted proposals feed policy_action_log for frequency
+        limiting; rejected ones stay auditable).  If the world model isn't
+        available, this fails open with no violations, since without a
+        durable ledger there's nothing to check policy against — see
+        record_action_execution for the same failure mode.
+        """
+        self._ensure_world_model()
+        proposal = ActionProposal(
+            proposal_id=f"proposal:{uuid4().hex[:16]}",
+            action_type=action_type,
+            target_entity_ids=tuple(target_entity_ids),
+            inputs=dict(inputs or {}),
+            source_evidence_ids=tuple(source_evidence_ids),
+        )
+        if self._action_store is None or self._policy_validator is None:
+            return proposal, []
+
+        self._action_store.propose(proposal)
+        violations = self._policy_validator.validate(proposal)
+        for violation in violations:
+            self._policy_validator.log_violation(violation)
+        blocked = any(v.blocked for v in violations)
+        if not blocked:
+            self._policy_validator.record_action(action_type, proposal.proposal_id)
+        return proposal, violations
+
+    def record_action_execution(
+        self,
+        proposal_id: str,
+        *,
+        success: bool,
+        result: object = None,
+        evidence_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Record that a proposed action actually ran, and its outcome."""
+        if self._action_store is None:
+            return
+        now = datetime.now(timezone.utc)
+        execution_id = f"execution:{uuid4().hex[:16]}"
+        self._action_store.record_execution(ActionExecution(
+            execution_id=execution_id,
+            proposal_id=proposal_id,
+            started_at=now,
+            completed_at=now,
+            success=success,
+            result=result,
+        ))
+        self._action_store.record_outcome(ActionOutcome(
+            outcome_id=f"outcome:{uuid4().hex[:16]}",
+            execution_id=execution_id,
+            success=success,
+            result=result,
+            evidence_ids=tuple(evidence_ids),
+            observed_at=now,
+        ))
 
     def backfill_world_from_evidence(self, batch_size: int = 500, max_items: int = 0) -> dict[str, object]:
         """Retroactively populate world model from existing evidence store.

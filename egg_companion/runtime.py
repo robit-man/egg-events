@@ -6993,6 +6993,46 @@ class CompanionRuntime:
         return context
 
     async def _speak(self, text: str, expected_revision: int | None = None) -> bool:
+        """Policy-gated entry point for every speech effect in the runtime.
+
+        All ~9 call sites across the codebase (proactive questions,
+        conversational replies, identity acknowledgements, calibration
+        questions, ...) go through here before TTS ever runs.  This is the
+        single real chokepoint for the "speak" / "ask_clarifying_question" /
+        "ask_identity_clarification" action types, so it's the one place
+        that can meaningfully enforce PolicyValidator's rules (destructive
+        action approval, safe-zone restrictions, per-minute frequency caps)
+        against something Egg actually does.
+        """
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return False
+
+        proposal_id: str | None = None
+        if self._memory is not None:
+            proposal, violations = self._memory.propose_action(
+                "speak", inputs={"text": normalized},
+            )
+            blocking = [v for v in violations if v.blocked]
+            if blocking:
+                logger.warning(
+                    "speak blocked by policy: %s",
+                    "; ".join(v.reason for v in blocking),
+                )
+                return False
+            proposal_id = proposal.proposal_id
+
+        spoken = False
+        try:
+            spoken = await self._speak_impl(normalized, expected_revision)
+            return spoken
+        finally:
+            if proposal_id is not None and self._memory is not None:
+                self._memory.record_action_execution(
+                    proposal_id, success=spoken, result=normalized[:200],
+                )
+
+    async def _speak_impl(self, text: str, expected_revision: int | None = None) -> bool:
         normalized = " ".join(text.strip().split())
         if not normalized:
             return False
