@@ -241,13 +241,10 @@ object_learning:
 
 ocr:
   enabled: true
-  # Local multi-pass Tesseract remains available when Omnius OCR/VLM services
-  # are cold or unhealthy. Omnius refinement is opt-in because it shares the
-  # live Ornith model and must never stall the bounded OCR queue.
+  # V2: local and Omnius are independent proposers — VLM negative ≠ OCR negative.
+  # Local provides fast provisional result; Omnius refines per policy.
   local_multipass_enabled: true
-  omnius_refinement_enabled: false
-  # Full-frame visual text regions are spatially grounded to the smallest
-  # overlapping mask; labels never gate OCR admission.
+  omnius_refinement_enabled: true
   full_frame_interval_seconds: 20
   text_object_interval_seconds: 8
   queue_size: 8
@@ -255,6 +252,21 @@ ocr:
   min_text_characters: 2
   max_fragments: 8
   max_region_refinements: 2
+  vlm_text_check_interval: 5.0
+  ledger_db_path: "data/ocr-jobs.sqlite3"
+  refinement:
+    enabled: true
+    local_confidence_threshold: 0.72
+    min_text_length_for_refinement: 6
+    max_refinements_per_minute: 20
+  dedup:
+    enabled: true
+    window_seconds: 300
+    hash_size: 8
+  backfill:
+    enabled: true
+    scan_interval_seconds: 60
+    batch_size: 4
 
 memory:
   enabled: true

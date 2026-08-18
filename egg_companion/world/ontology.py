@@ -321,6 +321,9 @@ _DEFAULT_PROPERTY_TYPES = [
                  volatility="dynamic", stale_after=300.0, decay_model="linear"),
     PropertyType(id="visible_text", value_type=ValueType.STRING, cardinality="one",
                  volatility="dynamic", stale_after=60.0, decay_model="linear"),
+    PropertyType(id="displays_text", value_type=ValueType.STRING, cardinality="one",
+                 volatility="dynamic", stale_after=30.0, decay_model="linear",
+                 description="Dynamic text on screens, monitors, clocks; valid briefly"),
 ]
 
 _DEFAULT_RELATION_TYPES = [

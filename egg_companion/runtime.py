@@ -18,6 +18,17 @@ from uuid import uuid4
 
 import numpy as np
 
+from egg_companion.ocr import (
+    OcrJobLedger,
+    OcrBackfillScheduler,
+    OcrReadiness,
+    OcrReadinessTracker,
+    OcrRefinementPolicy,
+    OcrResolution,
+    image_phash,
+    resolve_text_observations,
+    should_skip_dedup,
+)
 from egg_companion.adapters.audio import (
     ReSpeakerCapture,
     ReSpeakerDirection,
@@ -305,6 +316,24 @@ class CompanionRuntime:
         self._object_candidate_tracks: dict[str, list[dict[str, object]]] = {}
         self._last_ocr_candidate_at: dict[str, float] = {}
         self._ocr_mask_tracks: dict[str, list[dict[str, object]]] = {}
+        self._ocr_readiness = OcrReadinessTracker()
+        self._ocr_refinement = OcrRefinementPolicy(
+            local_confidence_threshold=config.ocr.refinement.local_confidence_threshold,
+            min_text_length_for_refinement=config.ocr.refinement.min_text_length_for_refinement,
+            max_refinements_per_minute=config.ocr.refinement.max_refinements_per_minute,
+        )
+        self._ocr_dedup_seen: dict[str, float] = {}
+        self._ocr_job_ledger: OcrJobLedger | None = None
+        if config.ocr.enabled:
+            try:
+                self._ocr_job_ledger = OcrJobLedger(config.ocr.ledger_db_path)
+            except Exception as error:
+                logger.warning("OCR job ledger unavailable: %s", error)
+        self._ocr_backfill = OcrBackfillScheduler(
+            enabled=config.ocr.backfill.enabled,
+            scan_interval_seconds=config.ocr.backfill.scan_interval_seconds,
+            batch_size=config.ocr.backfill.batch_size,
+        )
         self._last_visual_evidence_at: dict[str, float] = {}
         self._pending_curiosity: _PendingCuriosityQuestion | None = None
         self._curiosity_asked: set[tuple[str, str]] = set()
@@ -436,7 +465,11 @@ class CompanionRuntime:
             }
         else:
             graph = self._memory.knowledge_graph_snapshot(node_limit)
-        graph["ocr"] = self.telemetry.snapshot(self.config).get("ocr", {})
+        graph["ocr"] = {
+            **self.telemetry.snapshot(self.config).get("ocr", {}),
+            "readiness": self._ocr_readiness.snapshot(),
+            "pending_jobs": self._ocr_job_ledger.pending_count() if self._ocr_job_ledger else 0,
+        }
         dream_snapshot = self.dreams.snapshot()
         latest_run = next(
             (
@@ -727,6 +760,7 @@ class CompanionRuntime:
             ("conversation-reasoning", self._reason_about_transcript),
             ("ornith-object-labeler", self._auto_label_objects),
             ("advanced-ocr", self._process_ocr_candidates),
+            ("ocr-backfill", self._backfill_ocr_candidates),
             ("object-review-scheduler", self._object_review_scheduler),
             ("narrative-backfill", self._narrative_backfill_scheduler),
             ("narrative-semantic-dream", self._narrative_semantic_scheduler),
@@ -3147,112 +3181,136 @@ class CompanionRuntime:
             return
         now = time.monotonic()
         frame_key = f"frame:{observation.camera_id}"
-        
-        # VLM-driven text detection: check if there's text in the frame first
-        # This runs more frequently than full OCR but only triggers OCR when text is found
-        vlm_text_check_interval = 5.0  # Check every 5 seconds
         vlm_key = f"vlm_text:{observation.camera_id}"
-        if now - self._last_ocr_candidate_at.get(vlm_key, 0.0) < vlm_text_check_interval:
-            return
-        
-        try:
-            image_png = await asyncio.to_thread(
-                self._encode_ocr_image,
-                frame,
-                None,
-                self.config.ocr.max_image_size,
-            )
-            
-            # Use VLM to detect if there's text in the frame
-            text_detection = await self._omnius.detect_text_in_frame(
-                image_png, observation.camera_id
-            )
-            
-            if text_detection is None or not text_detection.get("has_text"):
-                self._last_ocr_candidate_at[vlm_key] = now
-                return
-            
-            # VLM detected text - now run OCR on the regions
+
+        # --- Path A: VLM text detection (independent proposer) ---
+        # Runs every vlm_text_check_interval seconds. VLM negative does NOT
+        # prevent the frame path from running — they are independent.
+        vlm_should_run = (
+            now - self._last_ocr_candidate_at.get(vlm_key, 0.0)
+            >= self.config.ocr.vlm_text_check_interval
+        )
+        if vlm_should_run and self._ocr_readiness.can_use_omnius:
             self._last_ocr_candidate_at[vlm_key] = now
-            self.telemetry.record_ocr(
-                "vlm_text_detected",
-                f"{observation.camera_id}:{len(text_detection.get('text_regions', []))} regions"
-            )
-            
-            # Build targets from VLM-detected text regions
-            targets: list[_OcrTarget] = []
-            for detection in observation.detections:
-                object_id = detection.attributes.get("object_id")
-                identity_id = detection.attributes.get("identity_id")
-                parent_id = str(
-                    object_id
-                    or identity_id
-                    or self._ocr_parent_for_detection(
-                        observation.camera_id, detection, now
+            try:
+                image_png = await asyncio.to_thread(
+                    self._encode_ocr_image, frame, None, self.config.ocr.max_image_size,
+                )
+                text_detection = await self._omnius.detect_text_in_frame(
+                    image_png, observation.camera_id,
+                )
+                if text_detection is not None and text_detection.get("has_text"):
+                    self._ocr_readiness.note_omnius_success()
+                    self.telemetry.record_ocr(
+                        "vlm_text_detected",
+                        f"{observation.camera_id}:{len(text_detection.get('text_regions', []))} regions",
                     )
-                )
-                targets.append(
-                    _OcrTarget(
-                        parent_id,
-                        (
-                            "object"
-                            if object_id
-                            else "person"
-                            if identity_id
-                            and detection.attributes.get("identity_persistent")
-                            else "appearance_track"
-                            if identity_id
-                            else "object_category"
-                        ),
-                        str(detection.attributes.get("identity") or detection.label),
-                        float(
-                            detection.attributes.get("identity_confidence")
-                            or detection.confidence
-                        ),
-                        (
-                            float(detection.bbox.x1),
-                            float(detection.bbox.y1),
-                            float(detection.bbox.x2),
-                            float(detection.bbox.y2),
-                        ),
-                        tuple(
-                            (float(point[0]), float(point[1]))
-                            for point in detection.attributes.get("mask_polygon", ())
-                            if isinstance(point, (list, tuple)) and len(point) >= 2
-                        ),
+                    targets = self._build_ocr_targets(observation, now)
+                    try:
+                        self._ocr_candidates.put_nowait(
+                            _OcrCandidate(
+                                observation.camera_id, image_png, observation.timestamp,
+                                "vlm_text", f"scene:{observation.camera_id}",
+                                "object_category", f"{observation.camera_id} scene",
+                                0.7, source_size=(int(frame.shape[1]), int(frame.shape[0])),
+                                targets=tuple(targets), trigger="vlm-text-detection",
+                                vlm_text_regions=text_detection.get("text_regions", []),
+                            )
+                        )
+                    except asyncio.QueueFull:
+                        pass
+                else:
+                    self.telemetry.record_ocr(
+                        "vlm_text_absent",
+                        f"{observation.camera_id}:no text regions",
                     )
-                )
-            
-            # Queue OCR with VLM-detected text regions
-            self._ocr_candidates.put_nowait(
-                _OcrCandidate(
-                    observation.camera_id,
-                    image_png,
-                    observation.timestamp,
-                    "vlm_text",
-                    f"scene:{observation.camera_id}",
-                    "object_category",
-                    f"{observation.camera_id} scene",
-                    0.7,  # Higher confidence since VLM detected text
-                    source_size=(int(frame.shape[1]), int(frame.shape[0])),
-                    targets=tuple(targets),
-                    trigger="vlm-text-detection",
-                    vlm_text_regions=text_detection.get("text_regions", []),
-                )
-            )
-        except asyncio.QueueFull:
-            return
-        except Exception as error:
-            self.telemetry.record_ocr("error", error)
-            self.telemetry.record_runtime_error("ocr-vlm-detect", error)
-            return
-        
-        # Also queue standard OCR at reduced rate for completeness
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._ocr_readiness.note_omnius_failure()
+                self.telemetry.record_ocr("error", error)
+                self.telemetry.record_runtime_error("ocr-vlm-detect", error)
+
+        # --- Path B: Scheduled full-frame OCR (independent proposer) ---
+        # Runs every full_frame_interval_seconds. Always runs regardless
+        # of VLM result — VLM negative ≠ OCR negative.
         if now - self._last_ocr_candidate_at.get(frame_key, 0.0) < (
             self._activity.scaled_interval(self.config.ocr.full_frame_interval_seconds, now)
         ):
             return
         self._last_ocr_candidate_at[frame_key] = now
+        targets = self._build_ocr_targets(observation, now)
+        try:
+            image_png = await asyncio.to_thread(
+                self._encode_ocr_image, frame, None, self.config.ocr.max_image_size,
+            )
+            # Dedup check — skip if identical image was OCR'd recently
+            phash = image_phash(image_png, self.config.ocr.dedup.hash_size)
+            if self.config.ocr.dedup.enabled and should_skip_dedup(
+                phash, self._ocr_dedup_seen,
+                self.config.ocr.dedup.window_seconds, now,
+            ):
+                self.telemetry.record_ocr("dedup_skip", observation.camera_id)
+                return
+            self._ocr_candidates.put_nowait(
+                _OcrCandidate(
+                    observation.camera_id, image_png, observation.timestamp,
+                    "frame", f"scene:{observation.camera_id}",
+                    "object_category", f"{observation.camera_id} scene",
+                    0.55, source_size=(int(frame.shape[1]), int(frame.shape[0])),
+                    targets=tuple(targets), trigger="visual-text-region-proposal",
+                )
+            )
+        except asyncio.QueueFull:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.telemetry.record_ocr("error", error)
+            self.telemetry.record_runtime_error("ocr-prepare", error)
+            return
+        self.telemetry.record_ocr(
+            "queued", f"{observation.camera_id}:frame:{len(targets)} masks"
+        )
+
+    def _ocr_parent_for_detection(
+        self, camera_id: str, detection: Detection, now: float
+    ) -> str:
+        """Assign OCR to a stable detected mask instead of a shared label node."""
+        tracks = [
+            track
+            for track in self._ocr_mask_tracks.get(camera_id, ())
+            if now - float(track["last_seen"]) <= 30.0
+        ]
+        normalized_label = self._identifier_fragment(detection.label)
+        compatible = [
+            track
+            for track in tracks
+            if track.get("label") == normalized_label
+        ]
+        match = max(
+            compatible,
+            key=lambda track: self._bbox_iou(detection.bbox, track["bbox"]),
+            default=None,
+        )
+        if match is None or self._bbox_iou(detection.bbox, match["bbox"]) < 0.30:
+            match = {
+                "id": f"visual-mask:{camera_id}:{uuid4().hex[:16]}",
+                "label": normalized_label,
+                "bbox": detection.bbox,
+                "last_seen": now,
+            }
+            tracks.append(match)
+        else:
+            match["bbox"] = detection.bbox
+            match["last_seen"] = now
+        self._ocr_mask_tracks[camera_id] = tracks[-48:]
+        return str(match["id"])
+
+    def _build_ocr_targets(
+        self, observation: Observation, now: float
+    ) -> list[_OcrTarget]:
+        """Build OCR targets from observation detections."""
         targets: list[_OcrTarget] = []
         for detection in observation.detections:
             object_id = detection.attributes.get("object_id")
@@ -3295,71 +3353,7 @@ class CompanionRuntime:
                     ),
                 )
             )
-        try:
-            image_png = await asyncio.to_thread(
-                self._encode_ocr_image,
-                frame,
-                None,
-                self.config.ocr.max_image_size,
-            )
-            self._ocr_candidates.put_nowait(
-                _OcrCandidate(
-                    observation.camera_id,
-                    image_png,
-                    observation.timestamp,
-                    "frame",
-                    f"scene:{observation.camera_id}",
-                    "object_category",
-                    f"{observation.camera_id} scene",
-                    0.55,
-                    source_size=(int(frame.shape[1]), int(frame.shape[0])),
-                    targets=tuple(targets),
-                    trigger="visual-text-region-proposal",
-                )
-            )
-        except asyncio.QueueFull:
-            return
-        except Exception as error:
-            self.telemetry.record_ocr("error", error)
-            self.telemetry.record_runtime_error("ocr-prepare", error)
-            return
-        self.telemetry.record_ocr(
-            "queued", f"{observation.camera_id}:frame:{len(targets)} masks"
-        )
-
-    def _ocr_parent_for_detection(
-        self, camera_id: str, detection: Detection, now: float
-    ) -> str:
-        """Assign OCR to a stable detected mask instead of a shared label node."""
-        tracks = [
-            track
-            for track in self._ocr_mask_tracks.get(camera_id, ())
-            if now - float(track["last_seen"]) <= 30.0
-        ]
-        normalized_label = self._identifier_fragment(detection.label)
-        compatible = [
-            track
-            for track in tracks
-            if track.get("label") == normalized_label
-        ]
-        match = max(
-            compatible,
-            key=lambda track: self._bbox_iou(detection.bbox, track["bbox"]),
-            default=None,
-        )
-        if match is None or self._bbox_iou(detection.bbox, match["bbox"]) < 0.30:
-            match = {
-                "id": f"visual-mask:{camera_id}:{uuid4().hex[:16]}",
-                "label": normalized_label,
-                "bbox": detection.bbox,
-                "last_seen": now,
-            }
-            tracks.append(match)
-        else:
-            match["bbox"] = detection.bbox
-            match["last_seen"] = now
-        self._ocr_mask_tracks[camera_id] = tracks[-48:]
-        return str(match["id"])
+        return targets
 
     @staticmethod
     def _identifier_fragment(value: str) -> str:
@@ -3705,23 +3699,85 @@ class CompanionRuntime:
         }
 
     async def _run_advanced_ocr(self, image_png: bytes) -> dict[str, object] | None:
-        if self.config.ocr.local_multipass_enabled:
-            local = await asyncio.to_thread(self._local_advanced_ocr, image_png)
-            if local is not None:
-                return local
-        if not self.config.ocr.omnius_refinement_enabled:
-            return None
-        scratch_path = (
-            Path(self.config.object_learning.storage_dir)
-            / ".ocr-scratch"
-            / f"{uuid4().hex}.png"
+        """Run both local and Omnius OCR independently, return combined result.
+
+        Local provides a fast provisional result. Omnius refines per policy.
+        Both engines are tried when available — neither gates the other.
+        """
+        local_result: dict[str, object] | None = None
+        omnius_result: dict[str, object] | None = None
+
+        # Always try local first (fast, synchronous)
+        if self.config.ocr.local_multipass_enabled and self._ocr_readiness.can_use_local:
+            try:
+                local_result = await asyncio.to_thread(self._local_advanced_ocr, image_png)
+                if local_result is not None:
+                    self._ocr_readiness.note_local_success()
+                else:
+                    self.telemetry.record_ocr("local_empty")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._ocr_readiness.note_local_failure()
+                self.telemetry.record_ocr("error", error)
+
+        # Always try Omnius when refinement is enabled and readiness allows
+        if (
+            self.config.ocr.omnius_refinement_enabled
+            and self._ocr_readiness.can_use_omnius
+        ):
+            # Determine if refinement is needed based on local result
+            local_conf = float(local_result.get("confidence", 0.0)) if local_result else 0.0
+            local_text = str(local_result.get("text") or "") if local_result else ""
+            needs_refinement = (
+                local_result is None
+                or self._ocr_refinement.needs_refinement(local_conf, local_text)
+            )
+            if needs_refinement:
+                scratch_path = (
+                    Path(self.config.object_learning.storage_dir)
+                    / ".ocr-scratch"
+                    / f"{uuid4().hex}.png"
+                )
+                await asyncio.to_thread(scratch_path.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(scratch_path.write_bytes, image_png)
+                try:
+                    omnius_result = await self._omnius.ocr_advanced(str(scratch_path))
+                    if omnius_result is not None:
+                        self._ocr_readiness.note_omnius_success()
+                        self._ocr_refinement.record_refinement()
+                    else:
+                        self.telemetry.record_ocr("omnius_empty")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self._ocr_readiness.note_omnius_failure()
+                    self.telemetry.record_ocr("error", error)
+                finally:
+                    await asyncio.to_thread(scratch_path.unlink, missing_ok=True)
+
+        # Merge via resolution layer
+        resolution = resolve_text_observations(
+            local_result, omnius_result,
+            confidence_threshold=self._ocr_refinement.local_confidence_threshold,
         )
-        await asyncio.to_thread(scratch_path.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(scratch_path.write_bytes, image_png)
-        try:
-            return await self._omnius.ocr_advanced(str(scratch_path))
-        finally:
-            await asyncio.to_thread(scratch_path.unlink, missing_ok=True)
+        if resolution is None:
+            return None
+
+        return {
+            "text": resolution.text,
+            "confidence": resolution.confidence,
+            "engine": resolution.engine,
+            "regions": list(resolution.regions),
+            "vision_used": bool(omnius_result and omnius_result.get("vision_used")),
+            "image_size": list(resolution.image_size) if resolution.image_size else None,
+            "local_text": resolution.local_text,
+            "local_confidence": resolution.local_confidence,
+            "local_engine": resolution.local_engine,
+            "omnius_text": resolution.omnius_text,
+            "omnius_confidence": resolution.omnius_confidence,
+            "source_count": resolution.source_count,
+        }
 
     async def _process_ocr_candidates(self) -> None:
         while True:
@@ -3729,12 +3785,24 @@ class CompanionRuntime:
             self.telemetry.record_ocr(
                 "request", f"{candidate.camera_id}:{candidate.scope}:{candidate.parent_label}"
             )
+            # Probe readiness if due
+            if self._ocr_readiness.should_probe():
+                self._ocr_readiness.record_probe()
+                if self.config.ocr.local_multipass_enabled:
+                    try:
+                        test = await asyncio.to_thread(
+                            self._local_advanced_ocr, candidate.image_png,
+                        )
+                        if test is not None:
+                            self._ocr_readiness.note_local_success()
+                    except Exception:
+                        self._ocr_readiness.note_local_failure()
             try:
                 if candidate.scope == "vlm_text" and candidate.vlm_text_regions:
                     result = await self._ocr_vlm_detected_regions(candidate)
                 elif candidate.scope == "frame":
                     result = await asyncio.to_thread(
-                        self._local_text_region_proposals, candidate.image_png
+                        self._local_text_region_proposals, candidate.image_png,
                     )
                 else:
                     result = await self._run_advanced_ocr(candidate.image_png)
@@ -3784,6 +3852,7 @@ class CompanionRuntime:
                     "engine": result.get("engine", "omnius-advanced-ocr"),
                     "confidence": result.get("confidence"),
                     "regions": result.get("regions", []),
+                    "source_count": result.get("source_count", 1),
                 },
             )
             self._queue_ocr_memory(candidate, text, result)
@@ -3871,6 +3940,76 @@ class CompanionRuntime:
             "vlm_region_count": len(all_regions),
             "image_size": [frame_w, frame_h],
         }
+
+    async def _backfill_ocr_candidates(self) -> None:
+        """Scan retained visual evidence for unprocessed text and queue OCR jobs."""
+        while True:
+            await asyncio.sleep(5.0)
+            if not self._ocr_backfill.should_scan():
+                continue
+            if self._memory is None or self._ocr_job_ledger is None:
+                continue
+            self._ocr_backfill.record_scan()
+            try:
+                items = await asyncio.to_thread(
+                    self._ocr_backfill.find_unprocessed_evidence,
+                    self._memory.store if self._memory else None,
+                    self._ocr_job_ledger,
+                    self._ocr_backfill.batch_size,
+                )
+            except Exception as error:
+                logger.debug("backfill scan failed: %s", error)
+                continue
+            for item in items:
+                try:
+                    media_key = item.get("media_key")
+                    if not media_key or self._memory is None:
+                        continue
+                    media_path = Path(self.config.memory.storage_dir) / "media" / media_key
+                    if not media_path.exists():
+                        continue
+                    image_bytes = await asyncio.to_thread(media_path.read_bytes)
+                    phash = image_phash(image_bytes, self.config.ocr.dedup.hash_size)
+                    if self.config.ocr.dedup.enabled and should_skip_dedup(
+                        phash, self._ocr_dedup_seen,
+                        self.config.ocr.dedup.window_seconds,
+                    ):
+                        continue
+                    job = self._ocr_job_ledger.enqueue(
+                        camera_id=str(item.get("camera_id", "unknown")),
+                        image_phash=phash,
+                        observed_at=datetime.now(timezone.utc),
+                        source_scope="backfill",
+                        parent_id=str(item.get("evidence_id", "unknown")),
+                    )
+                    if job is None:
+                        continue
+                    result = await self._run_advanced_ocr(image_bytes)
+                    if result is None:
+                        self._ocr_job_ledger.fail(job.job_id, "no text found")
+                        continue
+                    text = str(result.get("text") or "").strip()
+                    if not text:
+                        self._ocr_job_ledger.fail(job.job_id, "empty result")
+                        continue
+                    self._ocr_job_ledger.update_local_result(
+                        job.job_id, text,
+                        float(result.get("confidence", 0.0)),
+                        str(result.get("engine", "unknown")),
+                    )
+                    if result.get("omnius_text"):
+                        self._ocr_job_ledger.update_omnius_result(
+                            job.job_id,
+                            str(result["omnius_text"]),
+                            float(result.get("omnius_confidence", 0.0)),
+                        )
+                    self._ocr_job_ledger.complete(
+                        job.job_id, text, str(result.get("engine", "unknown")),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.debug("backfill OCR job failed: %s", error)
 
     async def _queue_spatially_grounded_ocr(
         self, candidate: _OcrCandidate, result: dict[str, object]

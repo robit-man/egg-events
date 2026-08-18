@@ -283,10 +283,29 @@ class ObjectLearningConfig(BaseModel):
     duplicate_adjudication_batch_size: int = Field(default=1, ge=0, le=8)
 
 
+class OcrRefinementConfig(BaseModel):
+    enabled: bool = True
+    local_confidence_threshold: float = Field(default=0.72, ge=0.1, le=1.0)
+    min_text_length_for_refinement: int = Field(default=6, ge=1, le=100)
+    max_refinements_per_minute: int = Field(default=20, ge=1, le=120)
+
+
+class OcrDedupConfig(BaseModel):
+    enabled: bool = True
+    window_seconds: float = Field(default=300.0, ge=30.0, le=3600.0)
+    hash_size: int = Field(default=8, ge=4, le=16)
+
+
+class OcrBackfillConfig(BaseModel):
+    enabled: bool = True
+    scan_interval_seconds: float = Field(default=60.0, ge=10.0, le=600.0)
+    batch_size: int = Field(default=4, ge=1, le=16)
+
+
 class OcrConfig(BaseModel):
     enabled: bool = True
     local_multipass_enabled: bool = True
-    omnius_refinement_enabled: bool = False
+    omnius_refinement_enabled: bool = True
     full_frame_interval_seconds: float = Field(default=20, ge=2, le=3600)
     text_object_interval_seconds: float = Field(default=8, ge=1, le=3600)
     queue_size: int = Field(default=8, ge=1, le=64)
@@ -294,6 +313,11 @@ class OcrConfig(BaseModel):
     min_text_characters: int = Field(default=2, ge=1, le=100)
     max_fragments: int = Field(default=8, ge=1, le=32)
     max_region_refinements: int = Field(default=2, ge=0, le=8)
+    vlm_text_check_interval: float = Field(default=5.0, ge=1.0, le=30.0)
+    ledger_db_path: str = "data/ocr-jobs.sqlite3"
+    refinement: OcrRefinementConfig = Field(default_factory=OcrRefinementConfig)
+    dedup: OcrDedupConfig = Field(default_factory=OcrDedupConfig)
+    backfill: OcrBackfillConfig = Field(default_factory=OcrBackfillConfig)
 
 
 class MemoryConfig(BaseModel):

@@ -333,6 +333,10 @@ class ObservationNormalizer:
             epistemic_kind=EpistemicKind.OBSERVATION.value,
         )
 
+        # Determine text type: static (signs, books) vs dynamic (screens, clocks)
+        text_type = payload.get("text_type", "static")
+        is_dynamic = text_type == "dynamic"
+
         delta.events.append({
             "event_type_id": "ocr_detection",
             "roles": {
@@ -345,18 +349,28 @@ class ObservationNormalizer:
             "observed_at": observed_at,
         })
 
-        if text and target_id and target_id != "unknown":
-            delta.assertions.append({
-                "subject_id": target_id,
-                "property_id": "visible_text",
-                "value": TypedValue(raw=text, value_type=ValueType.STRING),
-                "epistemic_kind": EpistemicKind.OBSERVATION.value,
-                "source_id": source_id,
-                "evidence_ids": evidence_ids,
-                "confidence": confidences.get("text", 0.6),
-                "authority": authority,
-                "valid_from": observed_at,
-            })
+        # Static text → visible_text (persistent until contradicted)
+        # Dynamic text → displays_text (stale_after 30s from ontology)
+        property_id = "displays_text" if is_dynamic else "visible_text"
+        valid_for_seconds = payload.get("valid_for_seconds")
+        if is_dynamic and valid_for_seconds is None:
+            valid_for_seconds = 30.0
+
+        assertion: dict[str, Any] = {
+            "subject_id": target_id,
+            "property_id": property_id,
+            "value": TypedValue(raw=text, value_type=ValueType.STRING),
+            "epistemic_kind": EpistemicKind.OBSERVATION.value,
+            "source_id": source_id,
+            "evidence_ids": evidence_ids,
+            "confidence": confidences.get("text", 0.6),
+            "authority": authority,
+            "valid_from": observed_at,
+        }
+        if valid_for_seconds is not None:
+            assertion["valid_for_seconds"] = valid_for_seconds
+
+        delta.assertions.append(assertion)
 
         return delta
 
