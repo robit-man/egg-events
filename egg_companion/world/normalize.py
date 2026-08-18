@@ -28,13 +28,103 @@ class ObservationNormalizer:
     Accepts evidence_ids from the caller so that provenance is never lost.
     """
 
+    # Labels that are clearly hallucinated for a home/office environment
+    # with 4 cameras.  These will never appear in reality.
+    IMPOSSIBLE_LABELS: set[str] = {
+        "astronaut", "bomb", "abacus", "altar", "angel", "archway",
+        "bank vault", "baptism", "bedpan", "blacksmith", "blowfish",
+        "blue artist", "bowling ball", "bronze statue", "chinese tower",
+        "church bench", "computer tower", "dinosaur", "eiffel tower",
+        "golf cap", "tokyo tower", "water tower", "volcano", "waterfall",
+        "zoo", "castle", "dome", "fountain", "greenhouse", "pagoda",
+        "stadium", "temple", "cathedral", "church", "lighthouse",
+        "monument", "pyramid", "statue", "tower", "helicopter", "horse",
+        "elephant", "igloo", "kennel", "bakery", "casino", "army",
+        "baptism", "barrel", "basket", "bin", "binder", "block",
+        "blowfish", "blue artist", "bolo tie", "bomb", "bonnet",
+        "boom microphone", "bottle opener", "bowling ball", "bread",
+        "bubble", "bureau", "bust", "cabinet", "cake", "cake stand",
+        "calculator", "can", "cape", "cardigan", "cash machine",
+        "castle", "chain", "chainlink fence", "chandelier", "chime",
+        "chinese tower", "chopstick", "church", "church bench",
+        "cliff", "closet", "cocktail shaker", "comic book",
+        "computer keyboard", "computer room", "computer tower",
+        "computer", "condiment", "cork", "cowboy hat", "cradle",
+        "crate", "cross", "crown", "crutch", "cup", "cutoff",
+        "dam", "desk", "desk chair", "dial telephone", "diaper",
+        "diamond", "dining table", "dinosaur", "dishwasher",
+        "dock", "dog", "doll", "domestic cat", "drum", "drumstick",
+        "dumbbell", "dumpster", "easel", "egg", "eiffel tower",
+        "electric fan", "electric guitar", "electric razor",
+        "envelope", "eraser", "eyepatch", "face powder", "ferris wheel",
+        "file cabinet", "fire engine", "fire screen", "flagpole",
+        "flute", "folding chair", "football helmet", "fountain",
+        "frame", "french horn", "frying pan", "fur coat", "garbage truck",
+        "gasmask", "gazebo", "genie", "giant panda", "goblet",
+        "golf cap", "golf cart", "golf club", "gong", "goose",
+        "grand piano", "greenhouse", "guillotine", "hair dryer",
+        "hair spray", "halter top", "hamper", "hammock", "handkerchief",
+        "hard disc drive", "harmonica", "harp", "hatbox", "head scarf",
+        "headphone", "helicopter", "helmet", "hippopotamus", "hoe",
+        "home plate", "hook", "horse", "hotdog", "hourglass",
+        "house", "ice cream", "igloo", "iron", "jack-o-lantern",
+        "jacuzzi", "jean", "jellyfish", "joystick", "kennel",
+        "kettle", "keypad", "kilt", "kimono", "knitting needle",
+        "labyrinth", "lampshade", "laptop", "lawn mower", "level",
+        "lighthouse", "lipstick", "lobster", "loudspeaker", "luggage",
+        "mailbox", "manhole", "mask", "masher", "matchstick",
+        "maypole", "measuring cup", "medicine", "microwave",
+        "military uniform", "milk can", "miniskirt", "minivan",
+        "missile", "mixer", "monarch", "monopoly", "monument",
+        "mop", "mortar", "mortarboard", "mosque", "motor scooter",
+        "motorcycle", "mouse", "mousetrap", "mug", "mule",
+        "multitool", "nailfile", "necklace", "needle", "newspaper",
+        "nosegay", "oboe", "ocarina", "ottoman", "overcoat",
+        "overhead projector", "ox", "padlock", "pagoda", "paintbrush",
+        "palette", "pan", "panda", "paper towel", "parachute",
+        "parking meter", "patio", "pay-phone", "pedestal", "pencil box",
+        "pencil sharpener", "perfume", "petri dish", "phonograph record",
+        "pickup truck", "piggy bank", "pillow", "pizza", "plastic bag",
+        "plunger", "polar bear", "polo shirt", "pool table", "pop bottle",
+        "postbox", "pot", "pottery", "power drill", "prayer rug",
+        "projectile", "projector", "punching bag", "purse", "pyramid",
+        "quilt", "racket", "radar", "radio", "rain barrel", "record player",
+        "recreation room", "refrigerator", "remote control", "restaurant",
+        "revolver", "rifle", "ring", "robocop", "rocket", "rocking chair",
+        "rotisserie", "ruler", "running shoe", "safe", "sailboat",
+        "saltshaker", "sandals", "sarong", "scale", "school bus",
+        "scoreboard", "scrubbing brush", "sewing machine", "shield",
+        "shoe", "shopping cart", "shower cap", "shower curtain",
+        "ski", "skirt", "sleeping bag", "sliding door", "slippers",
+        "slot machine", "smartphone", "smokestack", "snail", "snake",
+        "snowplow", "soccer ball", "sock", "sombrero", "space heater",
+        "spatula", "speedboat", "spider web", "spinning wheel",
+        "spotlight", "statue", "steam engine", "steering wheel",
+        "stethoscope", "stopwatch", "stove", "strawberry", "stretcher",
+        "studio couch", "submarine", "suitcase", "sunglasses",
+        "sunhat", "supertanker", "sweatshirt", "swimming trunks",
+        "swing", "switch", "syringe", "table lamp", "tank",
+        "tape player", "teapot", "teddy", "television", "tennis ball",
+        "thimble", "throne", "tiara", "tiger", "toaster",
+        "tokyo tower", "trolley", "trophy", "trumpet", "turtle",
+        "typewriter", "umbrella", "unicycle", "upright piano",
+        "vacuum cleaner", "vase", "vending machine", "violin",
+        "volleyball", "waffle iron", "wall clock", "wallet",
+        "water tower", "watermelon", "weber grill", "whistle",
+        "wig", "wind chime", "windmill", "wine bottle", "wine glass",
+        "wok", "wood-burning stove", "wool", "wrecking ball",
+        "yacht", "yo-yo", "zucchini",
+    }
+
     def __init__(
         self,
         authority_policy: AuthorityPolicy | None = None,
         ontology: OntologyRegistry | None = None,
+        min_confidence: float = 0.45,
     ) -> None:
         self._authority = authority_policy or AuthorityPolicy()
         self._ontology = ontology or OntologyRegistry()
+        self._min_confidence = min_confidence
 
     def normalize_event(
         self,
@@ -116,6 +206,17 @@ class ObservationNormalizer:
             confidence = float(detection.get("confidence", 0.0))
             bbox = detection.get("bbox")
             behavior = detection.get("behavior")
+
+            # Filter: reject detections below confidence threshold
+            if confidence < self._min_confidence:
+                continue
+
+            # Filter: reject contextually impossible labels for det:* entities
+            if (
+                entity_id.startswith("det:")
+                and label.lower().replace(" ", "") in self.IMPOSSIBLE_LABELS
+            ):
+                continue
 
             authority = self._authority.evaluate(
                 property_type=f"{self._entity_type_from_label(label)}.label",

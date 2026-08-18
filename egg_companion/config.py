@@ -409,6 +409,16 @@ class RuntimeConfig(BaseModel):
     log_level: str = "INFO"
 
 
+class WorldPruningConfig(BaseModel):
+    """World model pruning and hallucination removal settings."""
+    enabled: bool = True
+    min_confidence: float = Field(default=0.45, ge=0, le=1)
+    stale_after_hours: float = Field(default=24.0, ge=1, le=168)
+    max_det_entities: int = Field(default=200, ge=10, le=2000)
+    prune_every_n_dreams: int = Field(default=3, ge=1, le=20)
+    impossible_labels_file: str = ""
+
+
 class EggConfig(BaseModel):
     cameras: list[CameraConfig] = Field(default_factory=list)
     camera_discovery: CameraDiscoveryConfig = Field(default_factory=CameraDiscoveryConfig)
@@ -435,6 +445,7 @@ class EggConfig(BaseModel):
     )
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    world_pruning: WorldPruningConfig = Field(default_factory=WorldPruningConfig)
 
     @field_validator("cameras")
     @classmethod

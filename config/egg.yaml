@@ -327,6 +327,13 @@ social_cognition:
   history_turns: 24
   profile_context_characters: 1800
 
+world_pruning:
+  enabled: true
+  min_confidence: 0.45
+  stale_after_hours: 24.0
+  max_det_entities: 200
+  prune_every_n_dreams: 3
+
 privacy:
   persistent_identity_enabled: true
   profile_retention_days: 30
