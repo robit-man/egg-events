@@ -281,6 +281,30 @@ PAGE = r"""<!doctype html>
     button.identity-card { width: 100%; padding: 0; color: inherit; cursor: pointer; text-align: left; }
     button.identity-card:hover, button.identity-card:focus-visible { border-color: var(--accent); outline: 0; }
     button.identity-card[aria-expanded="true"] { border-color: var(--accent); box-shadow: inset 0 -3px var(--accent); }
+
+    .world-entity-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+    .world-entity-card { padding: 14px; background: var(--surface-muted); border: 1px solid var(--line); cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+    .world-entity-card:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .world-entity-card.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .world-entity-id { font-weight: 650; font-size: 13px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 6px; }
+    .world-entity-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+    .world-entity-badges .badge { font-size: 10px; padding: 2px 6px; }
+
+    .world-inspector-grid { display: grid; gap: 10px; }
+    .world-inspector-section { border: 1px solid var(--line); border-radius: 0; overflow: hidden; }
+    .world-inspector-section summary { display: flex; cursor: pointer; list-style: none; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--surface-muted); font-weight: 620; font-size: 13px; }
+    .world-inspector-section summary::-webkit-details-marker { display: none; }
+    .world-inspector-section summary::after { content: "+"; color: var(--muted); }
+    .world-inspector-section[open] summary::after { content: "−"; }
+    .world-inspector-props { padding: 8px 14px; }
+    .world-inspector-prop { display: grid; grid-template-columns: 110px 1fr; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+    .world-inspector-prop:last-child { border-bottom: 0; }
+    .world-inspector-prop-key { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; overflow-wrap: anywhere; }
+    .world-inspector-prop-val { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; word-break: break-all; }
+    .world-inspector-rel { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+    .world-inspector-rel:last-child { border-bottom: 0; }
+    .world-inspector-rel-arrow { color: var(--accent); font-weight: 700; }
+
     .person-inspector { margin-top: 16px; padding: 0; border: 1px solid var(--line-strong); background: var(--surface-muted); }
     .person-inspector-header { display: grid; grid-template-columns: 104px minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
     .person-inspector-header > img { display: block; width: 104px; height: 104px; object-fit: cover; background: #05070a; border: 1px solid var(--line-strong); }
@@ -568,6 +592,7 @@ PAGE = r"""<!doctype html>
         <a class="nav-link" href="/graph" data-route="/graph" data-title="Knowledge graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="6" cy="7" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="m8.3 7 7.2-.7M7.4 9l3.5 6.8M16.6 8.2l-3.5 7.6"/></svg><span>Knowledge graph</span></a>
         <a class="nav-link" href="/dreams" data-route="/dreams" data-title="Dreams"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 15.5A8 8 0 0 1 8.5 4 8 8 0 1 0 20 15.5Z"/><path d="M15.5 5.5h3M17 4v3M5 14h3M6.5 12.5v3"/></svg><span>Dreams</span></a>
         <a class="nav-link" href="/narrative" data-route="/narrative" data-title="Narrative"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 3v18M6 6h12M6 12h9M6 18h12"/><circle cx="6" cy="6" r="2"/><circle cx="6" cy="12" r="2"/><circle cx="6" cy="18" r="2"/></svg><span>Narrative</span></a>
+        <a class="nav-link" href="/world" data-route="/world" data-title="World"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z"/></svg><span>World</span></a>
         <a class="nav-link" href="/system" data-route="/system" data-title="System"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg><span>System</span></a>
       </nav>
       <div class="nav-label" style="margin-top:22px">Manage</div>
@@ -676,6 +701,21 @@ PAGE = r"""<!doctype html>
           <article class="card"><div class="card-header"><div><h3 class="card-title">Chronological story</h3><p class="card-note">Select a day, then expand a period to inspect its summarized episodes, people, objects, speech, OCR, audio, and retained media.</p></div><button id="narrative-refresh" class="button" type="button">Replay view</button></div><div id="narrative-timeline" class="narrative-timeline"><div class="empty">Loading daily narratives…</div></div></article>
         </section>
 
+        <section class="page" data-page="/world">
+          <div class="page-heading"><div><h2>World Model</h2><p>Typed operational world model: entities, properties, relations, conflicts, and assertion history.</p></div><div id="world-status" class="badge-row"><span class="badge">Loading</span></div></div>
+          <div class="grid">
+            <article class="card metric-card span-3"><div class="metric-label">Entities</div><div id="world-metric-entities" class="metric-value">0</div><div id="world-metric-entities-detail" class="metric-detail">Awaiting data</div></article>
+            <article class="card metric-card span-3"><div class="metric-label">Relations</div><div id="world-metric-relations" class="metric-value">0</div><div id="world-metric-relations-detail" class="metric-detail">Awaiting data</div></article>
+            <article class="card metric-card span-3"><div class="metric-label">Conflicts</div><div id="world-metric-conflicts" class="metric-value">0</div><div id="world-metric-conflicts-detail" class="metric-detail">No conflicts</div></article>
+            <article class="card metric-card span-3"><div class="metric-label">Revision</div><div id="world-metric-revision" class="metric-value">0</div><div id="world-metric-revision-detail" class="metric-detail">Latest revision</div></article>
+          </div>
+          <div class="grid">
+            <article class="card span-8"><div class="card-header"><div><h3 class="card-title">Entities</h3><p class="card-note">Select an entity to inspect properties, relations, and assertion history.</p></div><input id="world-entity-search" class="input" type="search" placeholder="Filter entities…"></div><div id="world-entities" class="world-entity-grid"><div class="empty">Loading entities…</div></div></article>
+            <article class="card span-4"><div class="card-header"><h3 class="card-title">Entity Inspector</h3></div><div id="world-entity-detail" class="card-body world-inspector-grid"><div class="empty">Select an entity above to inspect.</div></div></article>
+          </div>
+          <article class="card"><div class="card-header"><h3 class="card-title">Conflicts</h3></div><div id="world-conflicts" class="card-body"><div class="empty">No conflicts</div></div></article>
+        </section>
+
         <section class="page graph-page" data-page="/graph">
           <div class="page-heading"><div><h2>Multimodal knowledge graph</h2><p>Objects, faces, recognized content, evidence, claims, and episodes arranged by relationship strength and provenance.</p></div><div id="graph-ocr-status" class="badge-row"><span class="badge">OCR awaiting data</span></div></div>
           <article id="graph-panel" class="card graph-panel">
@@ -722,7 +762,7 @@ PAGE = r"""<!doctype html>
     const $ = (selector, root = document) => root.querySelector(selector);
     const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
     const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
-    const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/narrative':'Narrative','/system':'System','/configuration':'Configuration'};
+    const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/narrative':'Narrative','/world':'World','/system':'System','/configuration':'Configuration'};
     let currentState = null;
     let effectiveConfig = null;
     let catalog = null;
@@ -778,6 +818,7 @@ PAGE = r"""<!doctype html>
       if (route === '/graph') loadGraph();
       if (route === '/dreams') loadDreams();
       if (route === '/narrative') loadNarratives();
+      if (route === '/world') loadWorld();
       if (currentState) renderActivePage(currentState, route);
       if (priorRoute !== route) window.scrollTo({top: 0, behavior: 'instant'});
     }
@@ -1179,6 +1220,86 @@ PAGE = r"""<!doctype html>
         if (signature !== narrativeSignature) { narrativeSignature = signature; narrativeDetails.clear(); renderNarrativeIndex(chapters); }
       } catch (error) { narrativeLoadedAt = 0; $('#narrative-status').innerHTML = '<span class="badge bad">Narrative unavailable</span>'; $('#narrative-timeline').innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
     }
+    let worldLoadedAt = 0;
+    let selectedWorldEntityId = '';
+    async function loadWorld(force = false) {
+      if (!force && Date.now() - worldLoadedAt < 5000) return;
+      worldLoadedAt = Date.now();
+      try {
+        const [summaryRes, conflictsRes] = await Promise.all([
+          fetch('/api/world', {cache:'no-store'}),
+          fetch('/api/world/conflicts', {cache:'no-store'}),
+        ]);
+        if (!summaryRes.ok) throw new Error(await summaryRes.text());
+        const summary = await summaryRes.json();
+        const conflicts = conflictsRes.ok ? await conflictsRes.json() : [];
+        $('#world-status').innerHTML = `<span class="badge good">Entities ${summary.total_entities ?? '?'}</span><span class="badge">Relations ${summary.total_relations ?? '?'}</span><span class="badge">Revisions ${summary.revision ?? '?'}</span>`;
+        const entityCount = summary.total_entities ?? 0, relationCount = summary.total_relations ?? 0, conflictCount = summary.conflict_count ?? 0, revision = summary.revision ?? 0;
+        $('#world-metric-entities').textContent = entityCount;
+        $('#world-metric-entities-detail').textContent = `${(summary.entity_ids || []).length} shown · ${entityCount} total`;
+        $('#world-metric-relations').textContent = relationCount;
+        const relTypes = summary.relation_summary || {};
+        const topRel = Object.entries(relTypes).sort((a, b) => b[1] - a[1])[0];
+        $('#world-metric-relations-detail').textContent = topRel ? `top: ${topRel[0]} ×${topRel[1]}` : 'No relation types';
+        $('#world-metric-conflicts').textContent = conflictCount;
+        $('#world-metric-conflicts-detail').textContent = conflictCount ? `${conflictCount} unresolved` : 'No conflicts';
+        $('#world-metric-conflicts').parentElement.querySelector('.metric-card, .card').className = `card metric-card span-3${conflictCount ? '' : ''}`;
+        $('#world-metric-revision').textContent = revision;
+        $('#world-metric-revision-detail').textContent = revision ? `Version ${revision}` : 'Not yet revised';
+        $('#world-conflicts').innerHTML = conflicts.length
+          ? conflicts.map(c => `<div style="margin-bottom:6px;padding:6px;border-left:3px solid var(--accent)"><div><span class="badge">${esc(c.entity_id)}</span> <span class="muted">${esc(c.property_id)}</span></div><div style="margin-top:3px"><code>${esc(String(c.current_value).slice(0,80))}</code> → <code>${esc(String(c.proposed_value).slice(0,80))}</code></div><div class="muted" style="font-size:12px;margin-top:2px">${esc(c.reason)}</div></div>`).join('')
+          : '<div class="empty">No conflicts</div>';
+        if (summary.entities) {
+          const search = $('#world-entity-search');
+          const renderList = (filter = '') => {
+            const filtered = filter ? summary.entities.filter(e => e.entity_id.toLowerCase().includes(filter.toLowerCase())) : summary.entities;
+            const selectedId = selectedWorldEntityId || '';
+            $('#world-entities').innerHTML = filtered.length
+              ? filtered.map(e => {
+                  const id = esc(e.entity_id);
+                  const typeTag = e.entity_id.startsWith('det:') ? 'det' : e.entity_id.includes('person') ? 'person' : e.entity_id.includes('camera') ? 'cam' : '';
+                  const conflictBadge = e.has_conflicts ? '<span class="badge bad">conflict</span>' : '';
+                  const selected = e.entity_id === selectedId ? ' selected' : '';
+                  return `<div class="world-entity-card${selected}" data-entity-id="${id}" role="button" tabindex="0"><div class="world-entity-id" title="${id}">${id}</div><div class="world-entity-badges">${typeTag ? `<span class="badge">${typeTag}</span>` : ''}<span class="badge">${esc(e.property_count ?? 0)} props</span><span class="badge">${esc(e.relation_count ?? 0)} rels</span>${conflictBadge}</div></div>`;
+                }).join('')
+              : '<div class="empty">No matching entities</div>';
+            $$('#world-entities .world-entity-card').forEach(el => el.addEventListener('click', () => loadWorldEntity(el.dataset.entityId)));
+          };
+          renderList();
+          search.oninput = () => renderList(search.value);
+        }
+      } catch (error) { worldLoadedAt = 0; $('#world-status').innerHTML = '<span class="badge bad">World unavailable</span>'; $('#world-metric-entities-detail').textContent = esc(error.message); }
+    }
+    async function loadWorldEntity(entityId) {
+      selectedWorldEntityId = entityId;
+      const detail = $('#world-entity-detail');
+      detail.innerHTML = '<div class="empty">Loading…</div>';
+      try {
+        const response = await fetch(`/api/world/entity/${encodeURIComponent(entityId)}`, {cache:'no-store'});
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
+        const props = data.properties || [];
+        const rels = data.relations || [];
+        const history = data.assertion_history || [];
+        let html = `<div style="margin-bottom:10px"><span class="badge good">${esc(entityId)}</span><span class="badge">${esc(props.length)} properties</span><span class="badge">${esc(rels.length)} relations</span>${data.identity_chain ? `<span class="badge">identity chain: ${esc(data.identity_chain.length)} entries</span>` : ''}</div>`;
+        if (props.length) {
+          html += `<details class="world-inspector-section" open><summary>Properties (${props.length})</summary><div class="world-inspector-props">${props.map(p => `<div class="world-inspector-prop"><div class="world-inspector-prop-key">${esc(p.property_id)}</div><div class="world-inspector-prop-val">${esc(typeof p.value === 'object' ? JSON.stringify(p.value) : String(p.value ?? ''))}<span class="muted" style="margin-left:6px">${esc(p.epistemic_kind || '')}</span></div></div>`).join('')}</div></details>`;
+        }
+        if (rels.length) {
+          html += `<details class="world-inspector-section" open><summary>Relations (${rels.length})</summary><div class="world-inspector-props">${rels.map(r => `<div class="world-inspector-rel"><span>${esc(r.source_entity_id)}</span><span class="world-inspector-rel-arrow">→</span><span class="badge">${esc(r.relation_type_id)}</span><span class="world-inspector-rel-arrow">→</span><span>${esc(r.target_entity_id)}</span><span class="muted" style="margin-left:auto">${Math.round(Number(r.confidence || 0) * 100)}%</span></div>`).join('')}</div></details>`;
+        }
+        if (history.length) {
+          html += `<details class="world-inspector-section"><summary>Assertion history (${history.length})</summary><div class="world-inspector-props">${history.slice(0, 50).map(h => `<div class="world-inspector-prop"><div class="world-inspector-prop-key">${esc(h.property_id || '')}</div><div class="world-inspector-prop-val">${esc(typeof h.value === 'object' ? JSON.stringify(h.value) : String(h.value ?? ''))}<span class="muted" style="margin-left:6px">${esc(h.epistemic_kind || '')} · ${esc(h.valid_from || '')}</span></div></div>`).join('')}${history.length > 50 ? `<div class="muted" style="padding:8px 0">…${history.length - 50} more</div>` : ''}</div></details>`;
+        }
+        if (!props.length && !rels.length && !history.length) {
+          html += '<div class="empty">No properties, relations, or history for this entity.</div>';
+        }
+        detail.innerHTML = html;
+      } catch (error) { detail.innerHTML = `<div class="empty">Error: ${esc(error.message)}</div>`; }
+      // Re-render entity list to show selection state
+      const search = $('#world-entity-search');
+      if (search) search.dispatchEvent(new Event('input'));
+    }
     function renderSystem(state) {
       const telemetry = state.telemetry || {}, checks = state.checks || [], errors = telemetry.runtime_errors || [], gpu = telemetry.gpu || {}, activity = telemetry.activity || {};
       $('#checks').innerHTML = checks.map(check => `<div class="check ${esc(check.status)}"><span class="check-dot"></span><div><div class="check-name">${esc(check.name)}</div><div class="check-detail">${esc(check.detail)}</div></div></div>`).join('') || '<div class="empty">Checks pending.</div>';
@@ -1211,6 +1332,7 @@ PAGE = r"""<!doctype html>
       else if (route === '/cognition') renderCognition(telemetry);
       else if (route === '/dreams') renderDreams(dreamState || state.dreams, state.identity_summary);
       else if (route === '/narrative') loadNarratives();
+      else if (route === '/world') loadWorld();
       else if (route === '/system') renderSystem(state);
     }
     function render(state) {

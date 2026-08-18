@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from egg_companion.config import DefaultModeConfig
-from egg_companion.cognition.world_model import WorldModelSynthesizer
+from egg_companion.cognition.world_model import NarrativeWorldModelSynthesizer
 from egg_companion.memory.store import MemoryStore
 
 
@@ -13,7 +13,7 @@ class DefaultModeNetwork:
     def __init__(self, store: MemoryStore, config: DefaultModeConfig) -> None:
         self.store = store
         self.config = config
-        self.world_model = WorldModelSynthesizer(store, config)
+        self.world_model = NarrativeWorldModelSynthesizer(store, config)
 
     def run_once(self) -> dict[str, object]:
         job_id = self.store.create_job("default-mode-replay")

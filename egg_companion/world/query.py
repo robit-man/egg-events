@@ -113,6 +113,82 @@ class WorldQuery:
     def explain(self, entity_id: str, property_id: str) -> dict[str, Any]:
         return self._state.explain(entity_id, property_id)
 
+    def explain_entity(self, entity_id: str) -> dict[str, Any] | None:
+        """Full explanation of an entity: all properties with assertion history, conflicts, identity."""
+        view = self.entity(entity_id)
+        if view is None:
+            return None
+        properties_with_history: dict[str, dict[str, Any]] = {}
+        for prop_id, prop_data in view.properties.items():
+            entry = {**prop_data}
+            if self._reconciler is not None:
+                try:
+                    history = self._reconciler.get_assertion_history(entity_id, prop_id)
+                    entry["assertion_history"] = history
+                except Exception:
+                    entry["assertion_history"] = []
+            else:
+                entry["assertion_history"] = []
+            properties_with_history[prop_id] = entry
+        conflicts = [c for c in self.conflicts() if c.entity_id == entity_id]
+        return {
+            "entity_id": entity_id,
+            "properties": properties_with_history,
+            "relations": view.relations,
+            "identity_chain": view.identity_chain,
+            "last_updated": view.last_updated,
+            "conflicts": [
+                {
+                    "property_id": c.property_id,
+                    "current_value": c.current_value,
+                    "proposed_value": c.proposed_value,
+                    "reason": c.reason,
+                    "assertions": c.assertions,
+                }
+                for c in conflicts
+            ],
+        }
+
+    def world_summary(self) -> dict[str, Any]:
+        """Full world model summary for dashboard and debugging."""
+        summary = self.summary()
+        all_ids = self.all_entity_ids()
+        brief_counts = self._state.entity_brief_counts()
+        conflicting_ids = {c.entity_id for c in self.conflicts()}
+        entities_brief = []
+        for eid in all_ids[:100]:
+            info = brief_counts.get(eid, {})
+            entities_brief.append({
+                "entity_id": eid,
+                "property_count": info.get("property_count", 0),
+                "relation_count": info.get("relation_count", 0),
+                "last_updated": info.get("last_updated", ""),
+                "has_conflicts": eid in conflicting_ids,
+            })
+        recent_activity = []
+        if self._reconciler is not None:
+            try:
+                recent_activity = self._reconciler.get_conflicts()[:20]
+            except Exception:
+                pass
+        conflicts = self.conflicts()
+        return {
+            **summary,
+            "entities": entities_brief,
+            "conflict_count": len(conflicts),
+            "conflicts": [
+                {
+                    "entity_id": c.entity_id,
+                    "property_id": c.property_id,
+                    "current_value": c.current_value,
+                    "proposed_value": c.proposed_value,
+                    "reason": c.reason,
+                }
+                for c in conflicts
+            ],
+            "revision": self._state.revision,
+        }
+
     def conflicts(self) -> list[ConflictInfo]:
         # Get conflicts from the assertion log via the state store
         conflict_rows = self._state.conflicts()

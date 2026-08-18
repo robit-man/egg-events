@@ -644,7 +644,6 @@ if (container) {
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x070d19, 0.018);
     const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 500);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
@@ -657,162 +656,116 @@ if (container) {
     controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
     controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
 
-    scene.add(new THREE.HemisphereLight(0xbcd7ff, 0x08101d, 1.55));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 2.1);
-    keyLight.position.set(16, 24, 20);
-    scene.add(keyLight);
-    const rimLight = new THREE.PointLight(0x567cff, 42, 100);
-    rimLight.position.set(-22, 4, -18);
-    scene.add(rimLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 1.0));
 
     const graphRoot = new THREE.Group();
     scene.add(graphRoot);
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2(2, 2);
-    const meshes = [];
-    const meshById = new Map();
     const nodeById = new Map();
     const linksByNode = new Map();
-    const edgeObjects = [];
-    const edgeById = new Map();
     let graphData = { nodes: [], links: [] };
-    let hovered = null;
-    let selected = null;
+    let hoveredNodeId = null;
+    let selectedNodeId = null;
     let labelSprite = null;
     let pointerDown = null;
-    let appendPulseObjects = [];
-    const activePulseObjects = new Set();
     let lastDreamRevision = '';
     let lastActivationSequence = 0;
     const appendFlashMs = 1600;
     const activationPulseMs = 1250;
     const activationHopMs = 150;
     const layoutTweenMs = 1250;
-    const white = new THREE.Color(0xffffff);
 
-    const colors = {
-      person: 0x60a5fa,
-      appearance: 0x38bdf8,
-      object: 0x34d399,
-      object_category: 0x2dd4bf,
-      sound_event: 0xffae00,
-      content: 0xfbbf24,
-      daily_narrative: 0xf97316,
-      dream_replay: 0x8b5cf6,
-      cognitive: 0x06b6d4,
-      evidence: 0xc084fc,
-      claim: 0xfb7185,
-      episode: 0x94a3b8,
-      entity: 0x22d3ee,
+    let nodeMesh = null;
+    let nodeCount = 0;
+    const nodeInstanceIdMap = new Map();
+    const nodeTweens = [];
+    const nodeBasePositions = [];
+    const nodeTargetPositions = [];
+    let lineSegments = null;
+    let edgeLinePositions = null;
+    let edgeLineColors = null;
+    let edgeLineCount = 0;
+    const edgeDataList = [];
+
+    const palette = {
+      person: new THREE.Color(0x60a5fa),
+      appearance: new THREE.Color(0x38bdf8),
+      object: new THREE.Color(0x34d399),
+      object_category: new THREE.Color(0x2dd4bf),
+      sound_event: new THREE.Color(0xffae00),
+      content: new THREE.Color(0xfbbf24),
+      daily_narrative: new THREE.Color(0xf97316),
+      dream_replay: new THREE.Color(0x8b5cf6),
+      cognitive: new THREE.Color(0x06b6d4),
+      evidence: new THREE.Color(0xc084fc),
+      claim: new THREE.Color(0xfb7185),
+      episode: new THREE.Color(0x94a3b8),
+      entity: new THREE.Color(0x22d3ee),
     };
-
-    function hash(value) {
-      let result = 2166136261;
-      for (const character of String(value)) {
-        result ^= character.charCodeAt(0);
-        result = Math.imul(result, 16777619);
-      }
-      return result >>> 0;
-    }
-
-    function randomUnit(seed) {
-      let value = seed || 1;
-      return () => {
-        value += 0x6d2b79f5;
-        let next = value;
-        next = Math.imul(next ^ (next >>> 15), next | 1);
-        next ^= next + Math.imul(next ^ (next >>> 7), next | 61);
-        return ((next ^ (next >>> 14)) >>> 0) / 4294967296;
-      };
-    }
+    const _tmpC = new THREE.Color();
+    const _white = new THREE.Color(0xffffff);
 
     function nodeColor(node) {
       const subtype = String(node.subtype || '').toLowerCase();
-      if (subtype.includes('person') || subtype.includes('face')) return colors.person;
-      if (subtype.includes('appearance')) return colors.appearance;
-      if (subtype.includes('sound')) return colors.sound_event;
-      if (subtype.includes('daily_narrative')) return colors.daily_narrative;
-      if (subtype.includes('dream_replay')) return colors.dream_replay;
-      if (subtype.includes('cognitive_document') || subtype.includes('abstraction') || subtype.includes('reflection')) return colors.cognitive;
-      if (subtype.includes('content') || subtype.includes('ocr')) return colors.content;
-      if (subtype.includes('object')) return colors.object;
-      return colors[node.kind] || colors.entity;
+      if (subtype.includes('person') || subtype.includes('face')) return palette.person;
+      if (subtype.includes('appearance')) return palette.appearance;
+      if (subtype.includes('sound')) return palette.sound_event;
+      if (subtype.includes('daily_narrative')) return palette.daily_narrative;
+      if (subtype.includes('dream_replay')) return palette.dream_replay;
+      if (subtype.includes('cognitive_document') || subtype.includes('abstraction') || subtype.includes('reflection')) return palette.cognitive;
+      if (subtype.includes('content') || subtype.includes('ocr')) return palette.content;
+      if (subtype.includes('object')) return palette.object;
+      return palette[node.kind] || palette.entity;
     }
 
     function firingColor(source) {
-      if (source === 'voice') return 0xffae00;
-      if (source === 'memory_recall') return 0xc084fc;
-      if (source === 'action') return 0x34d399;
-      return 0xffffff;
+      if (source === 'voice') return new THREE.Color(0xffae00);
+      if (source === 'memory_recall') return new THREE.Color(0xc084fc);
+      if (source === 'action') return new THREE.Color(0x34d399);
+      return new THREE.Color(0xffffff);
     }
 
-    function relationshipLayout(nodes, links, revision = '') {
+    function computeRadius(node, degree) {
+      const confidence = THREE.MathUtils.clamp(Number(node.confidence ?? 0.65), 0.1, 1);
+      return 0.3 + Math.min(0.48, Math.log2((degree || 0) + 1) * 0.09) + confidence * 0.12;
+    }
+
+    function relationshipLayout(nodes, links, revision) {
       const association = associativeLayout3D(nodes, links, revision);
       return {
-        positions:new Map([...association.positions].map(([id, position]) => [id, new THREE.Vector3(position.x, position.y, position.z)])),
-        links:association.links,
+        positions: new Map([...association.positions].map(([id, p]) => [id, new THREE.Vector3(p.x, p.y, p.z)])),
+        links: association.links,
       };
-    }
-
-    function disposeObject(object) {
-      object.traverse(child => {
-        child.geometry?.dispose?.();
-        if (Array.isArray(child.material)) child.material.forEach(material => material.dispose());
-        else child.material?.dispose?.();
-      });
-    }
-
-    function clearGraph() {
-      if (labelSprite) {
-        labelSprite.material.map?.dispose();
-        labelSprite.material.dispose();
-        graphRoot.remove(labelSprite);
-        labelSprite = null;
-      }
-      for (const child of [...graphRoot.children]) {
-        graphRoot.remove(child);
-        disposeObject(child);
-      }
-      meshes.length = 0;
-      edgeObjects.length = 0;
-      appendPulseObjects = [];
-      activePulseObjects.clear();
-      meshById.clear();
-      nodeById.clear();
-      linksByNode.clear();
-      edgeById.clear();
-      hovered = null;
-      selected = null;
-    }
-
-    function curveFor(source, target, link, associative) {
-      const points = associativeSplinePoints(source, target, link, associative).map(point => new THREE.Vector3(point.x, point.y, point.z));
-      return new THREE.CatmullRomCurve3(points, false, 'centripetal', 0.5);
     }
 
     function linkIdentity(link) {
       return String(link.id || `${link.source}:${link.relation || ''}:${link.target}`);
     }
 
+    const SPLINE_PTS = 4;
+
     function buildGraph(payload) {
-      const selectedId = selected?.userData?.node?.id || null;
-      const hadGraph = meshes.length > 0;
-      const previousPositions = new Map(meshes.map(mesh => [mesh.userData.node.id, mesh.position.clone()]));
-      const previousNodeIds = new Set((graphData.nodes || []).map(node => node.id));
-      const previousLinkIds = new Set((graphData.links || []).map(link => linkIdentity(link)));
+      const selectedId = selectedNodeId;
+      const hadGraph = nodeCount > 0;
+      const prevPos = new Map();
+      for (const [id, idx] of nodeInstanceIdMap) prevPos.set(id, nodeBasePositions[idx] ? nodeBasePositions[idx].clone() : null);
+      const prevNodeIds = new Set((graphData.nodes || []).map(n => n.id));
+      const prevLinkIds = new Set((graphData.links || []).map(l => linkIdentity(l)));
       const appendedAt = performance.now();
-      const savedCamera = camera.position.clone();
-      const savedTarget = controls.target.clone();
+      const savedCam = camera.position.clone();
+      const savedTgt = controls.target.clone();
       graphData = payload || { nodes: [], links: [] };
       const dreamRevision = String(graphData.dream?.revision || '');
       const dreamChanged = hadGraph && Boolean(dreamRevision) && dreamRevision !== lastDreamRevision;
       lastDreamRevision = dreamRevision;
-      clearGraph();
+
       const nodes = Array.isArray(graphData.nodes) ? graphData.nodes : [];
-      const links = Array.isArray(graphData.links) ? graphData.links.map(link => ({ ...link })) : [];
+      const links = Array.isArray(graphData.links) ? graphData.links.map(l => ({ ...l })) : [];
       const dreamTouched = new Set(graphData.dream?.touched_node_ids || []);
       if (dreamChanged) for (const link of links) if (dreamTouched.has(link.source) || dreamTouched.has(link.target)) { dreamTouched.add(link.source); dreamTouched.add(link.target); }
-      const association = relationshipLayout(nodes, links, dreamRevision), positions = association.positions;
+      const association = relationshipLayout(nodes, links, dreamRevision);
+      const positions = association.positions;
       for (const link of links) link.associative = association.links.get(associativeLinkKey(link)) || relationRule(link);
       nodes.forEach(node => nodeById.set(node.id, node));
       for (const link of links) {
@@ -822,60 +775,110 @@ if (container) {
         linksByNode.get(link.target).push(link);
       }
 
-      const renderedLinks = links
-        .filter(link => positions.has(link.source) && positions.has(link.target))
-        .sort((a, b) => Number(b.associative?.tightness || 0) - Number(a.associative?.tightness || 0))
-        .slice(0, 1800);
-      for (const link of renderedLinks) {
-        const source = positions.get(link.source), target = positions.get(link.target);
-        const associative = link.associative || relationRule(link);
-        const tightness = associative.tightness;
-        const radius = 0.009 + associative.thickness * 0.105;
-        const curve = curveFor(source, target, link, link.associative);
-        const geometry = new THREE.TubeGeometry(curve, 12, radius, 4, false);
-        const baseOpacity = 0.055 + associative.associationStrength * 0.27 + associative.recurrence * 0.12;
-        const material = new THREE.MeshBasicMaterial({ color: 0x58709c, transparent: true, opacity: baseOpacity, depthWrite: false });
-        const edge = new THREE.Mesh(geometry, material);
-        const appended = hadGraph && (!previousLinkIds.has(linkIdentity(link)) || (dreamChanged && (dreamTouched.has(link.source) || dreamTouched.has(link.target))));
-        edge.userData = { link, tightness, associationStrength:associative.associationStrength, recurrence:associative.recurrence, confirmations:associative.confirmations, thickness:associative.thickness, arch:associative.arch, angle:associative.angle, family:associative.family, source: link.source, target: link.target, curve, baseColor:material.color.clone(), baseOpacity, appendedAt:appended ? appendedAt : 0 };
-        graphRoot.add(edge);
-        edgeObjects.push(edge);
-        edgeById.set(linkIdentity(link), edge);
-        if (appended) appendPulseObjects.push(edge);
-      }
+      if (labelSprite) { labelSprite.material.map?.dispose(); labelSprite.material.dispose(); graphRoot.remove(labelSprite); labelSprite = null; }
+      if (nodeMesh) { graphRoot.remove(nodeMesh); nodeMesh.geometry.dispose(); nodeMesh.material.dispose(); nodeMesh = null; }
+      if (lineSegments) { graphRoot.remove(lineSegments); lineSegments.geometry.dispose(); lineSegments.material.dispose(); lineSegments = null; }
+      nodeCount = nodes.length;
+      nodeInstanceIdMap.clear();
+      nodeTweens.length = 0;
+      nodeBasePositions.length = 0;
+      nodeTargetPositions.length = 0;
+      hoveredNodeId = null;
+      selectedNodeId = null;
+      edgeDataList.length = 0;
 
-      const sphereGeometry = new THREE.IcosahedronGeometry(1, 1);
-      for (const node of nodes) {
-        const confidence = THREE.MathUtils.clamp(Number(node.confidence ?? 0.65), 0.1, 1);
-        const degree = (linksByNode.get(node.id) || []).length;
-        const radius = 0.3 + Math.min(0.48, Math.log2(degree + 1) * 0.09) + confidence * 0.12;
-        const material = new THREE.MeshStandardMaterial({
-          color: nodeColor(node),
-          emissive: nodeColor(node),
-          emissiveIntensity: 0.28,
-          roughness: 0.38,
-          metalness: 0.08,
-          transparent: true,
-        });
-        const mesh = new THREE.Mesh(sphereGeometry.clone(), material);
-        const targetPosition = positions.get(node.id).clone();
-        mesh.position.copy(previousPositions.get(node.id) || targetPosition);
-        mesh.scale.setScalar(radius);
-        const appended = hadGraph && (!previousNodeIds.has(node.id) || (dreamChanged && dreamTouched.has(node.id)));
-        mesh.userData = { node, baseScale: radius, baseColor:material.color.clone(), displayEmissiveIntensity:0.28, appendedAt:appended ? appendedAt : 0, tweenFrom:mesh.position.clone(), tweenTarget:targetPosition, tweenAt:hadGraph && previousPositions.has(node.id) ? appendedAt : 0 };
-        graphRoot.add(mesh);
-        meshes.push(mesh);
-        meshById.set(node.id, mesh);
-        if (appended) appendPulseObjects.push(mesh);
+      if (nodeCount === 0) { if (hadGraph) { camera.position.copy(savedCam); controls.target.copy(savedTgt); controls.update(); } else fitCamera(); return; }
+
+      const sphereGeo = new THREE.IcosahedronGeometry(1, 1);
+      const nodeMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 1 });
+      nodeMesh = new THREE.InstancedMesh(sphereGeo, nodeMat, nodeCount);
+      nodeMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(nodeCount * 3), 3);
+      const dummy = new THREE.Object3D();
+      const nodeDegree = new Map(nodes.map(n => [n.id, 0]));
+      for (const link of links) {
+        nodeDegree.set(link.source, (nodeDegree.get(link.source) || 0) + 1);
+        nodeDegree.set(link.target, (nodeDegree.get(link.target) || 0) + 1);
       }
+      for (let i = 0; i < nodeCount; i++) {
+        const node = nodes[i];
+        const pos = positions.get(node.id) || new THREE.Vector3();
+        const radius = computeRadius(node, nodeDegree.get(node.id));
+        nodeInstanceIdMap.set(node.id, i);
+        const p = prevPos.get(node.id);
+        const targetPos = pos.clone();
+        nodeBasePositions[i] = (hadGraph && p) ? p.clone() : targetPos.clone();
+        nodeTargetPositions[i] = targetPos;
+        dummy.position.copy(nodeBasePositions[i]);
+        dummy.scale.setScalar(radius);
+        dummy.updateMatrix();
+        nodeMesh.setMatrixAt(i, dummy.matrix);
+        const c = nodeColor(node);
+        nodeMesh.instanceColor.setXYZ(i, c.r, c.g, c.b);
+        const appended = hadGraph && (!prevNodeIds.has(node.id) || (dreamChanged && dreamTouched.has(node.id)));
+        nodeTweens[i] = {
+          node, radius,
+          from: (hadGraph && p) ? p.clone() : targetPos.clone(),
+          to: targetPos,
+          tweenAt: hadGraph && prevPos.has(node.id) ? appendedAt : 0,
+          baseColor: c.clone(),
+          displayOpacity: 1, displayScale: 1,
+          appendedAt: appended ? appendedAt : 0,
+          activationAt: 0, activationIntensity: 0, activationColor: null,
+        };
+      }
+      nodeMesh.instanceMatrix.needsUpdate = true;
+      nodeMesh.instanceColor.needsUpdate = true;
+      graphRoot.add(nodeMesh);
+
+      const renderedLinks = links
+        .filter(l => positions.has(l.source) && positions.has(l.target))
+        .sort((a, b) => Number(b.associative?.tightness || 0) - Number(a.associative?.tightness || 0))
+        .slice(0, 2400);
+      edgeLineCount = renderedLinks.length;
+      const vertCount = edgeLineCount * (SPLINE_PTS + 1) * 2;
+      edgeLinePositions = new Float32Array(vertCount * 3);
+      edgeLineColors = new Float32Array(vertCount * 3);
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute('position', new THREE.BufferAttribute(edgeLinePositions, 3));
+      lineGeo.setAttribute('color', new THREE.BufferAttribute(edgeLineColors, 3));
+      const lineMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 1, depthWrite: false, linewidth: 1 });
+      lineSegments = new THREE.LineSegments(lineGeo, lineMat);
+      graphRoot.add(lineSegments);
+
+      for (let li = 0; li < edgeLineCount; li++) {
+        const link = renderedLinks[li];
+        const src = positions.get(link.source), tgt = positions.get(link.target);
+        const assoc = link.associative || relationRule(link);
+        const pts = associativeSplinePoints(src, tgt, link, assoc);
+        const baseOpacity = 0.055 + assoc.associationStrength * 0.27 + assoc.recurrence * 0.12;
+        const cr = 0.34 + assoc.thickness * 0.66;
+        const cg = 0.46 + assoc.associationStrength * 0.38;
+        const cb = 0.61 + assoc.recurrence * 0.22;
+        const appended = hadGraph && (!prevLinkIds.has(linkIdentity(link)) || (dreamChanged && (dreamTouched.has(link.source) || dreamTouched.has(link.target))));
+        edgeDataList[li] = {
+          points: pts, baseOpacity,
+          r: 0.34 * baseOpacity + cr * (1 - baseOpacity),
+          g: 0.44 * baseOpacity + cg * (1 - baseOpacity),
+          b: 0.61 * baseOpacity + cb * (1 - baseOpacity),
+          displayOpacity: 1,
+          source: link.source, target: link.target,
+          appendedAt: appended ? appendedAt : 0,
+          activationAt: 0, activationIntensity: 0,
+        };
+      }
+      updateEdgeGeometry();
+      lineGeo.attributes.position.needsUpdate = true;
+      lineGeo.attributes.color.needsUpdate = true;
+
       if (hadGraph) {
-        camera.position.copy(savedCamera);
-        controls.target.copy(savedTarget);
-        if (selectedId && meshById.has(selectedId)) {
-          selected = meshById.get(selectedId);
-          selected.scale.setScalar(selected.userData.baseScale * 1.7);
-          makeLabel(selected.userData.node, selected);
-          controls.target.copy(selected.position);
+        camera.position.copy(savedCam);
+        controls.target.copy(savedTgt);
+        if (selectedId && nodeInstanceIdMap.has(selectedId)) {
+          selectedNodeId = selectedId;
+          const idx = nodeInstanceIdMap.get(selectedId);
+          nodeTweens[idx].displayScale = 1.7;
+          makeLabel(nodeTweens[idx].node, nodeTargetPositions[idx]);
+          controls.target.copy(nodeTargetPositions[idx]);
         }
         controls.update();
       } else {
@@ -884,139 +887,171 @@ if (container) {
       applyFilter({ query: document.getElementById('graph-search')?.value || '', kind: document.getElementById('graph-kind')?.value || '' });
     }
 
+    function updateEdgeGeometry() {
+      let vi = 0;
+      for (let li = 0; li < edgeLineCount; li++) {
+        const ed = edgeDataList[li];
+        const pts = ed.points;
+        for (let s = 0; s <= SPLINE_PTS; s++) {
+          const t = s / SPLINE_PTS;
+          const i0 = Math.min(Math.floor(t * (pts.length - 1)), pts.length - 2);
+          const local = (t * (pts.length - 1)) - i0;
+          const p0 = pts[i0], p1 = pts[i0 + 1];
+          const px = p0.x + (p1.x - p0.x) * local;
+          const py = p0.y + (p1.y - p0.y) * local;
+          const pz = p0.z + (p1.z - p0.z) * local;
+          const edgeFade = Math.min(t, 1 - t) * 4;
+          const brightness = Math.min(1, ed.baseOpacity * (0.5 + edgeFade * 0.5)) * ed.displayOpacity;
+          edgeLinePositions[vi] = px;
+          edgeLinePositions[vi + 1] = py;
+          edgeLinePositions[vi + 2] = pz;
+          edgeLineColors[vi] = ed.r * brightness;
+          edgeLineColors[vi + 1] = ed.g * brightness;
+          edgeLineColors[vi + 2] = ed.b * brightness;
+          vi += 3;
+        }
+      }
+    }
+
     function fireActivations(payload) {
       const events = Array.isArray(payload?.events) ? payload.events : [];
-      for (const event of events.sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0))) {
+      for (const event of events.sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0))) {
         const sequence = Number(event.sequence || 0);
         if (!sequence || sequence <= lastActivationSequence) continue;
         lastActivationSequence = sequence;
         const now = performance.now(), intensity = THREE.MathUtils.clamp(Number(event.intensity || 1), .1, 1);
-        const origins = (event.origin_node_ids || []).filter(nodeId => meshById.has(nodeId));
-        const explicit = (event.node_ids || []).filter(nodeId => meshById.has(nodeId));
+        const origins = (event.origin_node_ids || []).filter(id => nodeInstanceIdMap.has(id));
+        const explicit = (event.node_ids || []).filter(id => nodeInstanceIdMap.has(id));
         const seeds = origins.length ? origins : explicit;
-        const schedule = new Map(seeds.map(nodeId => [nodeId, 0]));
-        for (const nodeId of explicit) if (!schedule.has(nodeId)) schedule.set(nodeId, activationHopMs);
-        const queue = [...schedule].map(([nodeId, delay]) => ({nodeId,delay,depth:delay ? 1 : 0}));
+        const schedule = new Map(seeds.map(id => [id, 0]));
+        for (const id of explicit) if (!schedule.has(id)) schedule.set(id, activationHopMs);
+        const queue = [...schedule].map(([id, delay]) => ({ nodeId: id, delay, depth: delay ? 1 : 0 }));
         let traversed = 0;
         while (queue.length && traversed < 120) {
           const current = queue.shift(); traversed += 1;
           if (!event.cascade || current.depth >= 3) continue;
           const neighbors = [...(linksByNode.get(current.nodeId) || [])]
-            .sort((left, right) => Number(right.associative?.tightness || 0) - Number(left.associative?.tightness || 0)).slice(0, 10);
+            .sort((a, b) => Number(b.associative?.tightness || 0) - Number(a.associative?.tightness || 0)).slice(0, 10);
           for (const link of neighbors) {
             const neighborId = link.source === current.nodeId ? link.target : link.source;
             const delay = current.delay + activationHopMs;
-            const edge = edgeById.get(linkIdentity(link));
-            if (edge) {
-              edge.userData.activationAt = now + current.delay + activationHopMs * .45;
-              edge.userData.activationIntensity = intensity * Math.pow(.78, current.depth);
-              edge.userData.activationColor = new THREE.Color(firingColor(event.source));
-              activePulseObjects.add(edge);
-            }
             if (!schedule.has(neighborId) || delay < schedule.get(neighborId)) {
               schedule.set(neighborId, delay);
-              queue.push({nodeId:neighborId,delay,depth:current.depth+1});
+              queue.push({ nodeId: neighborId, delay, depth: current.depth + 1 });
             }
           }
         }
-        for (const [nodeId, delay] of schedule) {
-          const mesh = meshById.get(nodeId);
-          if (!mesh) continue;
-          mesh.userData.activationAt = now + delay;
-          mesh.userData.activationIntensity = intensity * Math.pow(.82, Math.round(delay / activationHopMs));
-          mesh.userData.activationSource = event.source;
-          mesh.userData.activationColor = new THREE.Color(firingColor(event.source));
-          activePulseObjects.add(mesh);
+        const fc = firingColor(event.source);
+        for (const [id, delay] of schedule) {
+          const idx = nodeInstanceIdMap.get(id);
+          if (idx == null) continue;
+          nodeTweens[idx].activationAt = now + delay;
+          nodeTweens[idx].activationIntensity = intensity * Math.pow(.82, Math.round(delay / activationHopMs));
+          nodeTweens[idx].activationColor = fc;
         }
       }
     }
 
     function fitCamera() {
-      if (!meshes.length) {
+      if (nodeCount === 0) {
         camera.position.set(0, 0, 32);
         controls.target.set(0, 0, 0);
         controls.update();
         return;
       }
-      const bounds = new THREE.Box3().setFromObject(graphRoot);
-      const center = bounds.getCenter(new THREE.Vector3());
-      const size = bounds.getSize(new THREE.Vector3());
-      const distance = Math.max(18, size.length() * 0.78);
-      camera.position.copy(center).add(new THREE.Vector3(0, size.y * 0.08, distance));
-      controls.target.copy(center);
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      for (let i = 0; i < nodeCount; i++) {
+        const p = nodeTargetPositions[i];
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+      }
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+      const spanX = Math.max(1, maxX - minX), spanY = Math.max(1, maxY - minY), spanZ = Math.max(1, maxZ - minZ);
+      const distance = Math.max(18, Math.hypot(spanX, spanY, spanZ) * 0.78);
+      camera.position.set(cx, cy + spanY * 0.08, cz + distance);
+      controls.target.set(cx, cy, cz);
       controls.update();
     }
 
-    function applyFilter(filter = {}) {
-      const query = String(filter.query || '').trim().toLowerCase();
-      const kind = String(filter.kind || '');
-      const visible = new Set();
-      for (const mesh of meshes) {
-        const node = mesh.userData.node;
+    function applyFilter(filter) {
+      const query = String(filter?.query || '').trim().toLowerCase();
+      const kind = String(filter?.kind || '');
+      if (!nodeMesh) return;
+      const c = new THREE.Color();
+      for (let i = 0; i < nodeCount; i++) {
+        const tw = nodeTweens[i];
+        const node = tw.node;
         const text = `${node.label || ''} ${node.source_id || ''} ${node.subtype || ''}`.toLowerCase();
         const match = graphNodeMatches(node, kind) && (!query || text.includes(query));
-        if (match) visible.add(node.id);
-        mesh.material.opacity = match ? 1 : 0.075;
-        mesh.userData.displayEmissiveIntensity = match ? 0.28 : 0.04;
-        mesh.material.emissiveIntensity = mesh.userData.displayEmissiveIntensity;
+        tw.displayOpacity = match ? 1 : 0.075;
+        tw.displayScale = match ? 1 : 0.7;
+        c.copy(tw.baseColor);
+        if (!match) c.multiplyScalar(0.3);
+        nodeMesh.instanceColor.setXYZ(i, c.r, c.g, c.b);
       }
-      for (const edge of edgeObjects) {
-        const match = visible.has(edge.userData.source) && visible.has(edge.userData.target);
-        edge.userData.displayOpacity = match ? edge.userData.baseOpacity : 0.012;
-        edge.material.opacity = edge.userData.displayOpacity;
+      nodeMesh.instanceColor.needsUpdate = true;
+      const visibleIds = new Set();
+      for (let i = 0; i < nodeCount; i++) if (nodeTweens[i].displayOpacity > 0.5) visibleIds.add(nodeTweens[i].node.id);
+      for (let li = 0; li < edgeLineCount; li++) {
+        const ed = edgeDataList[li];
+        ed.displayOpacity = (visibleIds.has(ed.source) && visibleIds.has(ed.target)) ? 1 : 0.04;
       }
-      if ((query || kind) && visible.size === 1) {
-        const target = meshById.get([...visible][0]);
-        controls.target.copy(target.position);
+      if ((query || kind) && visibleIds.size === 1) {
+        const idx = nodeInstanceIdMap.get([...visibleIds][0]);
+        if (idx != null) controls.target.copy(nodeTargetPositions[idx]);
       }
     }
 
-    function makeLabel(node, mesh) {
-      if (labelSprite) {
-        labelSprite.material.map?.dispose();
-        labelSprite.material.dispose();
-        graphRoot.remove(labelSprite);
-      }
+    function makeLabel(node, position) {
+      if (labelSprite) { labelSprite.material.map?.dispose(); labelSprite.material.dispose(); graphRoot.remove(labelSprite); }
       const text = String(node.label || node.source_id || node.id).slice(0, 64);
       const canvas = document.createElement('canvas');
-      const context = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d');
       const scale = 2;
-      context.font = `600 ${12 * scale}px ui-sans-serif, system-ui, sans-serif`;
-      const width = Math.min(520, Math.ceil(context.measureText(text).width + 30 * scale));
+      ctx.font = `600 ${12 * scale}px ui-sans-serif, system-ui, sans-serif`;
+      const width = Math.min(520, Math.ceil(ctx.measureText(text).width + 30 * scale));
       canvas.width = Math.max(160, width);
       canvas.height = 34 * scale;
-      context.fillStyle = 'rgba(9,13,18,.96)';
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      context.strokeStyle = 'rgba(132,173,255,.75)';
-      context.lineWidth = 2;
-      context.stroke();
-      context.fillStyle = '#f2f4f7';
-      context.font = `600 ${12 * scale}px ui-sans-serif, system-ui, sans-serif`;
-      context.textBaseline = 'middle';
-      context.fillText(text, 15 * scale, canvas.height / 2);
+      ctx.fillStyle = 'rgba(9,13,18,.96)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = 'rgba(132,173,255,.75)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#f2f4f7';
+      ctx.font = `600 ${12 * scale}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, 15 * scale, canvas.height / 2);
       const texture = new THREE.CanvasTexture(canvas);
       texture.colorSpace = THREE.SRGBColorSpace;
       const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
       labelSprite = new THREE.Sprite(material);
       labelSprite.scale.set(canvas.width / 75, canvas.height / 75, 1);
-      labelSprite.position.copy(mesh.position).add(new THREE.Vector3(0, mesh.scale.x + 0.8, 0));
+      const idx = nodeInstanceIdMap.get(node.id);
+      const r = idx != null ? nodeTweens[idx].radius : 0.5;
+      labelSprite.position.copy(position).add(new THREE.Vector3(0, r + 0.8, 0));
       labelSprite.renderOrder = 20;
       graphRoot.add(labelSprite);
     }
 
-    function selectMesh(mesh) {
-      if (selected && selected !== mesh) selected.scale.setScalar(selected.userData.baseScale);
-      selected = mesh;
-      if (!mesh) return;
-      mesh.scale.setScalar(mesh.userData.baseScale * 1.7);
-      makeLabel(mesh.userData.node, mesh);
-      controls.target.copy(mesh.position);
+    function selectNode(nodeId) {
+      if (selectedNodeId && nodeInstanceIdMap.has(selectedNodeId)) {
+        nodeTweens[nodeInstanceIdMap.get(selectedNodeId)].displayScale = 1;
+      }
+      selectedNodeId = nodeId;
+      if (!nodeId) { if (labelSprite) { labelSprite.material.map?.dispose(); labelSprite.material.dispose(); graphRoot.remove(labelSprite); labelSprite = null; } return; }
+      const idx = nodeInstanceIdMap.get(nodeId);
+      if (idx == null) return;
+      nodeTweens[idx].displayScale = 1.7;
+      makeLabel(nodeTweens[idx].node, nodeTargetPositions[idx]);
+      controls.target.copy(nodeTargetPositions[idx]);
       controls.update();
-      const neighbors = (linksByNode.get(mesh.userData.node.id) || []).map(link => {
-        const otherId = link.source === mesh.userData.node.id ? link.target : link.source;
+      const node = nodeTweens[idx].node;
+      const neighbors = (linksByNode.get(node.id) || []).map(link => {
+        const otherId = link.source === node.id ? link.target : link.source;
         return { ...link, label: nodeById.get(otherId)?.label || otherId };
       });
-      window.dispatchEvent(new CustomEvent('egg:graph-selection', { detail: { node: mesh.userData.node, neighbors } }));
+      window.dispatchEvent(new CustomEvent('egg:graph-selection', { detail: { node, neighbors } }));
     }
 
     function updatePointer(event) {
@@ -1029,10 +1064,10 @@ if (container) {
     renderer.domElement.addEventListener('pointermove', event => {
       updatePointer(event);
       raycaster.setFromCamera(pointer, camera);
-      const next = raycaster.intersectObjects(meshes, false)[0]?.object || null;
-      if (next !== hovered) {
-        hovered = next;
-        renderer.domElement.style.cursor = hovered ? 'pointer' : 'grab';
+      if (nodeMesh) {
+        const hits = raycaster.intersectObject(nodeMesh, false);
+        const nextId = hits.length > 0 ? nodeTweens[hits[0].instanceId]?.node.id || null : null;
+        if (nextId !== hoveredNodeId) { hoveredNodeId = nextId; renderer.domElement.style.cursor = hoveredNodeId ? 'pointer' : 'grab'; }
       }
     });
     renderer.domElement.addEventListener('pointerup', event => {
@@ -1041,13 +1076,16 @@ if (container) {
       if (!origin || Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 5) return;
       updatePointer(event);
       raycaster.setFromCamera(pointer, camera);
-      selectMesh(raycaster.intersectObjects(meshes, false)[0]?.object || null);
+      if (nodeMesh) {
+        const hits = raycaster.intersectObject(nodeMesh, false);
+        selectNode(hits.length > 0 ? nodeTweens[hits[0].instanceId]?.node.id || null : null);
+      }
     });
 
     function resize() {
-      const width = Math.max(1, container.clientWidth), height = Math.max(1, container.clientHeight);
-      renderer.setSize(width, height, false);
-      camera.aspect = width / height;
+      const w = Math.max(1, container.clientWidth), h = Math.max(1, container.clientHeight);
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
       camera.updateProjectionMatrix();
     }
     new ResizeObserver(resize).observe(container);
@@ -1062,70 +1100,92 @@ if (container) {
     if (window.__eggGraphActivations) fireActivations(window.__eggGraphActivations);
 
     const clock = new THREE.Clock();
+    const dummy = new THREE.Object3D();
     function animate() {
       requestAnimationFrame(animate);
       const elapsed = clock.getElapsedTime();
       const now = performance.now();
       let selectedMoved = false;
-      for (const mesh of meshes) {
-        if (!mesh.userData.tweenAt) continue;
-        const raw = Math.min(1, (now - mesh.userData.tweenAt) / layoutTweenMs);
-        const eased = 1 - Math.pow(1 - raw, 3);
-        mesh.position.lerpVectors(mesh.userData.tweenFrom, mesh.userData.tweenTarget, eased);
-        if (mesh === selected) selectedMoved = true;
-        if (raw >= 1) mesh.userData.tweenAt = 0;
-      }
-      if (selectedMoved) {
-        controls.target.lerp(selected.position, 0.22);
-        if (labelSprite) labelSprite.position.copy(selected.position).add(new THREE.Vector3(0, selected.scale.x + 0.8, 0));
-      }
-      controls.update();
-      appendPulseObjects = appendPulseObjects.filter(object => {
-        const progress = (now - object.userData.appendedAt) / appendFlashMs;
-        if (progress >= 1) {
-          object.material.color.copy(object.userData.baseColor);
-          if (object.userData.node) {
-            object.material.emissive.copy(object.userData.baseColor);
-            object.material.emissiveIntensity = object.userData.displayEmissiveIntensity;
-            if (object !== selected) object.scale.setScalar(object.userData.baseScale);
-          } else object.material.opacity = object.userData.displayOpacity ?? object.userData.baseOpacity;
-          return false;
+      let matricesDirty = false;
+      let colorsDirty = false;
+
+      for (let i = 0; i < nodeCount; i++) {
+        const tw = nodeTweens[i];
+        const pos = nodeBasePositions[i];
+        if (tw.tweenAt) {
+          const raw = Math.min(1, (now - tw.tweenAt) / layoutTweenMs);
+          const eased = 1 - Math.pow(1 - raw, 3);
+          pos.x = tw.from.x + (tw.to.x - tw.from.x) * eased;
+          pos.y = tw.from.y + (tw.to.y - tw.from.y) * eased;
+          pos.z = tw.from.z + (tw.to.z - tw.from.z) * eased;
+          if (raw >= 1) tw.tweenAt = 0;
+          matricesDirty = true;
         }
-        const flash = Math.max(0, 1 - progress);
-        object.material.color.copy(object.userData.baseColor).lerp(white, flash);
-        if (object.userData.node) {
-          object.material.emissive.copy(object.userData.baseColor).lerp(white, flash);
-          object.material.emissiveIntensity = 0.28 + flash * 2.8;
-          if (object !== selected) object.scale.setScalar(object.userData.baseScale * (1 + flash * 0.28));
+        let scale = tw.radius * tw.displayScale;
+        let flash = 0;
+        if (tw.appendedAt) {
+          const progress = (now - tw.appendedAt) / appendFlashMs;
+          if (progress < 1) flash = 1 - progress; else tw.appendedAt = 0;
+        }
+        if (tw.activationAt) {
+          const ap = (now - tw.activationAt) / activationPulseMs;
+          if (ap >= 1) tw.activationAt = 0;
+          else if (ap >= 0) flash = Math.max(flash, Math.sin(ap * Math.PI) * tw.activationIntensity);
+        }
+        if (i === nodeInstanceIdMap.get(selectedNodeId)) { scale *= 1.62 + Math.sin(elapsed * 2.2) * 0.08; selectedMoved = true; }
+        if (flash > 0) {
+          _tmpC.copy(tw.baseColor).lerp(_white, flash);
+          nodeMesh.instanceColor.setXYZ(i, _tmpC.r, _tmpC.g, _tmpC.b);
+          scale *= 1 + flash * 0.28;
+          colorsDirty = true;
+        } else if (tw.displayOpacity < 0.5) {
+          _tmpC.copy(tw.baseColor).multiplyScalar(0.3);
+          nodeMesh.instanceColor.setXYZ(i, _tmpC.r, _tmpC.g, _tmpC.b);
+          colorsDirty = true;
         } else {
-          object.material.opacity = Math.max(object.userData.baseOpacity, 0.25 + flash * 0.75);
+          nodeMesh.instanceColor.setXYZ(i, tw.baseColor.r, tw.baseColor.g, tw.baseColor.b);
+          colorsDirty = true;
         }
-        return true;
-      });
-      for (const object of [...activePulseObjects]) {
-        const elapsed = now - object.userData.activationAt;
-        if (elapsed < 0) continue;
-        const progress = elapsed / activationPulseMs;
-        if (progress >= 1) {
-          object.material.color.copy(object.userData.baseColor);
-          if (object.userData.node) {
-            object.material.emissive.copy(object.userData.baseColor);
-            object.material.emissiveIntensity = object.userData.displayEmissiveIntensity;
-            if (object !== selected) object.scale.setScalar(object.userData.baseScale);
-          } else object.material.opacity = object.userData.displayOpacity ?? object.userData.baseOpacity;
-          activePulseObjects.delete(object);
-          continue;
-        }
-        const firing = Math.sin(progress * Math.PI) * Number(object.userData.activationIntensity || 1);
-        const pulseColor = object.userData.activationColor || white;
-        object.material.color.copy(object.userData.baseColor).lerp(pulseColor, firing);
-        if (object.userData.node) {
-          object.material.emissive.copy(object.userData.baseColor).lerp(pulseColor, firing);
-          object.material.emissiveIntensity = object.userData.displayEmissiveIntensity + firing * 3.4;
-          if (object !== selected) object.scale.setScalar(object.userData.baseScale * (1 + firing * .42));
-        } else object.material.opacity = Math.max(object.userData.baseOpacity, .28 + firing * .72);
+        dummy.position.set(pos.x, pos.y, pos.z);
+        dummy.scale.setScalar(scale);
+        dummy.updateMatrix();
+        nodeMesh.setMatrixAt(i, dummy.matrix);
+        matricesDirty = true;
       }
-      if (selected) selected.scale.setScalar(selected.userData.baseScale * (1.62 + Math.sin(elapsed * 2.2) * 0.08));
+      if (matricesDirty) nodeMesh.instanceMatrix.needsUpdate = true;
+      if (colorsDirty) nodeMesh.instanceColor.needsUpdate = true;
+
+      if (selectedMoved && selectedNodeId) {
+        const idx = nodeInstanceIdMap.get(selectedNodeId);
+        if (idx != null) {
+          controls.target.lerp(nodeBasePositions[idx], 0.22);
+          if (labelSprite) labelSprite.position.copy(nodeBasePositions[idx]).add(new THREE.Vector3(0, nodeTweens[idx].radius * 1.7 + 0.8, 0));
+        }
+      }
+
+      let edgeDirty = false;
+      for (let li = 0; li < edgeLineCount; li++) {
+        const ed = edgeDataList[li];
+        let flash = 0;
+        if (ed.appendedAt) {
+          const progress = (now - ed.appendedAt) / appendFlashMs;
+          if (progress < 1) flash = 1 - progress; else ed.appendedAt = 0;
+        }
+        if (ed.activationAt) {
+          const ap = (now - ed.activationAt) / activationPulseMs;
+          if (ap >= 1) ed.activationAt = 0;
+          else if (ap >= 0) flash = Math.max(flash, Math.sin(ap * Math.PI) * ed.activationIntensity);
+        }
+        if (flash > 0) {
+          const target = Math.min(1, ed.baseOpacity + flash * 0.75);
+          if (Math.abs(target - ed.displayOpacity) > 0.01) { edgeDirty = true; ed.displayOpacity = target; }
+        } else if (Math.abs(ed.displayOpacity - 1) > 0.01) {
+          edgeDirty = true; ed.displayOpacity = 1;
+        }
+      }
+      if (edgeDirty) { updateEdgeGeometry(); lineSegments.geometry.attributes.position.needsUpdate = true; lineSegments.geometry.attributes.color.needsUpdate = true; }
+
+      controls.update();
       renderer.render(scene, camera);
     }
     animate();

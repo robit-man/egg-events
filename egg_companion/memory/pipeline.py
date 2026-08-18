@@ -37,12 +37,13 @@ class MemoryPipeline:
         self._observation_policy_cache: dict[str, object] | None = None
         self._observation_policy_cached_at = 0.0
         
-        # World model integration (lazy initialization)
+        # World model integration (eager initialization)
         self._world_bridge = None
         self._world_reconciler = None
         self._world_normalizer = None
         self._world_query = None
         self._world_context = None
+        self._ensure_world_model()
 
     @property
     def world_query(self) -> object | None:
@@ -466,7 +467,7 @@ class MemoryPipeline:
             ).fetchone()
             
             # Use the same database file but separate connection for world model
-            db_path = self.store._db_path if hasattr(self.store, '_db_path') else ":memory:"
+            db_path = str(self.store.root / "memory.sqlite3") if hasattr(self.store, 'root') else ":memory:"
             
             world_conn = sqlite3.connect(db_path, check_same_thread=False)
             world_conn.execute("PRAGMA journal_mode=WAL")
@@ -492,6 +493,343 @@ class MemoryPipeline:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to initialize world model: {e}")
             self._world_reconciler = None
+
+    def backfill_world_from_evidence(self, batch_size: int = 500, max_items: int = 0) -> dict[str, object]:
+        """Retroactively populate world model from existing evidence store.
+
+        Reads vision evidence, deduplicates by entity, and bulk-ingests
+        into the world model in large batches to avoid per-item transaction overhead.
+        Returns progress stats.
+        """
+        import json
+        import logging
+        import time
+        from collections import defaultdict
+        from dataclasses import dataclass
+        from datetime import datetime, timezone
+
+        logger = logging.getLogger(__name__)
+
+        self._ensure_world_model()
+        if self._world_reconciler is None:
+            return {"error": "world model not initialized", "processed": 0}
+        
+        if self._world_normalizer is None:
+            from egg_companion.world.normalize import ObservationNormalizer
+            self._world_normalizer = ObservationNormalizer()
+
+        db_path = self.store.root / "memory.sqlite3" if hasattr(self.store, 'root') else None
+        if not db_path:
+            return {"error": "no database path", "processed": 0}
+
+        import sqlite3
+        read_conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        read_conn.row_factory = sqlite3.Row
+
+        # Get resume marker
+        marker_row = self.store._read_connection.execute(
+            "SELECT metadata_json FROM entities WHERE entity_id='world-backfill-marker'"
+        ).fetchone()
+        already_done = False
+        if marker_row:
+            try:
+                meta = json.loads(marker_row[0])
+                if meta.get("last_evidence_id") == "completed":
+                    already_done = True
+            except Exception:
+                pass
+
+        if already_done:
+            logger.info("World backfill already completed, skipping")
+            return {"processed": 0, "entities": 0, "relations": 0, "status": "already completed"}
+
+        # Count total
+        total = read_conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE modality='vision' "
+            "AND json_extract(payload_json,'$.detections') IS NOT NULL"
+        ).fetchone()[0]
+
+        logger.info("World backfill: %d vision evidence items", total)
+
+        # Step 1: Aggregate unique entity observations across all evidence
+        # Group by entity_id → pick the observation with highest confidence
+        entity_best: dict[str, dict] = {}
+        entity_seen_count: dict[str, int] = defaultdict(int)
+        relation_set: set[tuple[str, str, str]] = set()
+
+        query = (
+            "SELECT evidence_id, captured_at, source_id, payload_json FROM evidence "
+            "WHERE modality='vision' "
+            "AND json_extract(payload_json,'$.detections') IS NOT NULL "
+            "ORDER BY evidence_id"
+        )
+        cursor = read_conn.execute(query)
+
+        processed = 0
+        skipped = 0
+        start_time = time.monotonic()
+
+        for row in cursor:
+            evidence_id = row[0]
+            captured_at = row[1]
+            source_id = row[2] or "unknown"
+            payload = json.loads(row[3]) if row[3] else {}
+
+            detections = payload.get("detections", [])
+            if not isinstance(detections, list) or not detections:
+                skipped += 1
+                continue
+
+            frame_shape = None
+            if "frame_shape" in payload:
+                fs = payload["frame_shape"]
+                if isinstance(fs, (list, tuple)) and len(fs) >= 2:
+                    frame_shape = (int(fs[0]), int(fs[1]))
+
+            occurred = None
+            if captured_at:
+                try:
+                    occurred = datetime.fromisoformat(str(captured_at).replace('Z', '+00:00')) if isinstance(captured_at, str) else captured_at
+                except Exception:
+                    occurred = datetime.now(timezone.utc)
+            else:
+                occurred = datetime.now(timezone.utc)
+
+            for det in detections:
+                if not isinstance(det, dict):
+                    continue
+                entity_id = det.get("entity_id") or det.get("object_id") or det.get("identity_id")
+                if not entity_id:
+                    # Use label-based entity for tracked detections
+                    label = det.get("label", "")
+                    if label:
+                        entity_id = f"det:{label}"
+                    else:
+                        continue
+
+                entity_seen_count[entity_id] += 1
+                confidence = float(det.get("confidence", 0.0))
+
+                # Keep highest-confidence observation per entity
+                if entity_id not in entity_best or confidence > entity_best[entity_id]["confidence"]:
+                    camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
+                    entity_best[entity_id] = {
+                        "label": det.get("label", "unknown"),
+                        "confidence": confidence,
+                        "bbox": det.get("bbox"),
+                        "behavior": det.get("behavior"),
+                        "source_id": source_id,
+                        "camera_id": camera_id,
+                        "valid_from": occurred.isoformat() if isinstance(occurred, datetime) else str(occurred),
+                        "evidence_id": evidence_id,
+                        "frame_shape": frame_shape,
+                        "first_seen": occurred,
+                    }
+
+                # Collect relation: entity → camera
+                camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
+                relation_set.add((entity_id, "visible_from", f"camera_view:{camera_id}"))
+
+            processed += 1
+            if processed % 5000 == 0:
+                logger.info("World backfill scan: %d/%d evidence, %d unique entities so far", processed, total, len(entity_best))
+
+        read_conn.close()
+
+        elapsed_scan = time.monotonic() - start_time
+        logger.info(
+            "World backfill scan complete: %d evidence, %d unique entities, %d relations (%.1fs)",
+            processed, len(entity_best), len(relation_set), elapsed_scan,
+        )
+
+        # Step 2: Bulk ingest all entities in one big transaction
+        if not entity_best:
+            return {"processed": processed, "entities": 0, "relations": 0, "skipped": skipped}
+
+        @dataclass
+        class _Event:
+            source_id: str = "unknown"
+            event_type: str = "vision"
+            payload: dict = None
+            entity_ids: tuple = ()
+            occurred_at: datetime = None
+            evidence: tuple = ()
+
+        from egg_companion.world.types import WorldDelta
+
+        bulk_delta = WorldDelta()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for entity_id, info in entity_best.items():
+            label = info["label"]
+            confidence = info["confidence"]
+            bbox = info["bbox"]
+            behavior = info["behavior"]
+            source_id = info["source_id"]
+            camera_id = info["camera_id"]
+            valid_from = info["valid_from"]
+            evidence_id = info["evidence_id"]
+            frame_shape = info["frame_shape"]
+            seen_count = entity_seen_count[entity_id]
+
+            from egg_companion.world.types import TypedValue, ValueType, EpistemicKind, ObservabilityState
+
+            bulk_delta.assertions.append({
+                "subject_id": entity_id,
+                "property_id": "label",
+                "value": TypedValue(raw=label, value_type=ValueType.STRING),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": (evidence_id,),
+                "confidence": confidence,
+                "authority": 0.7,
+                "valid_from": valid_from,
+            })
+
+            if bbox:
+                if isinstance(bbox, dict):
+                    bbox_list = [bbox.get("x1", 0), bbox.get("y1", 0), bbox.get("x2", 0), bbox.get("y2", 0)]
+                else:
+                    bbox_list = list(bbox)
+                bulk_delta.assertions.append({
+                    "subject_id": entity_id,
+                    "property_id": "bbox",
+                    "value": TypedValue(raw=bbox_list, value_type=ValueType.GEOMETRY),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": (evidence_id,),
+                    "confidence": confidence,
+                    "authority": 0.7,
+                    "valid_from": valid_from,
+                })
+
+            if behavior:
+                bulk_delta.assertions.append({
+                    "subject_id": entity_id,
+                    "property_id": "behavior",
+                    "value": TypedValue(raw=behavior, value_type=ValueType.STRING),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": (evidence_id,),
+                    "confidence": confidence,
+                    "authority": 0.7,
+                    "valid_from": valid_from,
+                })
+
+            bulk_delta.assertions.append({
+                "subject_id": entity_id,
+                "property_id": "last_seen",
+                "value": TypedValue(raw=valid_from, value_type=ValueType.DATETIME),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": (evidence_id,),
+                "confidence": confidence,
+                "authority": 0.9,
+                "valid_from": valid_from,
+            })
+
+            bulk_delta.assertions.append({
+                "subject_id": entity_id,
+                "property_id": "observability",
+                "value": TypedValue(raw=ObservabilityState.OBSERVED_PRESENT.value, value_type=ValueType.ENUM),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": (evidence_id,),
+                "confidence": confidence,
+                "authority": 0.9,
+                "valid_from": valid_from,
+            })
+
+            bulk_delta.assertions.append({
+                "subject_id": entity_id,
+                "property_id": "observation_count",
+                "value": TypedValue(raw=seen_count, value_type=ValueType.INTEGER),
+                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "source_id": source_id,
+                "evidence_ids": (evidence_id,),
+                "confidence": min(1.0, 0.5 + seen_count * 0.05),
+                "authority": 0.9,
+                "valid_from": valid_from,
+            })
+
+            if frame_shape and bbox:
+                h, w = frame_shape
+                try:
+                    bx = bbox_list if isinstance(bbox_list, list) else [bbox.get("x1",0), bbox.get("y1",0), bbox.get("x2",0), bbox.get("y2",0)]
+                    center_x = ((bx[0] + bx[2]) / 2) / w
+                    center_y = ((bx[1] + bx[3]) / 2) / h
+                    bulk_delta.assertions.append({
+                        "subject_id": entity_id,
+                        "property_id": "current_location",
+                        "value": TypedValue(
+                            raw={"frame": f"{camera_id}_normalized", "position": [round(center_x, 4), round(center_y, 4)]},
+                            value_type=ValueType.GEOMETRY,
+                        ),
+                        "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                        "source_id": source_id,
+                        "evidence_ids": (evidence_id,),
+                        "confidence": confidence * 0.8,
+                        "authority": 0.7,
+                        "valid_from": valid_from,
+                    })
+                except Exception:
+                    pass
+
+            bulk_delta.relation_assertions.append({
+                "source_entity_id": entity_id,
+                "relation_type_id": "visible_from",
+                "target_entity_id": f"camera_view:{camera_id}",
+                "confidence": confidence,
+                "authority": 0.7,
+                "source_id": source_id,
+                "evidence_ids": (evidence_id,),
+                "valid_from": valid_from,
+            })
+
+        logger.info(
+            "World backfill ingesting %d assertions + %d relations for %d entities",
+            len(bulk_delta.assertions), len(bulk_delta.relation_assertions), len(entity_best),
+        )
+
+        ingest_start = time.monotonic()
+        try:
+            conflicts = self._world_reconciler.ingest(bulk_delta)
+        except Exception as e:
+            logger.error("World backfill ingest failed: %s", e)
+            return {"processed": processed, "entities": 0, "error": str(e)}
+
+        ingest_elapsed = time.monotonic() - ingest_start
+        total_elapsed = time.monotonic() - start_time
+
+        self._save_backfill_marker("completed")
+
+        stats = {
+            "processed": processed,
+            "entities": len(entity_best),
+            "relations": len(relation_set),
+            "assertions": len(bulk_delta.assertions),
+            "conflicts": len(conflicts),
+            "skipped": skipped,
+            "scan_seconds": round(elapsed_scan, 2),
+            "ingest_seconds": round(ingest_elapsed, 2),
+            "total_seconds": round(total_elapsed, 2),
+        }
+        logger.info("World backfill complete: %s", stats)
+        return stats
+
+    def _save_backfill_marker(self, evidence_id: str) -> None:
+        """Save backfill progress marker to allow resume."""
+        import json
+        from datetime import datetime, timezone
+        try:
+            self.store.upsert_entity(
+                "system",
+                "world-backfill-marker",
+                {"last_evidence_id": evidence_id, "updated_at": datetime.now(timezone.utc).isoformat()},
+                entity_id="world-backfill-marker",
+            )
+        except Exception:
+            pass
 
     def graph_node_detail(self, kind: str, source_id: str) -> dict[str, object] | None:
         return self.store.graph_node_detail(kind, source_id)

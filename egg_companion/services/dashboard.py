@@ -241,7 +241,12 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             node_limit = max(50, min(2000, int(request.query.get("limit", "1500"))))
         except ValueError as error:
             raise web.HTTPBadRequest(text="limit must be an integer") from error
-        payload = await dashboard_call(companion().knowledge_graph_snapshot, node_limit)
+        try:
+            payload = await dashboard_call(companion().knowledge_graph_snapshot, node_limit)
+        except Exception as error:
+            import traceback, logging
+            logging.getLogger(__name__).error("graph_handler error: %s\n%s", error, traceback.format_exc())
+            raise web.HTTPInternalServerError(text=f"graph error: {error}") from error
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def graph_node_handler(request: web.Request) -> web.Response:
@@ -575,6 +580,40 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         runtime.telemetry.record_consolidation(result)
         return web.json_response(result)
 
+    async def world_summary_handler(_: web.Request) -> web.Response:
+        pipeline = companion()._memory
+        query = getattr(pipeline, "world_query", None) if pipeline else None
+        if query is None:
+            return web.json_response({"error": "world model not initialized"}, status=503)
+        return web.json_response(
+            await dashboard_call(query.world_summary),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def world_entity_handler(request: web.Request) -> web.Response:
+        entity_id = request.match_info["entity_id"]
+        pipeline = companion()._memory
+        query = getattr(pipeline, "world_query", None) if pipeline else None
+        if query is None:
+            return web.json_response({"error": "world model not initialized"}, status=503)
+        result = await dashboard_call(query.explain_entity, entity_id)
+        if result is None:
+            return web.json_response({"error": "entity not found"}, status=404)
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
+    async def world_conflicts_handler(_: web.Request) -> web.Response:
+        pipeline = companion()._memory
+        query = getattr(pipeline, "world_query", None) if pipeline else None
+        if query is None:
+            return web.json_response({"error": "world model not initialized"}, status=503)
+        conflicts = await dashboard_call(query.conflicts)
+        return web.json_response(
+            [{"entity_id": c.entity_id, "property_id": c.property_id,
+              "current_value": c.current_value, "proposed_value": c.proposed_value,
+              "reason": c.reason, "assertions": c.assertions} for c in conflicts],
+            headers={"Cache-Control": "no-store"},
+        )
+
     app = web.Application()
     app.router.add_get("/", index_handler)
     app.router.add_get("/api/state", state_handler)
@@ -614,6 +653,9 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app.router.add_post("/api/memory/revisions", memory_revision_handler)
     app.router.add_post("/api/memory/consolidate", memory_consolidate_handler)
     app.router.add_get("/api/cognition/state", cognition_state_handler)
+    app.router.add_get("/api/world", world_summary_handler)
+    app.router.add_get("/api/world/entity/{entity_id}", world_entity_handler)
+    app.router.add_get("/api/world/conflicts", world_conflicts_handler)
     app.router.add_static(
         "/assets/",
         Path(__file__).with_name("vendor"),

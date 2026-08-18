@@ -136,6 +136,8 @@ class ObservationNormalizer:
             })
 
             if bbox:
+                if isinstance(bbox, dict):
+                    bbox = [bbox.get("x1", 0), bbox.get("y1", 0), bbox.get("x2", 0), bbox.get("y2", 0)]
                 bbox_authority = self._authority.evaluate(
                     property_type="*.bbox",
                     source_type=source_type,

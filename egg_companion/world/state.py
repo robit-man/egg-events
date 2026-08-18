@@ -371,6 +371,32 @@ class WorldStateStore:
             ).fetchall()
             return [row[0] for row in rows]
 
+    def entity_brief_counts(self) -> dict[str, dict[str, object]]:
+        """Bulk property/relation counts per entity in a single query."""
+        with self._lock:
+            prop_counts = {}
+            for row in self._conn.execute(
+                "SELECT entity_id, COUNT(*), MAX(updated_at) FROM current_property_state GROUP BY entity_id"
+            ).fetchall():
+                prop_counts[row[0]] = {"property_count": row[1], "last_updated": row[2]}
+            rel_counts = {}
+            for row in self._conn.execute(
+                "SELECT source_entity_id, COUNT(*) FROM current_relation_state WHERE valid_to IS NULL GROUP BY source_entity_id"
+            ).fetchall():
+                rel_counts[row[0]] = row[1]
+            for row in self._conn.execute(
+                "SELECT target_entity_id, COUNT(*) FROM current_relation_state WHERE valid_to IS NULL GROUP BY target_entity_id"
+            ).fetchall():
+                rel_counts[row[0]] = rel_counts.get(row[0], 0) + row[1]
+            result = {}
+            for eid, info in prop_counts.items():
+                result[eid] = {
+                    "property_count": info["property_count"],
+                    "relation_count": rel_counts.get(eid, 0),
+                    "last_updated": info["last_updated"],
+                }
+            return result
+
     def all_current_relations(self) -> list[RelationStateRow]:
         with self._lock:
             rows = self._conn.execute(

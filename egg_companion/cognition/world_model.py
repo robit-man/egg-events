@@ -10,7 +10,7 @@ from egg_companion.config import DefaultModeConfig
 from egg_companion.memory.store import MemoryStore
 
 
-class WorldModelSynthesizer:
+class NarrativeWorldModelSynthesizer:
     """Project model-authored dream semantics into a provenance-linked meta-graph."""
 
     DOCUMENT_TITLES = {

@@ -469,6 +469,7 @@ class CompanionRuntime:
             **self.telemetry.snapshot(self.config).get("ocr", {}),
             "readiness": self._ocr_readiness.snapshot(),
             "pending_jobs": self._ocr_job_ledger.pending_count() if self._ocr_job_ledger else 0,
+            "backfill_remaining": self._ocr_backfill.count_unprocessed(self._memory.store) if self._memory else 0,
         }
         dream_snapshot = self.dreams.snapshot()
         latest_run = next(
@@ -761,6 +762,7 @@ class CompanionRuntime:
             ("ornith-object-labeler", self._auto_label_objects),
             ("advanced-ocr", self._process_ocr_candidates),
             ("ocr-backfill", self._backfill_ocr_candidates),
+            ("world-backfill", self._backfill_world_model),
             ("object-review-scheduler", self._object_review_scheduler),
             ("narrative-backfill", self._narrative_backfill_scheduler),
             ("narrative-semantic-dream", self._narrative_semantic_scheduler),
@@ -3941,6 +3943,22 @@ class CompanionRuntime:
             "image_size": [frame_w, frame_h],
         }
 
+    async def _backfill_world_model(self) -> None:
+        """Retroactively populate world model from existing evidence on startup."""
+        if self._memory is None:
+            return
+        await asyncio.sleep(2.0)  # let other components initialize first
+        try:
+            result = await asyncio.to_thread(
+                self._memory.backfill_world_from_evidence,
+                batch_size=1000,
+                max_items=0,
+            )
+            if result and not result.get("error"):
+                logger.info("World model backfill: %s", result)
+        except Exception as error:
+            logger.debug("World model backfill failed: %s", error)
+
     async def _backfill_ocr_candidates(self) -> None:
         """Scan retained visual evidence for unprocessed text and queue OCR jobs."""
         while True:
@@ -4006,6 +4024,21 @@ class CompanionRuntime:
                     self._ocr_job_ledger.complete(
                         job.job_id, text, str(result.get("engine", "unknown")),
                     )
+                    backfill_candidate = _OcrCandidate(
+                        camera_id=str(item.get("camera_id", "unknown")),
+                        image_png=image_bytes,
+                        observed_at=item.get("captured_at", datetime.now(timezone.utc)),
+                        scope="backfill",
+                        parent_id=str(item.get("evidence_id", "scene:unknown")),
+                        parent_type="object_category",
+                        parent_label=f"{item.get('camera_id', 'unknown')} scene",
+                        confidence=float(result.get("confidence", 0.5)),
+                        trigger="retroactive-backfill",
+                    )
+                    try:
+                        self._queue_ocr_memory(backfill_candidate, text, result)
+                    except Exception as persist_error:
+                        logger.debug("backfill OCR memory persist failed: %s", persist_error)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:

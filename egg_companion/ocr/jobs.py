@@ -235,7 +235,7 @@ class OcrJobLedger:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), timeout=10)
+        self._conn = sqlite3.connect(str(self._db_path), timeout=10, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._migrate()
@@ -421,21 +421,71 @@ class OcrBackfillScheduler:
         if memory_store is None:
             return []
         try:
-            rows = memory_store.db.execute(
-                "SELECT evidence_id, media_key, recorded_at, camera_id "
-                "FROM evidence "
-                "WHERE modality = 'video' "
-                "AND evidence_id NOT IN ("
-                "  SELECT DISTINCT json_extract(metadata, '$.source_evidence_id') "
-                "  FROM evidence WHERE modality = 'ocr'"
+            rows = memory_store._read_connection.execute(
+                "SELECT e.evidence_id, e.media_key, e.captured_at, e.source_id "
+                "FROM evidence e "
+                "WHERE e.modality = 'vision' "
+                "AND e.media_key IS NOT NULL "
+                "AND e.evidence_id NOT IN ("
+                "  SELECT DISTINCT json_extract(e2.payload_json, '$.metadata.parent_id') "
+                "  FROM evidence e2 WHERE e2.modality = 'ocr'"
                 ") "
-                "ORDER BY recorded_at DESC LIMIT ?",
+                "ORDER BY e.captured_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         except Exception as error:
             logger.debug("backfill scan failed: %s", error)
             return []
         return [
-            {"evidence_id": r[0], "media_key": r[1], "recorded_at": r[2], "camera_id": r[3]}
+            {"evidence_id": r[0], "media_key": r[1], "captured_at": r[2], "camera_id": r[3]}
+            for r in rows
+        ]
+
+    def count_unprocessed(self, memory_store: Any) -> int:
+        """Return total count of visual evidence lacking OCR."""
+        if memory_store is None:
+            return 0
+        try:
+            row = memory_store._read_connection.execute(
+                "SELECT COUNT(*) FROM evidence e "
+                "WHERE e.modality = 'vision' "
+                "AND e.media_key IS NOT NULL "
+                "AND e.evidence_id NOT IN ("
+                "  SELECT DISTINCT json_extract(e2.payload_json, '$.metadata.parent_id') "
+                "  FROM evidence e2 WHERE e2.modality = 'ocr'"
+                ")"
+            ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception as error:
+            logger.debug("backfill count failed: %s", error)
+            return 0
+
+    def find_all_unprocessed(
+        self,
+        memory_store: Any,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        """Scan all visual evidence for unprocessed text (for bulk backfill)."""
+        if memory_store is None:
+            return []
+        try:
+            rows = memory_store._read_connection.execute(
+                "SELECT e.evidence_id, e.media_key, e.captured_at, e.source_id "
+                "FROM evidence e "
+                "WHERE e.modality = 'vision' "
+                "AND e.media_key IS NOT NULL "
+                "AND e.evidence_id NOT IN ("
+                "  SELECT DISTINCT json_extract(e2.payload_json, '$.metadata.parent_id') "
+                "  FROM evidence e2 WHERE e2.modality = 'ocr'"
+                ") "
+                "ORDER BY e.captured_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        except Exception as error:
+            logger.debug("backfill full scan failed: %s", error)
+            return []
+        return [
+            {"evidence_id": r[0], "media_key": r[1], "captured_at": r[2], "camera_id": r[3]}
             for r in rows
         ]
