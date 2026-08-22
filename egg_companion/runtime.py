@@ -1977,6 +1977,7 @@ class CompanionRuntime:
                     else "detector_hypothesis"
                 ),
                 "behavior": detection.attributes.get("behavior"),
+                "gaze": detection.attributes.get("gaze"),
             }
             for detection in observation.detections
         ]
