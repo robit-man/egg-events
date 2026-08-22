@@ -320,6 +320,47 @@ class OcrConfig(BaseModel):
     backfill: OcrBackfillConfig = Field(default_factory=OcrBackfillConfig)
 
 
+class OccupancyConfig(BaseModel):
+    """Per-camera voxel occupancy mapping via on-demand monocular metric depth.
+
+    Each camera gets its own local voxel grid (no calibration/extrinsics
+    between cameras exist on this hardware, so grids are not fused into one
+    shared 3D map). The depth model runs as a subprocess in a separate,
+    pre-existing Python environment (not this project's venv) and is loaded
+    fresh and torn down on every cycle -- this hardware doesn't have the
+    memory headroom to keep a ~4GB model resident alongside everything else.
+    """
+
+    # Defaults to disabled: live testing on this hardware showed swap usage
+    # climb noticeably from just a handful of on-demand depth cycles on a
+    # system that already runs with well under 1GB of free memory. Built,
+    # tested, and verified working end-to-end against the real model --
+    # opt in via config/egg.yaml once comfortable with the memory tradeoff.
+    enabled: bool = False
+    depth_venv_python: str = "/home/egg/Depth-Anything-3/venv/bin/python"
+    depth_worker_script: str = "scripts/depth_worker.py"
+    depth_repo_dir: str = "/home/egg/Depth-Anything-3"
+    model_name: str = "depth-anything/DA3METRIC-LARGE"
+    process_res: int = Field(default=504, ge=128, le=1024)
+    subprocess_timeout_seconds: float = Field(default=90.0, ge=10.0, le=600.0)
+    # Conservative default: live testing on this hardware showed swap usage
+    # climb noticeably (5Gi -> 8.9Gi) across a handful of depth cycles on a
+    # system that already runs with well under 1GB of free memory. With 3
+    # cameras staggered at this interval, a full sweep happens roughly
+    # every 3 minutes rather than contending for memory every ~15s.
+    update_interval_seconds: float = Field(default=180.0, ge=10.0, le=3600.0)
+    voxel_size_meters: float = Field(default=0.1, gt=0.01, le=2.0)
+    max_range_meters: float = Field(default=6.0, gt=0.5, le=50.0)
+    min_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
+    # No calibrated intrinsics exist for any camera; assumed_hfov_degrees
+    # is a coarse stand-in used only to back-project depth into a rough
+    # camera-local volume -- fine for "is space near X roughly occupied"
+    # reasoning, not for anything requiring true metric precision.
+    assumed_hfov_degrees: float = Field(default=80.0, ge=20.0, le=170.0)
+    max_voxels_per_camera: int = Field(default=20_000, ge=1_000, le=500_000)
+    stale_after_seconds: float = Field(default=1800.0, ge=60.0, le=86400.0)
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     storage_dir: str = "data/cognitive-memory"
@@ -436,6 +477,7 @@ class EggConfig(BaseModel):
     dreams: DreamsConfig = Field(default_factory=DreamsConfig)
     object_learning: ObjectLearningConfig = Field(default_factory=ObjectLearningConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
+    occupancy: OccupancyConfig = Field(default_factory=OccupancyConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     event_segmentation: EventSegmentationConfig = Field(default_factory=EventSegmentationConfig)
     cognitive_attention: CognitiveAttentionConfig = Field(default_factory=CognitiveAttentionConfig)

@@ -37,6 +37,7 @@ from egg_companion.adapters.audio import (
     UtteranceSegmenter,
 )
 from egg_companion.adapters.camera import CameraStream
+from egg_companion.adapters.depth import DepthEstimator
 from egg_companion.adapters.omnius import OmniusClient
 from egg_companion.adapters.speaker import Speaker
 from egg_companion.adapters.system_service import SystemServiceClient
@@ -48,6 +49,7 @@ from egg_companion.config import EggConfig
 from egg_companion.core.activity import ActivityGovernor
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
+from egg_companion.core.occupancy import VoxelGrid
 from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.buffer import BufferedMediaRef, PerceptualBuffer
 from egg_companion.memory.migrate_legacy import LegacyMemoryMigrator
@@ -349,6 +351,9 @@ class CompanionRuntime:
         self._person_comparison_candidates: deque[_PersonComparisonJob] = deque(
             maxlen=config.identity.temporal_vlm_queue_size
         )
+        self._depth_estimator = DepthEstimator(config.occupancy)
+        self._occupancy_grids: dict[str, VoxelGrid] = {}
+        self._occupancy_last_update: dict[str, float] = {}
         self._record_voice_transition("runtime_initialized")
 
     async def update_voice_config(
@@ -774,6 +779,10 @@ class CompanionRuntime:
             ("cognition-frequency", self._report_activity),
             ("system-prompt-maintenance", self._system_prompt_scheduler),
         ]
+        if self.config.occupancy.enabled:
+            component_specs.append(
+                ("occupancy-mapping", self._update_occupancy_maps)
+            )
         if self.config.audio_comprehension.enabled:
             component_specs.append(
                 ("audio-comprehension", self._process_audio_comprehension)
@@ -3983,6 +3992,78 @@ class CompanionRuntime:
                 logger.info("World model backfill: %s", result)
         except Exception as error:
             logger.debug("World model backfill failed: %s", error)
+
+    async def _update_occupancy_maps(self) -> None:
+        """Per-camera voxel occupancy from on-demand monocular metric depth.
+
+        Only one camera is updated per due cycle, never concurrently --
+        this Jetson does not have the memory headroom to run more than one
+        ~4GB depth model subprocess at a time. Each camera's grid is
+        entirely local to that camera (no calibration exists between
+        cameras), so this never attempts to fuse them into one map.
+        """
+        while True:
+            await asyncio.sleep(5.0)
+            await self._run_occupancy_cycle()
+
+    def _next_due_occupancy_camera(self, now: float) -> str | None:
+        return next(
+            (
+                camera_id for camera_id in self._latest_frames
+                if now - self._occupancy_last_update.get(camera_id, 0.0)
+                >= self.config.occupancy.update_interval_seconds
+            ),
+            None,
+        )
+
+    async def _run_occupancy_cycle(self) -> str | None:
+        """Update at most one due camera's occupancy grid. Returns the
+        camera_id updated, or None if nothing was due / nothing ran."""
+        if self._memory is None or not self.config.occupancy.enabled:
+            return None
+        camera_id = self._next_due_occupancy_camera(time.monotonic())
+        if camera_id is None:
+            return None
+        self._occupancy_last_update[camera_id] = time.monotonic()
+        frame_entry = self._latest_frames.get(camera_id)
+        if frame_entry is None:
+            return None
+        frame, _ = frame_entry
+        try:
+            image_bytes = await asyncio.to_thread(self._encode_frame, frame)
+            result = await self._depth_estimator.estimate(image_bytes)
+            if result is None:
+                return None
+            grid = self._occupancy_grids.setdefault(
+                camera_id,
+                VoxelGrid(
+                    voxel_size_meters=self.config.occupancy.voxel_size_meters,
+                    max_range_meters=self.config.occupancy.max_range_meters,
+                    max_voxels=self.config.occupancy.max_voxels_per_camera,
+                ),
+            )
+            await asyncio.to_thread(
+                grid.integrate_depth,
+                result.depth,
+                result.confidence,
+                self.config.occupancy.assumed_hfov_degrees,
+                self.config.occupancy.min_confidence,
+            )
+            grid.prune_stale(self.config.occupancy.stale_after_seconds)
+            self._memory.record_derived_property(
+                f"camera_view:{camera_id}",
+                "occupancy_summary",
+                grid.summary_text(),
+                source_id=f"depth:{camera_id}",
+            )
+            return camera_id
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "occupancy update failed for %s", camera_id, exc_info=error
+            )
+            return None
 
     async def _backfill_ocr_candidates(self) -> None:
         """Scan retained visual evidence for unprocessed text and queue OCR jobs."""

@@ -572,6 +572,44 @@ class MemoryPipeline:
             observed_at=now,
         ))
 
+    def record_derived_property(
+        self,
+        entity_id: str,
+        property_id: str,
+        value: str,
+        *,
+        confidence: float = 0.6,
+        authority: float = 0.5,
+        source_id: str = "derived",
+    ) -> None:
+        """Record a single computed/derived fact directly into the world
+        model, bypassing the raw-detection normalizer.
+
+        _normalize_visual_event's "detections" contract is for perception
+        output (label/bbox/behavior/gaze/...); a value computed from other
+        world state (like an occupancy-grid summary) isn't a detection and
+        doesn't belong wedged into that contract. This is a small, generic
+        primitive for "the world model should know this fact now."
+        """
+        self._ensure_world_model()
+        if self._world_reconciler is None:
+            return
+        from egg_companion.world.types import EpistemicKind, TypedValue, ValueType, WorldDelta
+
+        delta = WorldDelta()
+        delta.assertions.append({
+            "subject_id": entity_id,
+            "property_id": property_id,
+            "value": TypedValue(raw=value, value_type=ValueType.STRING),
+            "epistemic_kind": EpistemicKind.INFERENCE.value,
+            "source_id": source_id,
+            "evidence_ids": (),
+            "confidence": confidence,
+            "authority": authority,
+            "valid_from": datetime.now(timezone.utc).isoformat(),
+        })
+        self._world_reconciler.ingest(delta)
+
     def backfill_world_from_evidence(self, batch_size: int = 500, max_items: int = 0) -> dict[str, object]:
         """Retroactively populate world model from existing evidence store.
 
