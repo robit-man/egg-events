@@ -52,7 +52,7 @@ from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.buffer import BufferedMediaRef, PerceptualBuffer
 from egg_companion.memory.migrate_legacy import LegacyMemoryMigrator
 from egg_companion.memory.store import MemoryStore
-from egg_companion.models import AttentionDecision, AttentionTarget, Detection, EvidenceRef, Observation, PerceptualEvent
+from egg_companion.models import AttentionDecision, AttentionTarget, BoundingBox, Detection, EvidenceRef, Observation, PerceptualEvent
 from egg_companion.services.telemetry import RuntimeTelemetry
 from egg_companion.services.dreams import IdentityDreamEngine
 from egg_companion.services.identity import IdentityLibrary
@@ -4584,7 +4584,12 @@ class CompanionRuntime:
             )
 
     async def _classify_with_ocr(
-        self, image_png: bytes, detector_label: str, detector_confidence: float
+        self,
+        image_png: bytes,
+        detector_label: str,
+        detector_confidence: float,
+        *,
+        explicit_read_request: bool = False,
     ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         """Analyze one sparse stable mask; OCR admission is pixel-grounded."""
         analysis_method = getattr(
@@ -4599,7 +4604,9 @@ class CompanionRuntime:
         )
         vlm_response, ocr_result = await asyncio.gather(
             vlm_call,
-            self._run_advanced_ocr(image_png),
+            self._run_advanced_ocr(
+                image_png, explicit_read_request=explicit_read_request,
+            ),
             return_exceptions=True,
         )
         if isinstance(vlm_response, BaseException):
@@ -6992,6 +6999,40 @@ class CompanionRuntime:
             )
         return context
 
+    async def _dispatch_gated_action(
+        self,
+        action_type: str,
+        impl,
+        *,
+        inputs: dict[str, object] | None = None,
+        target_entity_ids: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        """Shared propose -> policy-check -> execute -> record wrapper.
+
+        `impl` is a zero-arg async callable returning a result dict with an
+        "ok" key. Used for focus_camera/inspect_entity, which share this
+        simple one-shot shape; _speak has its own wrapper since playback/
+        revision/barge-in semantics don't fit a plain "did it succeed" call.
+        """
+        if self._memory is None:
+            return await impl()
+        proposal, violations = self._memory.propose_action(
+            action_type, inputs=inputs or {}, target_entity_ids=target_entity_ids,
+        )
+        blocking = [v for v in violations if v.blocked]
+        if blocking:
+            reason = "; ".join(v.reason for v in blocking)
+            logger.warning("%s blocked by policy: %s", action_type, reason)
+            return {"ok": False, "reason": f"blocked by policy: {reason}"}
+        result: dict[str, object] = {"ok": False}
+        try:
+            result = await impl()
+            return result
+        finally:
+            self._memory.record_action_execution(
+                proposal.proposal_id, success=bool(result.get("ok")), result=result,
+            )
+
     async def _speak(self, text: str, expected_revision: int | None = None) -> bool:
         """Policy-gated entry point for every speech effect in the runtime.
 
@@ -7107,6 +7148,200 @@ class CompanionRuntime:
             self._last_spoken_at = time.monotonic()
             self._record_voice_transition("playback_completed")
             return True
+
+    async def focus_camera(
+        self, camera_id: str, duration_seconds: float = 45.0
+    ) -> dict[str, object]:
+        """Bias attention toward one camera for a while.
+
+        There is no pan/tilt/zoom hardware anywhere on this robot -- all
+        three cameras are fixed. "Focusing" a camera can only honestly mean
+        a software attention bias: for `duration_seconds`, detections on
+        that camera get a priority bonus in AttentionManager scoring (see
+        core/attention.py's camera_focus_bonus), so the robot is more
+        likely to notice and react to things happening in that camera's
+        view. It does not physically move anything.
+        """
+        return await self._dispatch_gated_action(
+            "focus_camera",
+            lambda: self._focus_camera_impl(camera_id, duration_seconds),
+            inputs={"camera_id": camera_id, "duration_seconds": duration_seconds},
+        )
+
+    async def _focus_camera_impl(
+        self, camera_id: str, duration_seconds: float
+    ) -> dict[str, object]:
+        if camera_id not in self._latest_frames:
+            return {
+                "ok": False,
+                "reason": f"unknown camera_id '{camera_id}' (no frames seen from it)",
+                "known_camera_ids": sorted(self._latest_frames.keys()),
+            }
+        if duration_seconds <= 0:
+            return {"ok": False, "reason": "duration_seconds must be positive"}
+        self._brain.add_camera_focus(camera_id, duration_seconds)
+        return {
+            "ok": True,
+            "camera_id": camera_id,
+            "duration_seconds": duration_seconds,
+        }
+
+    async def inspect_entity(self, entity_id: str) -> dict[str, object]:
+        """Take a closer, on-demand look at an entity that's currently visible.
+
+        Composes two analyses that already exist for opportunistic use
+        (dual-engine OCR and VLM object/appearance analysis) but runs them
+        immediately, explicitly, for one requested entity -- rather than
+        waiting for the background scheduler to get to it. Only works if
+        the entity is in at least one camera's most recent frame right now
+        (there's no pan/tilt to go find it with if it isn't).
+        """
+        return await self._dispatch_gated_action(
+            "inspect_entity",
+            lambda: self._inspect_entity_impl(entity_id),
+            inputs={"entity_id": entity_id},
+            target_entity_ids=(entity_id,),
+        )
+
+    def _find_live_detection(self, entity_id: str) -> tuple[str, Detection] | None:
+        """Most recent (camera_id, Detection) whose resolved id matches entity_id."""
+        best: tuple[str, Detection, datetime] | None = None
+        label_query = (
+            entity_id[len("det:"):] if entity_id.startswith("det:") else None
+        )
+        for camera_id, observation in self._latest_observations.items():
+            for detection in observation.detections:
+                candidate_id = str(
+                    detection.attributes.get("identity_id")
+                    or detection.attributes.get("object_id")
+                    or ""
+                )
+                if not candidate_id and label_query and detection.label == label_query:
+                    candidate_id = entity_id
+                if candidate_id and candidate_id == entity_id:
+                    if best is None or observation.timestamp > best[2]:
+                        best = (camera_id, detection, observation.timestamp)
+        if best is None:
+            return None
+        return best[0], best[1]
+
+    @staticmethod
+    def _crop_entity_png(
+        frame: np.ndarray, bbox: BoundingBox, margin_ratio: float = 0.15
+    ) -> bytes:
+        import cv2
+
+        height, width = frame.shape[:2]
+        box_width = max(1.0, bbox.x2 - bbox.x1)
+        box_height = max(1.0, bbox.y2 - bbox.y1)
+        margin_x = box_width * margin_ratio
+        margin_y = box_height * margin_ratio
+        x1 = max(0, int(bbox.x1 - margin_x))
+        y1 = max(0, int(bbox.y1 - margin_y))
+        x2 = min(width, int(bbox.x2 + margin_x))
+        y2 = min(height, int(bbox.y2 + margin_y))
+        if x2 <= x1 or y2 <= y1:
+            x1, y1, x2, y2 = 0, 0, width, height
+        ok, encoded = cv2.imencode(".png", frame[y1:y2, x1:x2])
+        if not ok:
+            raise RuntimeError("failed to encode entity inspection crop")
+        return encoded.tobytes()
+
+    async def _inspect_entity_impl(self, entity_id: str) -> dict[str, object]:
+        found = self._find_live_detection(entity_id)
+        if found is None:
+            return {"ok": False, "reason": "entity not currently visible in any camera"}
+        camera_id, detection = found
+        frame_entry = self._latest_frames.get(camera_id)
+        if frame_entry is None:
+            return {"ok": False, "reason": "no retained frame for that camera"}
+        frame, _ = frame_entry
+        try:
+            image_png = await asyncio.to_thread(
+                self._crop_entity_png, frame, detection.bbox
+            )
+        except Exception as error:
+            logger.warning("inspect_entity crop failed", exc_info=error)
+            return {"ok": False, "reason": f"crop failed: {error}"}
+
+        vlm_analysis, ocr_result = await self._classify_with_ocr(
+            image_png, detection.label, detection.confidence,
+            explicit_read_request=True,
+        )
+
+        text = str((ocr_result or {}).get("text") or "").strip()
+        if text:
+            candidate = _OcrCandidate(
+                camera_id=camera_id,
+                image_png=image_png,
+                observed_at=datetime.now(timezone.utc),
+                scope="explicit_inspection",
+                parent_id=entity_id,
+                parent_type="object",
+                parent_label=detection.label,
+                confidence=detection.confidence,
+                trigger="inspect_entity",
+            )
+            self._queue_ocr_memory(candidate, text, ocr_result)
+
+        appearance = None
+        if isinstance(vlm_analysis, dict):
+            appearance = (
+                vlm_analysis.get("appearance_description") or vlm_analysis.get("label")
+            )
+            # Refresh last_seen/observability/label for this entity through
+            # the same normalizer path live vision detections use ("object"
+            # routes to _normalize_visual_event exactly like "vision" does),
+            # rather than inventing a parallel update mechanism.
+            refreshed_label = str(vlm_analysis.get("label") or detection.label)
+            refreshed_confidence = float(
+                vlm_analysis.get("confidence", detection.confidence)
+            )
+            self._queue_memory_event(
+                PerceptualEvent(
+                    str(uuid4()),
+                    "object",
+                    datetime.now(timezone.utc),
+                    camera_id,
+                    (
+                        EvidenceRef(
+                            str(uuid4()),
+                            "vision",
+                            datetime.now(timezone.utc),
+                            "camera-inspection",
+                            camera_id,
+                            quality=refreshed_confidence,
+                            metadata={
+                                "trigger": "inspect_entity",
+                                "entity_id": entity_id,
+                                "vlm_analysis": vlm_analysis,
+                            },
+                        ),
+                    ),
+                    (entity_id,),
+                    payload={
+                        "detections": [{
+                            "entity_id": entity_id,
+                            "label": refreshed_label,
+                            "confidence": refreshed_confidence,
+                            "bbox": [
+                                detection.bbox.x1, detection.bbox.y1,
+                                detection.bbox.x2, detection.bbox.y2,
+                            ],
+                        }],
+                        "frame_shape": list(frame.shape[:2]),
+                    },
+                )
+            )
+
+        return {
+            "ok": True,
+            "entity_id": entity_id,
+            "camera_id": camera_id,
+            "text_found": bool(text),
+            "text": text or None,
+            "appearance": appearance,
+        }
 
     def _record_voice_transition(self, reason: str) -> None:
         self.telemetry.record_voice_transition(

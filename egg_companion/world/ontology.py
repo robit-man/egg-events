@@ -299,6 +299,8 @@ _DEFAULT_PROPERTY_TYPES = [
                  volatility="dynamic", stale_after=300.0, decay_model="linear"),
     PropertyType(id="behavior", value_type=ValueType.STRING, cardinality="one",
                  volatility="dynamic", stale_after=30.0, decay_model="linear"),
+    PropertyType(id="gaze_state", value_type=ValueType.STRING, cardinality="one",
+                 volatility="dynamic", stale_after=10.0, decay_model="linear"),
     PropertyType(id="bbox", value_type=ValueType.GEOMETRY, cardinality="one",
                  volatility="dynamic", stale_after=5.0, decay_model="linear"),
     PropertyType(id="confidence_score", value_type=ValueType.FLOAT, cardinality="one",

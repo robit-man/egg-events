@@ -75,3 +75,51 @@ class AttentionTests(unittest.TestCase):
         )
         assert selected
         assert "conversation-relevant" in selected[0].reason
+
+    def test_focus_camera_ids_boosts_priority_for_that_camera_only(self) -> None:
+        manager = AttentionManager(track_ttl_seconds=10, min_priority=0.1)
+        now = datetime.now(timezone.utc)
+        thing = Detection("cup", 0.5, BoundingBox(10, 10, 30, 30))
+
+        baseline = manager.select(Observation("camera-video1", now, (thing,)))[0]
+
+        manager2 = AttentionManager(track_ttl_seconds=10, min_priority=0.1)
+        boosted = manager2.select(
+            Observation("camera-video1", now, (thing,)),
+            None,
+            {"focus_camera_ids": ["camera-video1"]},
+        )[0]
+        assert boosted.priority > baseline.priority
+        assert "camera-focus-requested" in boosted.reason
+
+    def test_focus_camera_ids_does_not_boost_other_cameras(self) -> None:
+        manager = AttentionManager(track_ttl_seconds=10, min_priority=0.1)
+        now = datetime.now(timezone.utc)
+        thing = Detection("cup", 0.5, BoundingBox(10, 10, 30, 30))
+
+        not_focused = manager.select(
+            Observation("camera-video2", now, (thing,)),
+            None,
+            {"focus_camera_ids": ["camera-video1"]},
+        )[0]
+        assert "camera-focus-requested" not in not_focused.reason
+
+    def test_gazing_at_camera_boosts_priority(self) -> None:
+        now = datetime.now(timezone.utc)
+        looking = Detection(
+            "person", 0.6, BoundingBox(100, 100, 300, 500),
+            {"frame_shape": [1080, 1920], "gaze": {"state": "facing_camera", "confidence": 0.9}},
+        )
+        away = Detection(
+            "person", 0.6, BoundingBox(100, 100, 300, 500),
+            {"frame_shape": [1080, 1920], "gaze": {"state": "looking_away", "confidence": 0.9}},
+        )
+
+        looking_target = AttentionManager(track_ttl_seconds=10, min_priority=0.1).select(
+            Observation("front", now, (looking,))
+        )[0]
+        away_target = AttentionManager(track_ttl_seconds=10, min_priority=0.1).select(
+            Observation("front", now, (away,))
+        )[0]
+        assert looking_target.priority > away_target.priority
+        assert "gazing at viewer" in looking_target.reason

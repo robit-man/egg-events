@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from egg_companion.core.attention import AttentionManager
@@ -45,6 +46,24 @@ class CognitiveArchitecture:
         self.attention = attention
         self.cognitive_attention = cognitive_attention
         self.memory = memory
+        # Transient, TTL'd bias from the focus_camera action -- kept here
+        # (not in MemoryPipeline.observation_policy(), which is a cached,
+        # persistent-store-derived read) because "pay closer attention to
+        # this camera for a while" is ephemeral runtime state, not a
+        # durable policy.
+        self._camera_focus: dict[str, float] = {}
+
+    def add_camera_focus(self, camera_id: str, ttl_seconds: float) -> None:
+        self._camera_focus[camera_id] = time.monotonic() + max(0.0, ttl_seconds)
+
+    def _active_camera_focus_ids(self) -> list[str]:
+        now = time.monotonic()
+        self._camera_focus = {
+            camera_id: expires_at
+            for camera_id, expires_at in self._camera_focus.items()
+            if expires_at > now
+        }
+        return list(self._camera_focus.keys())
 
     def perceive(self, observation: Observation) -> CognitiveTick:
         entity_ids = [
@@ -61,7 +80,10 @@ class CognitiveArchitecture:
         graph_feedback = (
             self.memory.graph_signals(entity_ids) if self.memory and entity_ids else {}
         )
-        observation_policy = self.memory.observation_policy() if self.memory else {}
+        observation_policy = dict(self.memory.observation_policy() if self.memory else {})
+        active_camera_focus = self._active_camera_focus_ids()
+        if active_camera_focus:
+            observation_policy["focus_camera_ids"] = active_camera_focus
         targets = (
             self.attention.select(observation, graph_feedback, observation_policy)
             if self.memory

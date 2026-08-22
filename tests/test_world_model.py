@@ -413,6 +413,67 @@ class TestObservationNormalizer:
         assert delta.assertions[0]["evidence_ids"] == ("ev:1",)
         assert delta.assertions[0]["authority"] > 0
 
+    def test_normalize_detection_with_gaze_emits_gaze_state(self, world_stores):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:1g"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        normalizer = world_stores["normalizer"]
+        detection = {
+            "entity_id": "entity:2",
+            "label": "person",
+            "confidence": 0.85,
+            "bbox": [10, 20, 100, 200],
+            "gaze": {"state": "facing_camera", "yaw_offset": 0.02, "confidence": 0.77},
+        }
+        event = MockEvent(payload={"detections": [detection]}, evidence=("ev:1",))
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:1",))
+        gaze_assertions = [a for a in delta.assertions if a["property_id"] == "gaze_state"]
+        assert len(gaze_assertions) == 1
+        assert gaze_assertions[0]["subject_id"] == "entity:2"
+        assert gaze_assertions[0]["value"].raw == "facing_camera"
+        assert gaze_assertions[0]["confidence"] == 0.77
+
+    def test_normalize_detection_without_gaze_emits_no_gaze_state(self, world_stores):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:1h"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        normalizer = world_stores["normalizer"]
+        detection = {
+            "entity_id": "entity:3",
+            "label": "person",
+            "confidence": 0.85,
+            "bbox": [10, 20, 100, 200],
+        }
+        event = MockEvent(payload={"detections": [detection]}, evidence=("ev:1",))
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:1",))
+        assert not any(a["property_id"] == "gaze_state" for a in delta.assertions)
+
     def test_normalize_speech(self, world_stores):
         from dataclasses import dataclass
         

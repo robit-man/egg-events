@@ -101,6 +101,8 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
                 "/api/graph",
                 "/api/graph/node",
                 "/api/voice/action",
+                "/api/actions/focus_camera",
+                "/api/actions/inspect_entity",
                 "/api/voice/conversation",
                 "/api/dreams",
                 "/api/dreams/run",

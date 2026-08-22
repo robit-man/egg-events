@@ -8,6 +8,7 @@ import numpy as np
 
 from egg_companion.config import VisionConfig
 from egg_companion.core.behavior import classify_pose
+from egg_companion.core.gaze import classify_gaze
 from egg_companion.core.orientation import select_rotation, upright_pose_score
 from egg_companion.models import BoundingBox, Detection
 
@@ -98,7 +99,18 @@ class VisionEngine:
             )
             all_pose = self._pose_keypoints(pose_results) if include_pose else []
             all_pose_conf = self._pose_confidence(pose_results) if include_pose else []
-            behaviors = self._person_behaviors(pose_results) if include_pose else []
+            # Merge (x, y) with confidence once per person -- classify_pose and
+            # classify_gaze both need the 3rd (confidence) element to do their
+            # visibility checks; .xyn alone only carries (x, y).
+            merged_keypoints: list[list[list[float]]] = []
+            for person_index, pose_kps in enumerate(all_pose):
+                pose_cf = all_pose_conf[person_index] if person_index < len(all_pose_conf) else []
+                merged_keypoints.append([
+                    [round(kp[0], 4), round(kp[1], 4), round(pose_cf[kp_i] if kp_i < len(pose_cf) else 0.0, 3)]
+                    for kp_i, kp in enumerate(pose_kps)
+                ])
+            behaviors = [classify_pose(keypoints) for keypoints in merged_keypoints] if include_pose else []
+            gazes = [classify_gaze(keypoints) for keypoints in merged_keypoints] if include_pose else []
             detections: list[Detection] = []
             for result in results:
                 polygons = result.masks.xy if result.masks is not None else []
@@ -109,18 +121,10 @@ class VisionEngine:
                     attributes = {"frame_shape": [frame_height, frame_width]}
                     if label == "person" and index < len(behaviors) and behaviors[index]:
                         attributes["behavior"] = behaviors[index]
-                    if label == "person" and index < len(all_pose):
-                        pose_kps = all_pose[index]
-                        pose_cf = all_pose_conf[index] if index < len(all_pose_conf) else []
-                        merged = []
-                        for kp_i, kp in enumerate(pose_kps):
-                            conf = pose_cf[kp_i] if kp_i < len(pose_cf) else 0.0
-                            merged.append([
-                                round(kp[0], 4),
-                                round(kp[1], 4),
-                                round(conf, 3),
-                            ])
-                        attributes["pose_keypoints"] = merged
+                    if label == "person" and index < len(gazes) and gazes[index]:
+                        attributes["gaze"] = gazes[index]
+                    if label == "person" and index < len(merged_keypoints):
+                        attributes["pose_keypoints"] = merged_keypoints[index]
                     if index < len(polygons) and polygons[index] is not None and len(polygons[index]) >= 3:
                         attributes["mask_polygon"] = [
                             [round(float(x), 1), round(float(y), 1)] for x, y in polygons[index].tolist()
@@ -391,9 +395,6 @@ class VisionEngine:
             ).T
         scores = similarity[0].softmax(dim=0)
         return float(scores[0].item()) if int(scores.argmax().item()) == 0 else 0.0
-
-    def _person_behaviors(self, results: Sequence[object]) -> list[str | None]:
-        return [classify_pose(keypoints) for keypoints in self._pose_keypoints(results)]
 
     def _wrist_points(self, results: Sequence[object], width: int, height: int) -> list[np.ndarray]:
         wrists: list[np.ndarray] = []

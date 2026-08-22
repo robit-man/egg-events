@@ -107,12 +107,20 @@ class AttentionManager:
         focus_entities = {
             str(value) for value in observation_policy.get("focus_entity_ids", []) if value
         }
+        focus_cameras = {
+            str(value) for value in observation_policy.get("focus_camera_ids", []) if value
+        }
         policy_relevant = bool(stable_id and stable_id in focus_entities)
+        camera_focus_relevant = observation.camera_id in focus_cameras
+        gaze = detection.attributes.get("gaze")
+        gazing_at_camera = isinstance(gaze, dict) and gaze.get("state") == "facing_camera"
         person_bonus = 0.25 * effective_novelty if detection.label == "person" else 0.0
         action_bonus = 0.2 if detection.attributes.get("behavior") in {"waving", "approaching"} else 0.0
         direction_bonus = 0.1 if detection.attributes.get("audio_aligned") is True else 0.0
         policy_bonus = 0.22 if policy_relevant else 0.0
         gap_bonus = 0.06 * signal.knowledge_gap if signal and policy_relevant else 0.0
+        camera_focus_bonus = 0.18 if camera_focus_relevant else 0.0
+        gaze_bonus = 0.12 if gazing_at_camera else 0.0
         priority = min(
             1.0,
             0.45 * effective_novelty
@@ -121,10 +129,16 @@ class AttentionManager:
             + action_bonus
             + direction_bonus
             + policy_bonus
-            + gap_bonus,
+            + gap_bonus
+            + camera_focus_bonus
+            + gaze_bonus,
         )
         if policy_relevant:
             reason += "; conversation-relevant"
+        if camera_focus_relevant:
+            reason += "; camera-focus-requested"
+        if gazing_at_camera:
+            reason += "; gazing at viewer"
         return AttentionTarget(
             track_id=track.id,
             detection=detection,

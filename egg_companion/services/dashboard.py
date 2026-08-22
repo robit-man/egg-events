@@ -429,6 +429,35 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             raise web.HTTPBadGateway(text=str(error)) from error
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
+    async def action_focus_camera_handler(request: web.Request) -> web.Response:
+        require_loopback(request)
+        body = await request.json()
+        camera_id = str(body.get("camera_id", "")).strip()
+        if not camera_id:
+            raise web.HTTPBadRequest(text="camera_id is required")
+        duration_seconds = body.get("duration_seconds", 45.0)
+        try:
+            duration_seconds = float(duration_seconds)
+        except (TypeError, ValueError) as error:
+            raise web.HTTPBadRequest(text="duration_seconds must be a number") from error
+        result = await companion().focus_camera(camera_id, duration_seconds)
+        status = 200 if result.get("ok") else 409
+        return web.json_response(
+            result, status=status, headers={"Cache-Control": "no-store"}
+        )
+
+    async def action_inspect_entity_handler(request: web.Request) -> web.Response:
+        require_loopback(request)
+        body = await request.json()
+        entity_id = str(body.get("entity_id", "")).strip()
+        if not entity_id:
+            raise web.HTTPBadRequest(text="entity_id is required")
+        result = await companion().inspect_entity(entity_id)
+        status = 200 if result.get("ok") else 409
+        return web.json_response(
+            result, status=status, headers={"Cache-Control": "no-store"}
+        )
+
     async def memory_handler(_: web.Request) -> web.Response:
         return web.json_response(await dashboard_call(companion().memory_snapshot))
 
@@ -633,6 +662,8 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app.router.add_get("/api/voice/conversation", conversation_history_handler)
     app.router.add_put("/api/voice/config", voice_config_handler)
     app.router.add_post("/api/voice/action", voice_action_handler)
+    app.router.add_post("/api/actions/focus_camera", action_focus_camera_handler)
+    app.router.add_post("/api/actions/inspect_entity", action_inspect_entity_handler)
     app.router.add_get("/api/dreams", dreams_handler)
     app.router.add_post("/api/dreams/run", dreams_run_handler)
     app.router.add_get("/api/memory/narratives", narratives_handler)

@@ -119,6 +119,7 @@ class ObservationNormalizer:
             confidence = float(detection.get("confidence", 0.0))
             bbox = detection.get("bbox")
             behavior = detection.get("behavior")
+            gaze = detection.get("gaze")
 
             # Filter: reject detections below confidence threshold
             if confidence < self._min_confidence:
@@ -177,6 +178,29 @@ class ObservationNormalizer:
                     "evidence_ids": evidence_ids,
                     "confidence": confidence,
                     "authority": behavior_authority,
+                    "valid_from": observed_at,
+                })
+
+            if isinstance(gaze, dict) and gaze.get("state"):
+                gaze_authority = self._authority.evaluate(
+                    property_type="*.gaze_state",
+                    source_type=source_type,
+                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                )
+                gaze_confidence = gaze.get("confidence")
+                delta.assertions.append({
+                    "subject_id": entity_id,
+                    "property_id": "gaze_state",
+                    "value": TypedValue(raw=gaze["state"], value_type=ValueType.STRING),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": (
+                        float(gaze_confidence)
+                        if isinstance(gaze_confidence, (int, float))
+                        else confidence
+                    ),
+                    "authority": gaze_authority,
                     "valid_from": observed_at,
                 })
 

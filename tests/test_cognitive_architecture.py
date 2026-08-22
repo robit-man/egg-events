@@ -110,6 +110,72 @@ def test_perceive_integrates_with_real_attention_and_prediction_modules() -> Non
     )
 
 
+class _PolicyRecordingAttention:
+    """Records the observation_policy dict CognitiveArchitecture passes to
+    select(), so tests can see exactly what it merged in."""
+
+    def __init__(self) -> None:
+        self.policies: list[dict[str, object]] = []
+
+    def select(self, observation, graph_feedback=None, observation_policy=None):
+        self.policies.append(observation_policy or {})
+        return []
+
+
+def test_add_camera_focus_merges_into_observation_policy_for_real_memory() -> None:
+    class _FakeMemory:
+        def observation_policy(self):
+            return {"focus_terms": ["x"]}
+
+        def graph_signals(self, entity_ids):
+            return {}
+
+    attention = _PolicyRecordingAttention()
+    cognitive_attention = _FakeCognitiveAttention({})
+    brain = CognitiveArchitecture(attention, cognitive_attention, memory=_FakeMemory())
+
+    brain.add_camera_focus("camera-video1", ttl_seconds=30.0)
+    observation = _observation()
+    brain.perceive(observation)
+
+    assert attention.policies[0]["focus_camera_ids"] == ["camera-video1"]
+    assert attention.policies[0]["focus_terms"] == ["x"]
+
+
+def test_no_active_camera_focus_leaves_observation_policy_untouched() -> None:
+    class _FakeMemory:
+        def observation_policy(self):
+            return {"focus_terms": ["x"]}
+
+        def graph_signals(self, entity_ids):
+            return {}
+
+    attention = _PolicyRecordingAttention()
+    cognitive_attention = _FakeCognitiveAttention({})
+    brain = CognitiveArchitecture(attention, cognitive_attention, memory=_FakeMemory())
+
+    brain.perceive(_observation())
+
+    assert "focus_camera_ids" not in attention.policies[0]
+
+
+def test_camera_focus_expires_after_ttl(monkeypatch) -> None:
+    import time as time_module
+
+    attention = _FakeAttention([])
+    cognitive_attention = _FakeCognitiveAttention({})
+    brain = CognitiveArchitecture(attention, cognitive_attention, memory=None)
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(time_module, "monotonic", lambda: fake_now[0])
+
+    brain.add_camera_focus("camera-video1", ttl_seconds=10.0)
+    assert brain._active_camera_focus_ids() == ["camera-video1"]
+
+    fake_now[0] = 1011.0
+    assert brain._active_camera_focus_ids() == []
+
+
 def test_associate_object_matches_evidence_fusion() -> None:
     brain = CognitiveArchitecture(
         AttentionManager(track_ttl_seconds=10, min_priority=0.1),
