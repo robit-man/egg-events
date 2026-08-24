@@ -891,6 +891,84 @@ class TestSupersession:
         assert superseded[0]["valid_to"] is not None
 
 
+class TestBulkAssertionHistories:
+    """get_assertion_histories: one query for many (subject, property)
+    pairs, replacing what used to be one get_assertion_history() call per
+    conflict -- a real bottleneck once the live database accumulated
+    thousands of conflicting pairs."""
+
+    def test_matches_per_pair_get_assertion_history(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+
+        for entity_id, prop, value in (
+            ("e1", "label", "a"), ("e1", "label", "b"),
+            ("e2", "behavior", "waving"),
+        ):
+            delta = WorldDelta()
+            delta.assertions.append({
+                "subject_id": entity_id, "property_id": prop,
+                "value": TypedValue(raw=value, value_type=ValueType.STRING),
+                "epistemic_kind": "observation", "source_id": "cam:1",
+                "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.6,
+                "valid_from": utcnow().isoformat(),
+            })
+            reconciler.ingest(delta)
+
+        pairs = [("e1", "label"), ("e2", "behavior")]
+        bulk = reconciler.get_assertion_histories(pairs)
+
+        assert set(bulk.keys()) == set(pairs)
+        assert bulk[("e1", "label")] == reconciler.get_assertion_history("e1", "label")
+        assert bulk[("e2", "behavior")] == reconciler.get_assertion_history("e2", "behavior")
+
+    def test_empty_pairs_returns_empty_dict(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        assert reconciler.get_assertion_histories([]) == {}
+
+    def test_pair_with_no_assertions_maps_to_empty_list(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        result = reconciler.get_assertion_histories([("nonexistent", "label")])
+        assert result == {("nonexistent", "label"): []}
+
+    def test_limit_per_pair_caps_history_depth(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+
+        for i in range(10):
+            delta = WorldDelta()
+            delta.assertions.append({
+                "subject_id": "e1", "property_id": "counter",
+                "value": TypedValue(raw=f"v{i}", value_type=ValueType.STRING),
+                "epistemic_kind": "observation", "source_id": "cam:1",
+                "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.6,
+                "valid_from": utcnow().isoformat(),
+            })
+            reconciler.ingest(delta)
+
+        result = reconciler.get_assertion_histories([("e1", "counter")], limit_per_pair=3)
+        assert len(result[("e1", "counter")]) == 3
+
+    def test_pairs_for_different_subjects_do_not_cross_contaminate(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+
+        for entity_id in ("e1", "e2"):
+            delta = WorldDelta()
+            delta.assertions.append({
+                "subject_id": entity_id, "property_id": "label",
+                "value": TypedValue(raw=f"label-{entity_id}", value_type=ValueType.STRING),
+                "epistemic_kind": "observation", "source_id": "cam:1",
+                "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.6,
+                "valid_from": utcnow().isoformat(),
+            })
+            reconciler.ingest(delta)
+
+        result = reconciler.get_assertion_histories([("e1", "label"), ("e2", "label")])
+        assert result[("e1", "label")][0]["value"] == "label-e1"
+        assert result[("e2", "label")][0]["value"] == "label-e2"
+
+
 class TestAtomicTransaction:
     """Verify that WorldDelta is committed atomically."""
 
@@ -1489,6 +1567,140 @@ class TestConflictQuerying:
         assert conflicts[0].entity_id == "e1"
         assert conflicts[0].property_id == "label"
         assert len(conflicts[0].assertions) > 0
+
+    @staticmethod
+    def _make_conflict(reconciler, entity_id: str, property_id: str = "label") -> None:
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        for value, source in (("Alice", "cam:1"), ("Bob", "cam:2")):
+            delta = WorldDelta()
+            delta.assertions.append({
+                "subject_id": entity_id, "property_id": property_id,
+                "value": TypedValue(raw=value, value_type=ValueType.STRING),
+                "epistemic_kind": "observation", "source_id": source,
+                "evidence_ids": (f"ev:{source}",), "confidence": 0.9, "authority": 0.7,
+                "valid_from": utcnow().isoformat(),
+            })
+            reconciler.ingest(delta)
+
+    def test_conflicts_scoped_to_entity_id_excludes_others(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+        self._make_conflict(reconciler, "e1")
+        self._make_conflict(reconciler, "e2")
+
+        scoped = query.conflicts(entity_id="e1")
+        assert {c.entity_id for c in scoped} == {"e1"}
+
+    def test_conflicts_scoped_to_entity_ids_list(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+        self._make_conflict(reconciler, "e1")
+        self._make_conflict(reconciler, "e2")
+        self._make_conflict(reconciler, "e3")
+
+        scoped = query.conflicts(entity_ids=["e1", "e3"])
+        assert {c.entity_id for c in scoped} == {"e1", "e3"}
+
+    def test_conflicts_with_no_scope_returns_everything(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+        self._make_conflict(reconciler, "e1")
+        self._make_conflict(reconciler, "e2")
+
+        scoped = query.conflicts()
+        assert {"e1", "e2"} <= {c.entity_id for c in scoped}
+
+    def test_conflicts_limit_bounds_results(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+        for i in range(5):
+            self._make_conflict(reconciler, f"e{i}")
+
+        limited = query.conflicts(limit=2)
+        assert len(limited) == 2
+
+    def test_explain_entity_uses_scoped_conflicts_not_global_filter(self, world_stores):
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+        self._make_conflict(reconciler, "e1")
+        self._make_conflict(reconciler, "e2")
+
+        explanation = query.explain_entity("e1")
+        assert explanation is not None
+        conflict_props = {c["property_id"] for c in explanation["conflicts"]}
+        assert "label" in conflict_props
+
+
+class TestEntityRankingSignals:
+    """Bulk ranking-signal query used by CognitiveContext.build_window
+    instead of calling entity() on every entity in the world model."""
+
+    def test_signals_reflect_confidence_and_recency(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        reconciler = world_stores["reconciler"]
+        state = world_stores["state"]
+
+        delta = WorldDelta()
+        delta.assertions.append({
+            "subject_id": "e1", "property_id": "label",
+            "value": TypedValue(raw="thing", value_type=ValueType.STRING),
+            "epistemic_kind": "observation", "source_id": "cam:1",
+            "evidence_ids": ("ev:1",), "confidence": 0.8, "authority": 0.7,
+            "valid_from": utcnow().isoformat(),
+        })
+        reconciler.ingest(delta)
+
+        signals = state.entity_ranking_signals()
+        assert "e1" in signals
+        assert signals["e1"]["avg_confidence"] == pytest.approx(0.8)
+        assert signals["e1"]["last_updated"]
+
+    def test_missing_entity_absent_from_signals(self, world_stores):
+        state = world_stores["state"]
+        signals = state.entity_ranking_signals()
+        assert "nonexistent-entity" not in signals
+
+
+class TestBuildWindowDoesNotFetchEveryEntity:
+    """Regression test: build_window used to call entity() (3 queries) on
+    every entity in the world model just to rank them -- with thousands of
+    entities this was ~24s of pure overhead on every conversational turn,
+    since this builds the world-state section included in every LLM
+    context, not just a dashboard view."""
+
+    def test_entity_is_not_called_for_unselected_entities(self, world_stores):
+        from egg_companion.world.types import TypedValue, ValueType, WorldDelta
+        from egg_companion.world.context import CognitiveContext
+
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+
+        for i in range(20):
+            delta = WorldDelta()
+            delta.assertions.append({
+                "subject_id": f"e{i}", "property_id": "label",
+                "value": TypedValue(raw=f"thing-{i}", value_type=ValueType.STRING),
+                "epistemic_kind": "observation", "source_id": "cam:1",
+                "evidence_ids": (f"ev:{i}",), "confidence": 0.5, "authority": 0.7,
+                "valid_from": utcnow().isoformat(),
+            })
+            reconciler.ingest(delta)
+
+        calls: list[str] = []
+        original_entity = query.entity
+
+        def counting_entity(entity_id):
+            calls.append(entity_id)
+            return original_entity(entity_id)
+
+        query.entity = counting_entity
+        ctx = CognitiveContext(query)
+        window = ctx.build_window(max_characters=5000, max_entities=3)
+
+        # entity() should only be called for the (at most 3) selected
+        # entities, never for all 20 during ranking.
+        assert len(calls) <= 3
+        assert len(window.entities) <= 3
 
 
 class TestActionProposalPersistence:

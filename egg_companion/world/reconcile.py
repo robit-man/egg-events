@@ -205,6 +205,11 @@ class Reconciler:
                 CREATE INDEX IF NOT EXISTS idx_wa_property ON world_assertions(subject_id, property_id);
                 CREATE INDEX IF NOT EXISTS idx_wa_state ON world_assertions(state);
                 CREATE INDEX IF NOT EXISTS idx_wa_valid ON world_assertions(valid_from, valid_to);
+                -- Serves get_assertion_histories' bulk "WHERE subject_id IN
+                -- (...) ORDER BY valid_from DESC" directly, instead of a
+                -- full scan + temp-btree sort per query.
+                CREATE INDEX IF NOT EXISTS idx_wa_subject_valid
+                    ON world_assertions(subject_id, valid_from DESC);
 
                 CREATE TABLE IF NOT EXISTS relation_assertions (
                     assertion_id TEXT PRIMARY KEY,
@@ -641,6 +646,56 @@ class Reconciler:
                 }
                 for row in rows
             ]
+
+    def get_assertion_histories(
+        self, pairs: list[tuple[str, str]], limit_per_pair: int = 5
+    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        """Bulk form of get_assertion_history for many (subject, property)
+        pairs at once -- one query instead of one per pair. Used by
+        WorldQuery.conflicts(), where the pair count scales with how many
+        conflicts currently exist and a per-pair query became a real
+        bottleneck against a live, continuously-written database.
+
+        Capped to the `limit_per_pair` most recent rows per pair via a
+        window function: some entities accumulate hundreds of historical
+        assertion versions (continuously re-observed cameras/objects), and
+        callers here only ever look at the first couple of rows -- fetching
+        the unbounded full history per pair was the actual dominant cost
+        once the query itself stopped being N+1.
+        """
+        if not pairs:
+            return {}
+        subjects = sorted({subject for subject, _ in pairs})
+        wanted = set(pairs)
+        with self._lock:
+            placeholders = ",".join("?" for _ in subjects)
+            rows = self._conn.execute(
+                f"""SELECT subject_id, property_id, assertion_id, value_json,
+                epistemic_kind, source_id, confidence, authority, valid_from,
+                valid_to, state, recorded_at
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY subject_id, property_id ORDER BY valid_from DESC
+                    ) AS rn
+                    FROM world_assertions WHERE subject_id IN ({placeholders})
+                )
+                WHERE rn <= ?
+                ORDER BY valid_from DESC""",
+                (*subjects, limit_per_pair),
+            ).fetchall()
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {pair: [] for pair in pairs}
+        for row in rows:
+            key = (row[0], row[1])
+            if key not in wanted:
+                continue
+            grouped[key].append({
+                "assertion_id": row[2], "value": json.loads(row[3]),
+                "epistemic_kind": row[4], "source_id": row[5],
+                "confidence": row[6], "authority": row[7],
+                "valid_from": row[8], "valid_to": row[9],
+                "state": row[10], "recorded_at": row[11],
+            })
+        return grouped
 
     def get_conflicts(self) -> list[dict[str, Any]]:
         with self._lock:

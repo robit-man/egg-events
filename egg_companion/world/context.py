@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,27 +51,33 @@ class CognitiveContext:
         window = ContextWindow(max_characters=max_characters)
         all_ids = self._query.all_entity_ids()
 
-        # Rank entities: focus_entity always first, then by recency and confidence
+        # Rank entities: focus_entity always first, then by recency and
+        # confidence. This used to call entity() (properties + relations +
+        # identity chain -- 3 queries) on *every* entity just to compute a
+        # ranking score before picking the handful actually needed -- with
+        # several thousand entities that was ~24s of pure query overhead on
+        # every conversational turn (this builds the world-state section of
+        # every LLM context, not just a dashboard view). One bulk GROUP BY
+        # query gives the same recency+confidence signal; entity() is now
+        # only called for the entities actually selected, below.
+        signals = self._query.entity_ranking_signals()
+        now = _dt.datetime.now(_dt.timezone.utc)
         ranked: list[tuple[float, str]] = []
         for eid in all_ids:
             priority = 0.0
             if eid == focus_entity:
                 priority = 1000.0
-            ev = self._query.entity(eid)
-            if ev and ev.properties:
-                # Boost by recency
-                last_seen = ev.properties.get("last_seen", {})
-                if last_seen.get("value"):
+            info = signals.get(eid)
+            if info:
+                last_updated = info.get("last_updated")
+                if last_updated:
                     try:
-                        import datetime as _dt
-                        ts = _dt.datetime.fromisoformat(str(last_seen["value"]))
-                        age = (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds()
+                        ts = _dt.datetime.fromisoformat(str(last_updated))
+                        age = (now - ts).total_seconds()
                         priority += max(0.0, 10.0 - age / 30.0)
                     except Exception:
                         pass
-                # Boost by avg confidence
-                avg_conf = sum(p.get("confidence", 0) for p in ev.properties.values()) / max(len(ev.properties), 1)
-                priority += avg_conf * 5.0
+                priority += float(info.get("avg_confidence") or 0.0) * 5.0
             ranked.append((priority, eid))
 
         ranked.sort(reverse=True)
@@ -107,9 +114,16 @@ class CognitiveContext:
         window.total_characters = total_chars
         window.summary = self._query.summary()
 
-        # Populate conflicts
+        # Populate conflicts -- scoped to just the entities actually in
+        # this window (at most max_entities), not a global scan: this used
+        # to fetch every conflict across the whole world model on every
+        # turn regardless of which entities were even being shown.
         try:
-            conflicts = self._query.conflicts()
+            window_entity_ids = [entry["entity_id"] for entry in entities]
+            conflicts = (
+                self._query.conflicts(entity_ids=window_entity_ids)
+                if window_entity_ids else []
+            )
             window.conflicts = [
                 {
                     "entity_id": c.entity_id,

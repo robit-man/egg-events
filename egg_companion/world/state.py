@@ -308,41 +308,70 @@ class WorldStateStore:
                 for row in rows
             ]
 
-    def conflicts(self, entity_id: str = "") -> list[PropertyStateRow]:
+    def conflicts(
+        self, entity_id: str = "", entity_ids: list[str] | None = None
+    ) -> list[PropertyStateRow]:
         """Return properties that have multiple active accepted assertions.
 
         Queries the assertion log for (entity_id, property_id) pairs that
         have more than one accepted/conflicted assertion.  Returns the
         corresponding current-state rows.
+
+        This used to issue one point-lookup query per conflicting pair --
+        with thousands of conflicting pairs on a live, continuously-written
+        database, that N+1 pattern (each lookup contending for the lock
+        with the perception pipeline's writes) was slow enough to make the
+        dashboard's /api/world route effectively unusable. Now it's exactly
+        two queries: the candidate-pair scan, then one bulk fetch of every
+        current_property_state row for the involved entities, filtered to
+        the wanted pairs in Python.
+
+        `entity_ids`, when given, scopes the candidate scan to just those
+        entities (e.g. the handful in an LLM context window) instead of
+        the whole table -- takes priority over `entity_id` if both given.
         """
         with self._lock:
-            if entity_id:
-                rows = self._conn.execute(
+            if entity_ids:
+                placeholders = ",".join("?" for _ in entity_ids)
+                pairs = self._conn.execute(
+                    f"""SELECT DISTINCT subject_id, property_id FROM world_assertions
+                    WHERE subject_id IN ({placeholders}) AND state IN ('conflicted', 'accepted')
+                    GROUP BY subject_id, property_id HAVING COUNT(*) > 1""",
+                    list(entity_ids),
+                ).fetchall()
+            elif entity_id:
+                pairs = self._conn.execute(
                     """SELECT DISTINCT subject_id, property_id FROM world_assertions
                     WHERE subject_id = ? AND state IN ('conflicted', 'accepted')
                     GROUP BY subject_id, property_id HAVING COUNT(*) > 1""",
                     (entity_id,),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                pairs = self._conn.execute(
                     """SELECT DISTINCT subject_id, property_id FROM world_assertions
                     WHERE state IN ('conflicted', 'accepted')
                     GROUP BY subject_id, property_id HAVING COUNT(*) > 1"""
                 ).fetchall()
+            if not pairs:
+                return []
+            wanted = {(subject, prop) for subject, prop in pairs}
+            subjects = sorted({subject for subject, _ in pairs})
+            placeholders = ",".join("?" for _ in subjects)
+            rows = self._conn.execute(
+                f"SELECT * FROM current_property_state WHERE entity_id IN ({placeholders})",
+                subjects,
+            ).fetchall()
             result = []
-            for subject, prop in rows:
-                row = self._conn.execute(
-                    "SELECT * FROM current_property_state WHERE entity_id = ? AND property_id = ?",
-                    (subject, prop),
-                ).fetchone()
-                if row:
-                    result.append(PropertyStateRow(
-                        entity_id=row[0], property_id=row[1], value_json=row[2],
-                        value_type=row[3], confidence=row[4], authority=row[5],
-                        assertion_id=row[6], evidence_ids_json=row[7],
-                        epistemic_kind=row[8], valid_from=row[9], valid_to=row[10],
-                        updated_at=row[11], revision=row[12],
-                    ))
+            for row in rows:
+                if (row[0], row[1]) not in wanted:
+                    continue
+                result.append(PropertyStateRow(
+                    entity_id=row[0], property_id=row[1], value_json=row[2],
+                    value_type=row[3], confidence=row[4], authority=row[5],
+                    assertion_id=row[6], evidence_ids_json=row[7],
+                    epistemic_kind=row[8], valid_from=row[9], valid_to=row[10],
+                    updated_at=row[11], revision=row[12],
+                ))
             return result
 
     def explain(self, entity_id: str, property_id: str) -> dict[str, Any]:
@@ -396,6 +425,28 @@ class WorldStateStore:
                     "last_updated": info["last_updated"],
                 }
             return result
+
+    def entity_ranking_signals(self) -> dict[str, dict[str, object]]:
+        """Cheap bulk (last_updated, avg_confidence) per entity for ranking.
+
+        CognitiveContext.build_window used to rank every entity by calling
+        entity() (3 queries: properties, relations, identity chain) on all
+        of them just to compute a priority score, before even picking the
+        handful it actually needed -- with several thousand entities that
+        was ~24s of pure query overhead on every conversational turn (this
+        feeds the LLM context section built for every reply, not just the
+        dashboard). One GROUP BY query gives the same ranking signal
+        (recency + confidence) that only the top few selected entities
+        need full detail for afterward.
+        """
+        with self._lock:
+            signals: dict[str, dict[str, object]] = {}
+            for row in self._conn.execute(
+                "SELECT entity_id, MAX(updated_at), AVG(confidence) "
+                "FROM current_property_state GROUP BY entity_id"
+            ).fetchall():
+                signals[row[0]] = {"last_updated": row[1], "avg_confidence": row[2] or 0.0}
+            return signals
 
     def all_current_relations(self) -> list[RelationStateRow]:
         with self._lock:

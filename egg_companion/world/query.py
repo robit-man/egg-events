@@ -130,7 +130,7 @@ class WorldQuery:
             else:
                 entry["assertion_history"] = []
             properties_with_history[prop_id] = entry
-        conflicts = [c for c in self.conflicts() if c.entity_id == entity_id]
+        conflicts = self.conflicts(entity_id=entity_id)
         return {
             "entity_id": entity_id,
             "properties": properties_with_history,
@@ -154,7 +154,22 @@ class WorldQuery:
         summary = self.summary()
         all_ids = self.all_entity_ids()
         brief_counts = self._state.entity_brief_counts()
-        conflicting_ids = {c.entity_id for c in self.conflicts()}
+        # Computed once and reused for both the per-entity has_conflicts
+        # flag and the conflicts list below -- this used to call
+        # self.conflicts() twice, each run independently doing the full
+        # (now-fixed, but still non-trivial) conflict-resolution query
+        # chain for no reason.
+        #
+        # conflicting_ids/conflict_count use the cheap candidate-pair scan
+        # (no per-conflict assertion history) so the reported total and the
+        # has_conflicts flags stay accurate; the detailed conflicts list is
+        # capped to a representative sample -- same spirit as entities_brief
+        # below being capped to the first 100 -- since fetching assertion
+        # history for potentially thousands of live conflicts is real work
+        # this dashboard summary doesn't need to pay for in full every time.
+        conflict_rows = self._state.conflicts()
+        conflicting_ids = {row.entity_id for row in conflict_rows}
+        conflicts = self.conflicts(limit=100)
         entities_brief = []
         for eid in all_ids[:100]:
             info = brief_counts.get(eid, {})
@@ -165,17 +180,10 @@ class WorldQuery:
                 "last_updated": info.get("last_updated", ""),
                 "has_conflicts": eid in conflicting_ids,
             })
-        recent_activity = []
-        if self._reconciler is not None:
-            try:
-                recent_activity = self._reconciler.get_conflicts()[:20]
-            except Exception:
-                pass
-        conflicts = self.conflicts()
         return {
             **summary,
             "entities": entities_brief,
-            "conflict_count": len(conflicts),
+            "conflict_count": len(conflict_rows),
             "conflicts": [
                 {
                     "entity_id": c.entity_id,
@@ -189,26 +197,45 @@ class WorldQuery:
             "revision": self._state.revision,
         }
 
-    def conflicts(self) -> list[ConflictInfo]:
+    def conflicts(
+        self,
+        entity_id: str | None = None,
+        entity_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[ConflictInfo]:
+        """entity_id/entity_ids scope the (expensive-ish) conflict scan to
+        specific entities instead of the whole world model; limit bounds
+        how many of the matched conflicts get their (also non-trivial)
+        assertion history fetched and returned."""
         # Get conflicts from the assertion log via the state store
-        conflict_rows = self._state.conflicts()
+        conflict_rows = self._state.conflicts(entity_id=entity_id or "", entity_ids=entity_ids)
         seen: set[tuple[str, str]] = set()
-        result: list[ConflictInfo] = []
+        unique_rows = []
         for c in conflict_rows:
             key = (c.entity_id, c.property_id)
             if key in seen:
                 continue
             seen.add(key)
-            # Fetch assertion history to show both sides of the conflict
-            assertions = []
-            if self._reconciler is not None:
-                try:
-                    history = self._reconciler.get_assertion_history(c.entity_id, c.property_id)
-                    assertions = [
-                        a for a in history if a.get("state") in ("accepted", "conflicted")
-                    ]
-                except Exception:
-                    pass
+            unique_rows.append(c)
+        if limit is not None:
+            unique_rows = unique_rows[:limit]
+
+        # One bulk query for every conflict's assertion history instead of
+        # one query per conflict -- with thousands of live conflicts this
+        # was the dominant cost of building the dashboard's world summary.
+        histories: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        if self._reconciler is not None and unique_rows:
+            try:
+                histories = self._reconciler.get_assertion_histories(
+                    [(c.entity_id, c.property_id) for c in unique_rows]
+                )
+            except Exception:
+                histories = {}
+
+        result: list[ConflictInfo] = []
+        for c in unique_rows:
+            history = histories.get((c.entity_id, c.property_id), [])
+            assertions = [a for a in history if a.get("state") in ("accepted", "conflicted")]
             proposed_value = None
             if len(assertions) >= 2:
                 proposed_value = assertions[1].get("value")
@@ -237,6 +264,9 @@ class WorldQuery:
 
     def all_entity_ids(self) -> list[str]:
         return self._state.all_entity_ids()
+
+    def entity_ranking_signals(self) -> dict[str, dict[str, object]]:
+        return self._state.entity_ranking_signals()
 
     def all_current_relations(self) -> list[dict[str, Any]]:
         return [
