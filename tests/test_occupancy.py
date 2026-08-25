@@ -9,6 +9,7 @@ a ~4GB model load and a sibling project's venv.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from egg_companion.core.occupancy import VoxelGrid
 
@@ -140,6 +141,56 @@ class TestCapacityAndStaleness:
         removed = grid.prune_stale(stale_after_seconds=100.0, now=500.0)
         assert removed > 0
         assert len(grid) == 0
+
+
+class TestOccupiedVoxels:
+    """occupied_voxels() -- the raw per-voxel export used by the
+    dashboard's 3D scene, as opposed to summarize()'s coarse text summary."""
+
+    def test_empty_grid_returns_empty_list(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        assert grid.occupied_voxels() == []
+
+    def test_free_voxels_are_excluded(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        grid.integrate_depth(
+            _flat_depth(16, 16, value=4.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=4, ray_steps=16,
+        )
+        voxels = grid.occupied_voxels()
+        assert voxels
+        assert all(v["confidence"] > 0 for v in voxels)
+        # occupied_count() is the authoritative count of occupied cells;
+        # occupied_voxels() must return exactly that many, not more (i.e.
+        # not accidentally including the free/ray-carved cells too).
+        assert len(voxels) == grid.occupied_count()
+
+    def test_voxel_center_matches_grid_index_times_voxel_size(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        grid.integrate_depth(
+            _flat_depth(4, 4, value=2.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=1, ray_steps=2,
+        )
+        voxels = grid.occupied_voxels()
+        assert voxels
+        for v in voxels:
+            # Every returned coordinate should land on a half-voxel-offset
+            # center: (index + 0.5) * voxel_size.
+            for axis in ("x", "y", "z"):
+                remainder = (v[axis] / 0.5) % 1
+                assert remainder == pytest.approx(0.5, abs=1e-6) or remainder == pytest.approx(-0.5, abs=1e-6)
+
+    def test_confidence_is_carried_through(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
+        depth = _flat_depth(4, 4, value=2.0)
+        conf = np.full((4, 4), 0.73, dtype=np.float32)
+        grid.integrate_depth(
+            depth, confidence=conf, horizontal_fov_degrees=90.0,
+            sample_stride=1, ray_steps=2,
+        )
+        voxels = grid.occupied_voxels()
+        assert voxels
+        assert all(v["confidence"] == pytest.approx(0.73) for v in voxels)
 
 
 class TestSummarize:

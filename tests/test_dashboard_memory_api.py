@@ -117,6 +117,7 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
                 "/api/memory/revisions",
                 "/api/memory/export/{entity_id}",
                 "/api/cognition/state",
+                "/api/occupancy",
             } <= paths
             assert "/assets" in paths
         finally:
@@ -175,6 +176,10 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert '<option value="daily_narrative">Daily stories</option>' in dashboard.PAGE
     assert 'data-graph-kind="world_model"' in dashboard.PAGE
     assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
+    assert 'id="occupancy-scene"' in dashboard.PAGE
+    assert 'src="/assets/occupancy_scene.js?v=20260824a"' in dashboard.PAGE
+    assert "egg:occupancy-data" in dashboard.PAGE
+    assert "loadOccupancy" in dashboard.PAGE
 
 
 def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> None:

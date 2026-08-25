@@ -352,7 +352,16 @@ class CompanionRuntime:
             maxlen=config.identity.temporal_vlm_queue_size
         )
         self._depth_estimator = DepthEstimator(config.occupancy)
-        self._occupancy_grids: dict[str, VoxelGrid] = {}
+        # One shared grid, not one per camera: the array's cameras are
+        # co-located with a known relative yaw (config.occupancy.
+        # camera_yaw_degrees), so every camera's depth fuses into a single
+        # reconstruction of the environment instead of disconnected
+        # per-camera fragments. See core/occupancy.py's module docstring.
+        self._occupancy_grid = VoxelGrid(
+            voxel_size_meters=config.occupancy.voxel_size_meters,
+            max_range_meters=config.occupancy.max_range_meters,
+            max_voxels=config.occupancy.max_voxels,
+        )
         self._occupancy_last_update: dict[str, float] = {}
         self._record_voice_transition("runtime_initialized")
 
@@ -408,6 +417,32 @@ class CompanionRuntime:
             "bytes": buffered["bytes"],
         }
         return snapshot
+
+    def occupancy_snapshot(self) -> dict[str, object]:
+        """Fused voxel occupancy for the dashboard's 3D scene.
+
+        One shared reconstruction (see core/occupancy.py's module
+        docstring for the array-fusion geometry), plus per-camera
+        freshness/contribution diagnostics and the array's configured
+        mounting angles so the dashboard can draw camera position markers.
+        """
+        now = time.monotonic()
+        return {
+            "enabled": self.config.occupancy.enabled,
+            "voxel_size_meters": self.config.occupancy.voxel_size_meters,
+            "max_range_meters": self.config.occupancy.max_range_meters,
+            "camera_yaw_degrees": dict(self.config.occupancy.camera_yaw_degrees),
+            "voxels": self._occupancy_grid.occupied_voxels(),
+            "occupied_count": self._occupancy_grid.occupied_count(),
+            "free_count": self._occupancy_grid.free_count(),
+            "cameras": {
+                camera_id: {
+                    "age_seconds": round(now - last_update, 1),
+                    "yaw_degrees": self.config.occupancy.camera_yaw_degrees.get(camera_id, 0.0),
+                }
+                for camera_id, last_update in self._occupancy_last_update.items()
+            },
+        }
 
     def conversation_history(self, limit: int = 5000) -> list[dict[str, object]]:
         if self._memory is None:
@@ -3994,13 +4029,14 @@ class CompanionRuntime:
             logger.debug("World model backfill failed: %s", error)
 
     async def _update_occupancy_maps(self) -> None:
-        """Per-camera voxel occupancy from on-demand monocular metric depth.
+        """Fused voxel occupancy from on-demand monocular metric depth.
 
         Only one camera is updated per due cycle, never concurrently --
         this Jetson does not have the memory headroom to run more than one
-        ~4GB depth model subprocess at a time. Each camera's grid is
-        entirely local to that camera (no calibration exists between
-        cameras), so this never attempts to fuse them into one map.
+        ~4GB depth model subprocess at a time. Each camera's depth is
+        rotated by its known array yaw (config.occupancy.
+        camera_yaw_degrees) into the single shared self._occupancy_grid --
+        see core/occupancy.py's module docstring for the fusion geometry.
         """
         while True:
             await asyncio.sleep(5.0)
@@ -4017,8 +4053,9 @@ class CompanionRuntime:
         )
 
     async def _run_occupancy_cycle(self) -> str | None:
-        """Update at most one due camera's occupancy grid. Returns the
-        camera_id updated, or None if nothing was due / nothing ran."""
+        """Integrate at most one due camera's depth into the shared
+        occupancy grid. Returns the camera_id integrated, or None if
+        nothing was due / nothing ran."""
         if self._memory is None or not self.config.occupancy.enabled:
             return None
         camera_id = self._next_due_occupancy_camera(time.monotonic())
@@ -4034,26 +4071,20 @@ class CompanionRuntime:
             result = await self._depth_estimator.estimate(image_bytes)
             if result is None:
                 return None
-            grid = self._occupancy_grids.setdefault(
-                camera_id,
-                VoxelGrid(
-                    voxel_size_meters=self.config.occupancy.voxel_size_meters,
-                    max_range_meters=self.config.occupancy.max_range_meters,
-                    max_voxels=self.config.occupancy.max_voxels_per_camera,
-                ),
-            )
+            yaw_degrees = self.config.occupancy.camera_yaw_degrees.get(camera_id, 0.0)
             await asyncio.to_thread(
-                grid.integrate_depth,
+                self._occupancy_grid.integrate_depth,
                 result.depth,
                 result.confidence,
                 self.config.occupancy.assumed_hfov_degrees,
                 self.config.occupancy.min_confidence,
+                yaw_degrees=yaw_degrees,
             )
-            grid.prune_stale(self.config.occupancy.stale_after_seconds)
+            self._occupancy_grid.prune_stale(self.config.occupancy.stale_after_seconds)
             self._memory.record_derived_property(
-                f"camera_view:{camera_id}",
+                "environment:egg",
                 "occupancy_summary",
-                grid.summary_text(),
+                self._occupancy_grid.summary_text(),
                 source_id=f"depth:{camera_id}",
             )
             return camera_id

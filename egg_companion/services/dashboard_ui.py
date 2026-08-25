@@ -638,6 +638,18 @@ PAGE = r"""<!doctype html>
         <section class="page" data-page="/vision">
           <div class="page-heading"><div><h2>Camera streams</h2><p>Raw feeds with current instance masks, semantic labels, and inference timing.</p></div><div id="vision-summary" class="badge-row"></div></div>
           <div class="grid"><article class="card span-12"><div id="cameras" class="camera-grid"><div class="empty">Waiting for camera streams.</div></div></article><article class="card span-12"><div class="card-header"><div><h3 class="card-title">Scene inventory</h3><p class="card-note">Observed labels aggregated over the current runtime</p></div></div><div id="seen" class="badge-row"><span class="muted">No scene categories reported.</span></div></article></div>
+          <div class="page-heading" style="margin-top:20px"><div><h2>Voxel occupancy</h2><p>Fused 3D reconstruction from the panoramic depth array; orbit to inspect the dense workable environment.</p></div><div id="occupancy-status" class="badge-row"><span class="badge">Loading</span></div></div>
+          <article id="occupancy-panel" class="card graph-panel">
+            <div class="graph-toolbar">
+              <div class="graph-toolbar-controls"><span class="card-note">Cameras video0–video3, right to left, counter-clockwise · 60° stitch</span></div>
+              <div class="graph-toolbar-actions"><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
+            </div>
+            <div class="graph-stage">
+              <div id="occupancy-scene" class="graph-canvas" role="img" aria-label="Interactive three-dimensional voxel occupancy reconstruction of the environment"></div>
+              <div id="occupancy-overlay" class="graph-overlay badge-row"><span class="badge">Loading occupancy</span></div>
+              <div class="graph-hint">Drag to orbit · scroll to zoom</div>
+            </div>
+          </article>
         </section>
 
         <section class="page" data-page="/voice">
@@ -786,6 +798,7 @@ PAGE = r"""<!doctype html>
     let graphLoadedAt = 0;
     let graphDataSignature = '';
     let graphActivationSequence = 0;
+    let occupancyLoadedAt = 0;
     let graphSelectionRevision = 0;
     let narrativeLoadedAt = 0;
     let narrativeSignature = '';
@@ -813,6 +826,7 @@ PAGE = r"""<!doctype html>
       document.body.classList.remove('menu-open');
       if (route === '/configuration' && !effectiveConfig) loadConfiguration();
       if (route === '/vision' && currentState) renderCameras(currentState.telemetry?.cameras || []);
+      if (route === '/vision') loadOccupancy();
       if (route === '/voice' && !catalog) loadCatalog();
       if (route === '/' || route === '/voice') loadConversation();
       if (route === '/graph') loadGraph();
@@ -1425,6 +1439,31 @@ PAGE = r"""<!doctype html>
       }
     }
 
+    async function loadOccupancy() {
+      if (Date.now() - occupancyLoadedAt < 4000) return;
+      occupancyLoadedAt = Date.now();
+      try {
+        const response = await fetch('/api/occupancy', {cache:'no-store'});
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        window.dispatchEvent(new CustomEvent('egg:occupancy-data', {detail: payload}));
+        if (!payload.enabled) {
+          $('#occupancy-status').innerHTML = '<span class="badge">Occupancy mapping disabled</span>';
+          $('#occupancy-overlay').innerHTML = '<span class="badge">Disabled in configuration</span>';
+          return;
+        }
+        const voxels = payload.voxels || [];
+        const cameraCount = Object.keys(payload.cameras || {}).length;
+        $('#occupancy-status').innerHTML = `<span class="badge ${voxels.length ? 'good' : ''}">${esc(payload.occupied_count || 0)} occupied voxels</span><span class="badge">${esc(cameraCount)} camera${cameraCount === 1 ? '' : 's'} contributing</span>`;
+        $('#occupancy-overlay').innerHTML = voxels.length ? `<span class="badge good">${esc(voxels.length)} voxels</span><span class="badge">${esc(payload.max_range_meters)}m range</span>` : '<span class="badge">No occupied space observed yet</span>';
+      } catch (error) {
+        occupancyLoadedAt = 0;
+        $('#occupancy-status').innerHTML = `<span class="badge bad">Occupancy unavailable: ${esc(error.message)}</span>`;
+        $('#occupancy-overlay').innerHTML = `<span class="badge bad">Occupancy unavailable</span>`;
+      }
+    }
+    $('#occupancy-reset')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-reset')));
+
     $('#voice').addEventListener('input', () => { voiceFormDirty = true; });
     $('#voice').addEventListener('change', () => { voiceFormDirty = true; });
     $('#voice [name=voice_model]').addEventListener('change', () => currentState && renderVoiceChoices(currentState));
@@ -1609,9 +1648,11 @@ PAGE = r"""<!doctype html>
     Promise.allSettled([loadCatalog(), loadConfiguration()]).finally(refresh);
     setInterval(refresh, 1000);
     setInterval(() => $('.page.active')?.dataset.page === '/graph' && loadGraph(true), 2000);
+    setInterval(() => $('.page.active')?.dataset.page === '/vision' && loadOccupancy(), 4000);
     connectLiveWaveform();
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
   <script type="module" src="/assets/knowledge_graph.js?v=20260814b"></script>
+  <script type="module" src="/assets/occupancy_scene.js?v=20260824a"></script>
 </body>
 </html>"""

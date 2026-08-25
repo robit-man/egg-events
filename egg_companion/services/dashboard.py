@@ -619,6 +619,11 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             headers={"Cache-Control": "no-store"},
         )
 
+    async def occupancy_snapshot_handler(_: web.Request) -> web.Response:
+        return web.json_response(
+            companion().occupancy_snapshot(), headers={"Cache-Control": "no-store"}
+        )
+
     async def world_entity_handler(request: web.Request) -> web.Response:
         entity_id = request.match_info["entity_id"]
         pipeline = companion()._memory
@@ -685,6 +690,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app.router.add_post("/api/memory/consolidate", memory_consolidate_handler)
     app.router.add_get("/api/cognition/state", cognition_state_handler)
     app.router.add_get("/api/world", world_summary_handler)
+    app.router.add_get("/api/occupancy", occupancy_snapshot_handler)
     app.router.add_get("/api/world/entity/{entity_id}", world_entity_handler)
     app.router.add_get("/api/world/conflicts", world_conflicts_handler)
     app.router.add_static(

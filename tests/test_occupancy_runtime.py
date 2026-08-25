@@ -54,7 +54,11 @@ def _runtime(tmp_path):
     runtime.config = config
     runtime._memory = pipeline
     runtime._latest_frames = {}
-    runtime._occupancy_grids = {}
+    runtime._occupancy_grid = VoxelGrid(
+        voxel_size_meters=config.occupancy.voxel_size_meters,
+        max_range_meters=config.occupancy.max_range_meters,
+        max_voxels=config.occupancy.max_voxels,
+    )
     runtime._occupancy_last_update = {}
     return runtime, pipeline
 
@@ -117,13 +121,12 @@ class TestOccupancyCycle:
 
         assert result == "camera-video1"
         assert runtime._depth_estimator.calls == 1
-        assert "camera-video1" in runtime._occupancy_grids
-        assert isinstance(runtime._occupancy_grids["camera-video1"], VoxelGrid)
-        assert len(runtime._occupancy_grids["camera-video1"]) > 0
+        assert isinstance(runtime._occupancy_grid, VoxelGrid)
+        assert len(runtime._occupancy_grid) > 0
         assert "camera-video1" in runtime._occupancy_last_update
 
         summary = pipeline._world_query.property_value(
-            "camera_view:camera-video1", "occupancy_summary",
+            "environment:egg", "occupancy_summary",
         )
         assert summary is not None
         assert "nearest occupied surface" in summary
@@ -153,7 +156,7 @@ class TestOccupancyCycle:
 
         assert result is None
         summary = pipeline._world_query.property_value(
-            "camera_view:camera-video1", "occupancy_summary",
+            "environment:egg", "occupancy_summary",
         )
         assert summary is None
 
@@ -185,4 +188,6 @@ class TestOccupancyCycle:
 
         assert result in ("camera-video1", "camera-video2")
         assert runtime._depth_estimator.calls == 1
-        assert len(runtime._occupancy_grids) == 1
+        # Only the camera actually integrated this cycle gets an
+        # updated timestamp -- the other stays due for the next cycle.
+        assert len(runtime._occupancy_last_update) == 1

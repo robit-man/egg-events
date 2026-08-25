@@ -1,15 +1,22 @@
-"""Per-camera sparse voxel occupancy grid built from monocular depth.
+"""Sparse voxel occupancy grid fused from a known multi-camera array.
 
-None of this hardware's cameras have calibrated intrinsics, and there is no
-known extrinsic transform between them (no shared coordinate frame), so
-this deliberately builds one independent, camera-local grid per camera
-rather than attempting to fuse them into a single building-wide 3D map.
-Each grid answers "what does this camera's own view look like as occupied
-space" -- coarse enough for spatial reasoning ("is there room near X"), not
-precise enough for anything requiring true metric accuracy or navigation.
+The four cameras are a co-located panoramic rig (not independent, unrelated
+viewpoints): video0 rightmost, sweeping counter-clockwise through video1,
+video2, video3, each adjacent pair separated by a known yaw (see
+config.OccupancyConfig.camera_yaw_degrees). There's still no calibrated
+per-camera intrinsics (focal length/principal point are an assumed-FOV
+estimate -- see DepthEstimator/assumed_hfov_degrees), but the *extrinsic*
+geometry between cameras is known, so this fuses every camera's depth into
+one shared "egg frame" grid via a per-camera yaw rotation (no translation:
+the rig is modeled as sharing one optical center) rather than keeping each
+camera's reconstruction in its own disconnected local frame.
 
-Coordinate convention per grid: standard pinhole camera-local axes,
-+X right, +Y down, +Z forward (away from the camera), in meters.
+Coordinate convention for the shared (fused) frame: +X right, +Y up,
++Z forward (the direction camera-video's local yaw=0 boresight faces),
+in meters, right-handed, matching standard 3D-graphics/robotics "Y up"
+convention. Camera-local back-projection itself still uses the pinhole
+image convention (+Y down) before being rotated into the shared frame --
+see integrate_depth's yaw_degrees parameter.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ class VoxelRecord:
 
 
 class VoxelGrid:
-    """Sparse, bounded, camera-local occupancy grid."""
+    """Sparse, bounded occupancy grid in the shared (fused) egg frame."""
 
     def __init__(
         self,
@@ -73,10 +80,18 @@ class VoxelGrid:
         sample_stride: int = 8,
         ray_steps: int = 12,
         now: float | None = None,
+        yaw_degrees: float = 0.0,
     ) -> int:
         """Back-project a depth map into this grid using an assumed pinhole
-        model (no calibrated intrinsics exist for these cameras) and carve
-        free space along the ray from the camera to each observed surface.
+        model (no calibrated intrinsics exist for these cameras), rotate
+        each point into the shared fused frame by this camera's known
+        mounting yaw, and carve free space along the ray from the shared
+        origin to each observed surface.
+
+        yaw_degrees is this camera's angle in the panoramic array (see
+        module docstring / config.OccupancyConfig.camera_yaw_degrees), not
+        a per-call override of a calibrated pose -- pass 0.0 to integrate
+        directly in camera-local coordinates without fusing.
 
         Returns the number of pixels integrated.
         """
@@ -89,12 +104,14 @@ class VoxelGrid:
         fx = (width / 2.0) / math.tan(math.radians(horizontal_fov_degrees) / 2.0)
         fy = fx  # assumed square pixels -- no calibration exists to say otherwise
         cx, cy = width / 2.0, height / 2.0
+        yaw = math.radians(yaw_degrees)
+        cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
 
         integrated = 0
         for row in range(0, height, sample_stride):
             for col in range(0, width, sample_stride):
-                z = float(depth[row, col])
-                if z <= 0.0 or z > self.max_range or not math.isfinite(z):
+                z_cam = float(depth[row, col])
+                if z_cam <= 0.0 or z_cam > self.max_range or not math.isfinite(z_cam):
                     continue
                 if confidence is not None:
                     pixel_conf = float(confidence[row, col])
@@ -103,8 +120,17 @@ class VoxelGrid:
                 else:
                     pixel_conf = 1.0
 
-                x = (col - cx) * z / fx
-                y = (row - cy) * z / fy
+                # Camera-local pinhole back-projection (+X right, +Y down,
+                # +Z forward), then flip to shared-frame +Y up, then rotate
+                # about the (now vertical) Y axis by this camera's mount
+                # yaw. Rotation is linear about the shared origin, so the
+                # ray-marched intermediate points below can just scale this
+                # already-rotated point by t rather than re-rotating each step.
+                x_cam = (col - cx) * z_cam / fx
+                y_cam = -(row - cy) * z_cam / fy
+                x = x_cam * cos_yaw + z_cam * sin_yaw
+                y = y_cam
+                z = -x_cam * sin_yaw + z_cam * cos_yaw
                 surface_index = self._to_index((x, y, z))
 
                 for step in range(1, ray_steps):
@@ -143,6 +169,21 @@ class VoxelGrid:
 
     def free_count(self) -> int:
         return sum(1 for record in self._voxels.values() if not record.occupied)
+
+    def occupied_voxels(self) -> list[dict[str, object]]:
+        """Occupied voxel centers in shared-frame meters, for the
+        dashboard's 3D scene -- not the fastest representation for a large
+        grid, but max_voxels already bounds how big this can get."""
+        return [
+            {
+                "x": round((ix + 0.5) * self.voxel_size, 3),
+                "y": round((iy + 0.5) * self.voxel_size, 3),
+                "z": round((iz + 0.5) * self.voxel_size, 3),
+                "confidence": round(record.confidence, 3),
+            }
+            for (ix, iy, iz), record in self._voxels.items()
+            if record.occupied
+        ]
 
     def summarize(self) -> dict[str, object]:
         """Compact, LLM-context-friendly summary of this camera's local

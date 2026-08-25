@@ -320,15 +320,39 @@ class OcrConfig(BaseModel):
     backfill: OcrBackfillConfig = Field(default_factory=OcrBackfillConfig)
 
 
-class OccupancyConfig(BaseModel):
-    """Per-camera voxel occupancy mapping via on-demand monocular metric depth.
+def _default_camera_yaw_degrees() -> dict[str, float]:
+    # The four cameras are a co-located panoramic rig, not independent
+    # viewpoints: video0 mounted farthest right, sweeping counter-clockwise
+    # through video1/video2/video3 at ~60-degree increments so adjacent
+    # fields of view stitch together (per the physical mounting -- not
+    # independently measured/verified, hence fully overridable here).
+    # Modeled as pure yaw about a shared optical center spanning a 180-
+    # degree forward arc, boresight to boresight: video0=-90 (rightmost)
+    # ... video3=+90 (leftmost), positive = counter-clockwise from above.
+    return {
+        "camera-video0": -90.0,
+        "camera-video1": -30.0,
+        "camera-video2": 30.0,
+        "camera-video3": 90.0,
+    }
 
-    Each camera gets its own local voxel grid (no calibration/extrinsics
-    between cameras exist on this hardware, so grids are not fused into one
-    shared 3D map). The depth model runs as a subprocess in a separate,
-    pre-existing Python environment (not this project's venv) and is loaded
-    fresh and torn down on every cycle -- this hardware doesn't have the
-    memory headroom to keep a ~4GB model resident alongside everything else.
+
+class OccupancyConfig(BaseModel):
+    """Fused voxel occupancy mapping via on-demand monocular metric depth.
+
+    The four cameras are a known panoramic array (see
+    camera_yaw_degrees), so every camera's depth is rotated into one
+    shared "egg frame" grid rather than kept in disconnected per-camera
+    frames -- see core/occupancy.py's module docstring for the exact
+    fusion geometry. There's still no calibrated per-camera intrinsics
+    (assumed_hfov_degrees is an estimate, not a measurement), so this is
+    accurate multi-view *reconstruction* within that limit, not
+    navigation-grade metric precision.
+
+    The depth model runs as a subprocess in a separate, pre-existing
+    Python environment (not this project's venv) and is loaded fresh and
+    torn down on every cycle -- this hardware doesn't have the memory
+    headroom to keep a ~4GB model resident alongside everything else.
     """
 
     # Defaults to disabled: live testing on this hardware showed swap usage
@@ -345,19 +369,28 @@ class OccupancyConfig(BaseModel):
     subprocess_timeout_seconds: float = Field(default=90.0, ge=10.0, le=600.0)
     # Conservative default: live testing on this hardware showed swap usage
     # climb noticeably (5Gi -> 8.9Gi) across a handful of depth cycles on a
-    # system that already runs with well under 1GB of free memory. With 3
+    # system that already runs with well under 1GB of free memory. With 4
     # cameras staggered at this interval, a full sweep happens roughly
-    # every 3 minutes rather than contending for memory every ~15s.
+    # every 4 minutes rather than contending for memory every ~15s.
     update_interval_seconds: float = Field(default=180.0, ge=10.0, le=3600.0)
     voxel_size_meters: float = Field(default=0.1, gt=0.01, le=2.0)
     max_range_meters: float = Field(default=6.0, gt=0.5, le=50.0)
     min_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
     # No calibrated intrinsics exist for any camera; assumed_hfov_degrees
     # is a coarse stand-in used only to back-project depth into a rough
-    # camera-local volume -- fine for "is space near X roughly occupied"
-    # reasoning, not for anything requiring true metric precision.
-    assumed_hfov_degrees: float = Field(default=80.0, ge=20.0, le=170.0)
-    max_voxels_per_camera: int = Field(default=20_000, ge=1_000, le=500_000)
+    # volume -- fine for "is space near X roughly occupied" reasoning, not
+    # for anything requiring true metric precision. Defaults to the same
+    # 60 degrees the array is described as stitching at, since adjacent
+    # cameras' edges meeting implies each one's own FOV is close to that.
+    assumed_hfov_degrees: float = Field(default=60.0, ge=20.0, le=170.0)
+    # camera_id -> yaw in degrees within the shared array frame (positive =
+    # counter-clockwise from above). Cameras with no entry here (e.g. a
+    # newly discovered /dev/videoN not yet in the array) are treated as
+    # yaw=0 -- their depth still integrates, just not correctly positioned
+    # relative to the rest of the array, so it's worth keeping this
+    # up to date with the real physical mounting.
+    camera_yaw_degrees: dict[str, float] = Field(default_factory=_default_camera_yaw_degrees)
+    max_voxels: int = Field(default=60_000, ge=1_000, le=1_000_000)
     stale_after_seconds: float = Field(default=1800.0, ge=60.0, le=86400.0)
 
 
