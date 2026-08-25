@@ -28,10 +28,6 @@ window.addEventListener('egg:occupancy-voxel-scale', event => {
   );
 });
 
-function cameraRingRadiusFor(maxRange) {
-  return Math.max(0.6, Math.min(3.0, (maxRange || 6.0) * 0.32));
-}
-
 // Increasing the Voxel +/- control must consolidate neighboring points
 // into larger, gap-filling blocks -- not just inflate each native voxel's
 // own footprint in place, which only produces overlap and, when shrunk,
@@ -83,37 +79,47 @@ function initCanvasFallback(container) {
   container.replaceChildren(canvas);
   const context = canvas.getContext('2d', { alpha: false });
 
-  let rawVoxels = [], voxels = [], cameras = [], voxelSizeMeters = 0.1;
+  let rawVoxels = [], voxels = [], voxelSizeMeters = 0.1;
   let pixelRatio = 1, width = 1, height = 1;
   let zoom = 60, panX = 0, panY = 0, yaw = 0.5, pitch = -0.25;
   let target = { x: 0, y: 0, z: 0 };
   let drag = null, framed = false;
-  const cameraImages = new Map(); // cameraId -> { img, lastLoad }
-  const CAMERA_TEXTURE_REFRESH_MS = 3000;
+  // Egg-POV lock: instead of orbiting a pivot, the camera sits at the
+  // shared fused-frame origin (0,0,0) -- per core/occupancy.py's module
+  // docstring, that origin IS the rig's single modeled optical center,
+  // i.e. physically the center of the 256mm ring the four cameras are
+  // mounted around -- and dragging looks around from there instead of
+  // orbiting. povYaw/povPitch are independent of the orbit mode's
+  // yaw/pitch/target/pan so switching back restores the prior orbit view.
+  let povLocked = false, povYaw = 0, povPitch = 0, povDrag = null;
 
   function point(p) {
     const x = p.x - target.x, y = p.y - target.y, z = p.z - target.z;
     const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
     const rx = cy * x + sy * z, rz = -sy * x + cy * z, ry = cp * y - sp * rz, depth = sp * y + cp * rz;
     const perspective = Math.max(0.25, Math.min(2.4, 1 - depth / 12));
-    // Screen X is mirrored (-rx) so the camera array reads left-to-right
-    // on screen (matching how a viewer standing behind the rig reads
-    // video0..video3) -- both voxels and camera planes go through this
-    // same point() projection, so the mirror keeps them consistent with
-    // each other; it never touches core/occupancy.py's actual fusion
-    // geometry, which stays physically accurate independent of display.
+    // Screen X is mirrored (-rx) so the array reads left-to-right on
+    // screen (matching how a viewer standing behind the rig reads
+    // video0..video3) -- this never touches core/occupancy.py's actual
+    // fusion geometry, which stays physically accurate independent of
+    // display.
     return { x: width / 2 + panX - rx * zoom * perspective, y: height / 2 + panY - ry * zoom * perspective, depth, scale: perspective };
   }
 
-  function refreshCameraImage(cameraId) {
-    let entry = cameraImages.get(cameraId);
-    const now = Date.now();
-    if (entry && now - entry.lastLoad < CAMERA_TEXTURE_REFRESH_MS) return entry;
-    const img = entry ? entry.img : new Image();
-    img.src = `/api/cameras/${encodeURIComponent(cameraId)}/raw.jpg?t=${now}`;
-    entry = { img, lastLoad: now };
-    cameraImages.set(cameraId, entry);
-    return entry;
+  // True perspective-divide projection from a camera fixed at the origin
+  // (unlike point()'s weak-perspective orbit approximation, which assumes
+  // the camera is always far from target) -- appropriate here because in
+  // POV mode the "camera" is inside the reconstruction, often within a
+  // voxel or two of nearby surfaces, where a real 1/depth projection is
+  // needed for correct scale. zoom is reused as a shared FOV knob so
+  // scroll-to-zoom keeps doing something meaningful in both modes.
+  function povPoint(p) {
+    const cy = Math.cos(povYaw), sy = Math.sin(povYaw), cp = Math.cos(povPitch), sp = Math.sin(povPitch);
+    const rx = cy * p.x + sy * p.z, rz = -sy * p.x + cy * p.z;
+    const ry = cp * p.y - sp * rz, depth = sp * p.y + cp * rz;
+    if (depth <= 0.05) return null; // behind the camera
+    const f = height * 0.9 * (zoom / 60);
+    return { x: width / 2 - (rx * f) / depth, y: height / 2 - (ry * f) / depth, depth, scale: f / depth };
   }
 
   function resize() {
@@ -130,17 +136,25 @@ function initCanvasFallback(container) {
 
   canvas.addEventListener('pointerdown', event => {
     canvas.setPointerCapture(event.pointerId);
+    if (povLocked) { povDrag = { x: event.clientX, y: event.clientY, yaw: povYaw, pitch: povPitch }; return; }
     drag = { x: event.clientX, y: event.clientY, panX, panY, yaw, pitch, pan: event.shiftKey || event.button !== 0 };
   });
   canvas.addEventListener('pointermove', event => {
     canvas.style.cursor = 'grab';
+    if (povLocked) {
+      if (!povDrag) return;
+      const dx = event.clientX - povDrag.x, dy = event.clientY - povDrag.y;
+      povYaw = povDrag.yaw - dx * 0.006;
+      povPitch = Math.max(-1.5, Math.min(1.5, povDrag.pitch - dy * 0.006));
+      return;
+    }
     if (!drag) return;
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
     if (drag.pan) { panX = drag.panX + dx; panY = drag.panY + dy; }
     else { yaw = drag.yaw + dx * 0.007; pitch = Math.max(-1.35, Math.min(1.35, drag.pitch - dy * 0.007)); }
   });
-  canvas.addEventListener('pointerup', () => { drag = null; });
-  canvas.addEventListener('pointercancel', () => { drag = null; });
+  canvas.addEventListener('pointerup', () => { drag = null; povDrag = null; });
+  canvas.addEventListener('pointercancel', () => { drag = null; povDrag = null; });
   canvas.addEventListener('contextmenu', event => event.preventDefault());
   canvas.addEventListener('wheel', event => {
     event.preventDefault();
@@ -152,19 +166,10 @@ function initCanvasFallback(container) {
   }
 
   function applyPayload(payload) {
-    if (!payload || !payload.enabled) { rawVoxels = []; voxels = []; cameras = []; return; }
+    if (!payload || !payload.enabled) { rawVoxels = []; voxels = []; return; }
     rawVoxels = payload.voxels || [];
     voxelSizeMeters = payload.voxel_size_meters || 0.1;
     rebucket();
-    const radius = cameraRingRadiusFor(payload.max_range_meters);
-    cameras = Object.entries(payload.cameras || {}).map(([id, info]) => {
-      const yawRad = (Number(info.yaw_degrees || 0) * Math.PI) / 180;
-      return {
-        id,
-        fresh: Number(info.age_seconds ?? 999) < 30,
-        x: Math.sin(yawRad) * radius, y: 0.1, z: Math.cos(yawRad) * radius,
-      };
-    });
     if (!framed && rawVoxels.length) {
       const n = rawVoxels.length;
       target = {
@@ -204,49 +209,37 @@ function initCanvasFallback(container) {
     context.fillStyle = '#070d19';
     context.fillRect(0, 0, width, height);
 
-    const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const project = povLocked ? povPoint : point;
+    const cy = Math.cos(povLocked ? povYaw : yaw), sy = Math.sin(povLocked ? povYaw : yaw);
+    const cp = Math.cos(povLocked ? povPitch : pitch), sp = Math.sin(povLocked ? povPitch : pitch);
     const visibleFaces = visibleCubeFaces(cy, sy, cp, sp);
     const voxelWorldSize = voxelSizeMeters * voxelScaleMultiplier;
 
     const drawables = [];
-    for (const v of voxels) drawables.push({ kind: 'voxel', v, depth: point(v).depth });
-    for (const cam of cameras) drawables.push({ kind: 'camera', cam, entry: refreshCameraImage(cam.id), ...point(cam) });
+    for (const v of voxels) {
+      const projected = project(v);
+      if (projected) drawables.push({ v, depth: projected.depth });
+    }
     drawables.sort((a, b) => b.depth - a.depth); // paint far first
 
     for (const d of drawables) {
-      if (d.kind === 'voxel') {
-        const [r, g, b] = d.v.color || [0x66, 0x7e, 0xa8];
-        for (const face of visibleFaces) {
-          // Each corner is a REAL world-space offset of the voxel, so it
-          // goes through the same perspective/zoom projection as every
-          // other point -- the cube's on-screen size and shape follow
-          // actual spatial geometry (distance, zoom, viewing angle), not
-          // an arbitrary flat pixel constant.
-          const projected = face.corners.map(([lx, ly, lz]) => point({
-            x: d.v.x + lx * voxelWorldSize, y: d.v.y + ly * voxelWorldSize, z: d.v.z + lz * voxelWorldSize,
-          }));
-          context.fillStyle = `rgb(${Math.round(r * face.shade)},${Math.round(g * face.shade)},${Math.round(b * face.shade)})`;
-          context.beginPath();
-          context.moveTo(projected[0].x, projected[0].y);
-          for (let i = 1; i < projected.length; i++) context.lineTo(projected[i].x, projected[i].y);
-          context.closePath();
-          context.fill();
-        }
-      } else {
-        const img = d.entry.img;
-        const h = 70 * d.scale;
-        const w = img.naturalWidth && img.naturalHeight ? h * (img.naturalWidth / img.naturalHeight) : h;
-        if (img.complete && img.naturalWidth) {
-          context.globalAlpha = d.cam.fresh ? 0.95 : 0.5;
-          context.drawImage(img, d.x - w / 2, d.y - h / 2, w, h);
-          context.globalAlpha = 1;
-        } else {
-          context.fillStyle = '#223344';
-          context.fillRect(d.x - w / 2, d.y - h / 2, w, h);
-        }
-        context.strokeStyle = d.cam.fresh ? '#34d399' : '#667085';
-        context.lineWidth = 1;
-        context.strokeRect(d.x - w / 2, d.y - h / 2, w, h);
+      const [r, g, b] = d.v.color || [0x66, 0x7e, 0xa8];
+      for (const face of visibleFaces) {
+        // Each corner is a REAL world-space offset of the voxel, so it
+        // goes through the same perspective/zoom projection as every
+        // other point -- the cube's on-screen size and shape follow
+        // actual spatial geometry (distance, zoom, viewing angle), not
+        // an arbitrary flat pixel constant.
+        const projected = face.corners.map(([lx, ly, lz]) => project({
+          x: d.v.x + lx * voxelWorldSize, y: d.v.y + ly * voxelWorldSize, z: d.v.z + lz * voxelWorldSize,
+        })).filter(Boolean);
+        if (projected.length < face.corners.length) continue; // a corner is behind the POV camera
+        context.fillStyle = `rgb(${Math.round(r * face.shade)},${Math.round(g * face.shade)},${Math.round(b * face.shade)})`;
+        context.beginPath();
+        context.moveTo(projected[0].x, projected[0].y);
+        for (let i = 1; i < projected.length; i++) context.lineTo(projected[i].x, projected[i].y);
+        context.closePath();
+        context.fill();
       }
     }
     requestAnimationFrame(render);
@@ -255,8 +248,15 @@ function initCanvasFallback(container) {
   window.addEventListener('egg:occupancy-data', event => applyPayload(event.detail));
   window.addEventListener('egg:occupancy-reset', () => {
     target = { x: 0, y: 0, z: 0 }; yaw = 0.5; pitch = -0.25; zoom = 60; panX = 0; panY = 0; framed = false;
+    povYaw = 0; povPitch = 0;
   });
   window.addEventListener('egg:occupancy-voxel-scale', () => rebucket());
+  window.addEventListener('egg:occupancy-pov-toggle', () => {
+    povLocked = !povLocked;
+    if (povLocked) { povYaw = 0; povPitch = 0; }
+    drag = null; povDrag = null;
+    window.dispatchEvent(new CustomEvent('egg:occupancy-pov-changed', { detail: { locked: povLocked } }));
+  });
   window.dispatchEvent(new CustomEvent('egg:occupancy-renderer', { detail: { mode: 'canvas-2d' } }));
   render();
 }
@@ -265,25 +265,27 @@ const container = document.getElementById('occupancy-scene');
 
 if (container) {
   let scene, camera, renderer, controls, resizeObserver, animationFrame;
-  let voxelMesh = null, cameraRoot = null, rangeWireframe = null;
+  let voxelMesh = null, rangeWireframe = null;
   let lastPayload = null;
+  // Egg-POV lock: the camera sits at the fused frame's origin (0,0,0) --
+  // per core/occupancy.py's module docstring, that origin IS the rig's
+  // single modeled optical center, i.e. physically the center of the
+  // 256mm ring the four cameras are mounted around -- and dragging looks
+  // around from there (FPS-style) instead of orbiting a target.
+  let povLocked = false, povYaw = 0, povPitch = 0, povDrag = null;
+  const DEFAULT_CAMERA_POSITION = { x: 3.2, y: 2.4, z: 4.2 };
+  const DEFAULT_CONTROLS_TARGET = { x: 0, y: 0.3, z: 0 };
 
   const voxelGeometry = new THREE.BoxGeometry(1, 1, 1);
   const voxelMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.05 });
   const tmpColor = new THREE.Color();
   const tmpMatrix = new THREE.Matrix4();
 
-  // Each contributing camera's live frame, textured onto a plane and
-  // placed radially at that camera's known array yaw -- same rotation
-  // convention core/occupancy.py uses to fuse depth into the shared
-  // frame (yaw about +Y, 0deg = +Z), so a camera's image sits in the
-  // scene exactly where the voxels it contributed radiate outward from.
-  const textureLoader = new THREE.TextureLoader();
-  const cameraPlanes = new Map(); // cameraId -> { mesh, lastTextureLoad }
-  const CAMERA_TEXTURE_REFRESH_MS = 3000;
-  const CAMERA_PLANE_HEIGHT = 0.55;
-
-  function cameraRingRadius(maxRange) {
+  // Nominal radius used only to pad fitCameraToScene's bounding box when
+  // there are few/no voxels yet -- not physical rig geometry (see the
+  // module docstring in core/occupancy.py: the fused frame's origin
+  // already models the rig's single shared optical center).
+  function nominalSceneRadius(maxRange) {
     return THREE.MathUtils.clamp((maxRange || 6.0) * 0.32, 0.6, 3.0);
   }
 
@@ -311,85 +313,6 @@ if (container) {
     scene.add(voxelMesh);
   }
 
-  function disposeCameraPlane(entry) {
-    entry.mesh.geometry.dispose();
-    entry.mesh.material.map?.dispose();
-    entry.mesh.material.dispose();
-  }
-
-  function refreshCameraTexture(cameraId, mesh) {
-    const url = `/api/cameras/${encodeURIComponent(cameraId)}/raw.jpg?t=${Date.now()}`;
-    textureLoader.load(
-      url,
-      texture => {
-        texture.colorSpace = THREE.SRGBColorSpace;
-        const image = texture.image;
-        if (image && image.width && image.height) {
-          const aspect = image.width / image.height;
-          mesh.geometry.dispose();
-          mesh.geometry = new THREE.PlaneGeometry(CAMERA_PLANE_HEIGHT * aspect, CAMERA_PLANE_HEIGHT);
-        }
-        mesh.material.map?.dispose();
-        mesh.material.map = texture;
-        mesh.material.color.set(0xffffff);
-        mesh.material.needsUpdate = true;
-      },
-      undefined,
-      () => {}, // camera frame not available yet -- keep the placeholder tile
-    );
-  }
-
-  // Each contributing camera's live frame, textured onto a plane
-  // positioned radially at that camera's known array yaw and facing the
-  // shared origin -- matches core/occupancy.py's rotation convention
-  // (yaw about +Y, +Z is the video0-local boresight), so a camera's
-  // image sits exactly where the voxels it contributed radiate from.
-  function renderCameraMarkers(cameras, maxRange) {
-    const radius = cameraRingRadius(maxRange);
-    const seen = new Set();
-    Object.entries(cameras || {}).forEach(([cameraId, info]) => {
-      seen.add(cameraId);
-      const yaw = THREE.MathUtils.degToRad(Number(info.yaw_degrees || 0));
-      // Mirrored X (matches renderVoxels() and the 2D fallback's point()).
-      const x = -Math.sin(yaw) * radius;
-      const z = Math.cos(yaw) * radius;
-      let entry = cameraPlanes.get(cameraId);
-      if (!entry) {
-        const material = new THREE.MeshBasicMaterial({
-          color: 0x223344, side: THREE.DoubleSide, transparent: true, opacity: 0.96,
-        });
-        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(CAMERA_PLANE_HEIGHT, CAMERA_PLANE_HEIGHT), material);
-        mesh.userData.cameraId = cameraId;
-        cameraRoot.add(mesh);
-        entry = { mesh, lastTextureLoad: 0 };
-        cameraPlanes.set(cameraId, entry);
-      }
-      entry.mesh.position.set(x, 0.05, z);
-      entry.mesh.lookAt(0, 0.05, 0);
-      const fresh = Number(info.age_seconds ?? 999) < 30;
-      entry.mesh.material.opacity = fresh ? 0.96 : 0.5;
-      const now = Date.now();
-      if (now - entry.lastTextureLoad > CAMERA_TEXTURE_REFRESH_MS) {
-        entry.lastTextureLoad = now;
-        refreshCameraTexture(cameraId, entry.mesh);
-      }
-    });
-    for (const [cameraId, entry] of cameraPlanes) {
-      if (seen.has(cameraId)) continue;
-      cameraRoot.remove(entry.mesh);
-      disposeCameraPlane(entry);
-      cameraPlanes.delete(cameraId);
-    }
-  }
-
-  function clearCameraMarkers() {
-    for (const entry of cameraPlanes.values()) {
-      cameraRoot.remove(entry.mesh);
-      disposeCameraPlane(entry);
-    }
-    cameraPlanes.clear();
-  }
-
   function renderRangeWireframe(maxRange) {
     if (rangeWireframe) {
       scene.remove(rangeWireframe);
@@ -409,7 +332,7 @@ if (container) {
   let framedOnce = false;
   function fitCameraToScene(payload) {
     const voxels = payload.voxels || [];
-    const radius = cameraRingRadius(payload.max_range_meters);
+    const radius = nominalSceneRadius(payload.max_range_meters);
     const box = new THREE.Box3();
     box.expandByPoint(new THREE.Vector3(-radius, 0, -radius));
     box.expandByPoint(new THREE.Vector3(radius, 0.5, radius));
@@ -428,15 +351,13 @@ if (container) {
     if (!scene) return;
     if (!payload || !payload.enabled) {
       if (voxelMesh) { scene.remove(voxelMesh); voxelMesh.geometry.dispose(); voxelMesh = null; }
-      clearCameraMarkers();
       return;
     }
     const nativeSize = payload.voxel_size_meters || 0.1;
     const cellSize = nativeSize * voxelScaleMultiplier;
     renderVoxels(rebucketVoxels(payload.voxels || [], cellSize, nativeSize), cellSize);
-    renderCameraMarkers(payload.cameras || {}, payload.max_range_meters);
     renderRangeWireframe(payload.max_range_meters);
-    if (!framedOnce) fitCameraToScene(payload);
+    if (!framedOnce && !povLocked) fitCameraToScene(payload);
   }
 
   function resize() {
@@ -450,9 +371,48 @@ if (container) {
 
   function animate() {
     animationFrame = requestAnimationFrame(animate);
-    controls.update();
+    if (!povLocked) controls.update(); // manual pose while locked; see applyPovLook()
     renderer.render(scene, camera);
   }
+
+  // Point the camera per povYaw/povPitch from a fixed position at the
+  // fused frame's origin -- FPS-style look, independent of OrbitControls
+  // (disabled while locked; see setPovLocked()).
+  function applyPovLook() {
+    if (!camera) return;
+    camera.position.set(0, 0, 0);
+    camera.rotation.order = 'YXZ';
+    camera.rotation.set(povPitch, povYaw, 0);
+  }
+
+  function setPovLocked(locked) {
+    povLocked = locked;
+    if (!camera || !controls) return;
+    controls.enabled = !locked;
+    if (locked) {
+      povYaw = 0; povPitch = 0;
+      applyPovLook();
+    } else {
+      camera.rotation.order = 'XYZ';
+      camera.position.set(DEFAULT_CAMERA_POSITION.x, DEFAULT_CAMERA_POSITION.y, DEFAULT_CAMERA_POSITION.z);
+      controls.target.set(DEFAULT_CONTROLS_TARGET.x, DEFAULT_CONTROLS_TARGET.y, DEFAULT_CONTROLS_TARGET.z);
+      controls.update();
+    }
+    window.dispatchEvent(new CustomEvent('egg:occupancy-pov-changed', { detail: { locked } }));
+  }
+
+  function onPovPointerDown(event) {
+    if (!povLocked) return;
+    povDrag = { x: event.clientX, y: event.clientY, yaw: povYaw, pitch: povPitch };
+  }
+  function onPovPointerMove(event) {
+    if (!povLocked || !povDrag) return;
+    const dx = event.clientX - povDrag.x, dy = event.clientY - povDrag.y;
+    povYaw = povDrag.yaw - dx * 0.005;
+    povPitch = Math.max(-1.5, Math.min(1.5, povDrag.pitch - dy * 0.005));
+    applyPovLook();
+  }
+  function onPovPointerUp() { povDrag = null; }
 
   let fallbackActive = false;
 
@@ -478,13 +438,13 @@ if (container) {
 
     scene = new THREE.Scene();
     camera = new THREE.PerspectiveCamera(50, 1, 0.05, 200);
-    camera.position.set(3.2, 2.4, 4.2);
+    camera.position.set(DEFAULT_CAMERA_POSITION.x, DEFAULT_CAMERA_POSITION.y, DEFAULT_CAMERA_POSITION.z);
     controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.06;
     controls.minDistance = 0.4;
     controls.maxDistance = 60;
-    controls.target.set(0, 0.3, 0);
+    controls.target.set(DEFAULT_CONTROLS_TARGET.x, DEFAULT_CONTROLS_TARGET.y, DEFAULT_CONTROLS_TARGET.z);
     controls.update();
 
     scene.add(new THREE.AmbientLight(0xffffff, 1.1));
@@ -493,14 +453,16 @@ if (container) {
     scene.add(key);
     scene.add(new THREE.AxesHelper(0.35));
 
-    cameraRoot = new THREE.Group();
-    scene.add(cameraRoot);
-
     resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(container);
     resize();
     animate();
 
+    renderer.domElement.addEventListener('pointerdown', onPovPointerDown);
+    window.addEventListener('pointermove', onPovPointerMove);
+    window.addEventListener('pointerup', onPovPointerUp);
+
+    if (povLocked) applyPovLook();
     if (lastPayload) applyOccupancy(lastPayload);
   }
 
@@ -508,6 +470,9 @@ if (container) {
     if (!renderer) return;
     cancelAnimationFrame(animationFrame);
     resizeObserver?.disconnect();
+    renderer.domElement.removeEventListener('pointerdown', onPovPointerDown);
+    window.removeEventListener('pointermove', onPovPointerMove);
+    window.removeEventListener('pointerup', onPovPointerUp);
     controls.dispose();
     voxelMesh?.geometry.dispose();
     scene.traverse(node => {
@@ -515,19 +480,20 @@ if (container) {
       node.material?.map?.dispose?.();
       node.material?.dispose?.();
     });
-    cameraPlanes.clear(); // meshes just disposed above belong to the now-discarded scene
     window.__eggGraph?.resume();
     scene = camera = renderer = controls = resizeObserver = undefined;
-    voxelMesh = cameraRoot = rangeWireframe = null;
+    voxelMesh = rangeWireframe = null;
   }
 
   window.addEventListener('egg:occupancy-data', event => applyOccupancy(event.detail));
   window.addEventListener('egg:occupancy-reset', () => {
     if (!camera) return;
-    camera.position.set(3.2, 2.4, 4.2);
-    controls.target.set(0, 0.3, 0);
+    if (povLocked) { povYaw = 0; povPitch = 0; applyPovLook(); return; }
+    camera.position.set(DEFAULT_CAMERA_POSITION.x, DEFAULT_CAMERA_POSITION.y, DEFAULT_CAMERA_POSITION.z);
+    controls.target.set(DEFAULT_CONTROLS_TARGET.x, DEFAULT_CONTROLS_TARGET.y, DEFAULT_CONTROLS_TARGET.z);
     controls.update();
   });
+  window.addEventListener('egg:occupancy-pov-toggle', () => setPovLocked(!povLocked));
   window.addEventListener('egg:occupancy-voxel-scale', () => {
     if (!scene || !lastPayload) return;
     const nativeSize = lastPayload.voxel_size_meters || 0.1;

@@ -49,7 +49,11 @@ from egg_companion.config import EggConfig
 from egg_companion.core.activity import ActivityGovernor
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
-from egg_companion.core.occupancy import VoxelGrid, resolve_camera_yaw_degrees
+from egg_companion.core.occupancy import (
+    VoxelGrid,
+    resolve_camera_yaw_degrees,
+    resolve_voxel_size_meters,
+)
 from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.buffer import BufferedMediaRef, PerceptualBuffer
 from egg_companion.memory.migrate_legacy import LegacyMemoryMigrator
@@ -362,6 +366,12 @@ class CompanionRuntime:
             max_range_meters=config.occupancy.max_range_meters,
             max_voxels=config.occupancy.max_voxels,
         )
+        # Fixed baseline update_occupancy_resolution() scales voxel size
+        # from -- read once from the as-configured values so repeated live
+        # adjustments always scale relative to the same reference point
+        # instead of compounding off whatever the previous adjustment left.
+        self._occupancy_base_stride = config.occupancy.sample_stride
+        self._occupancy_base_voxel_size_meters = config.occupancy.voxel_size_meters
         self._occupancy_last_update: dict[str, float] = {}
         self._record_voice_transition("runtime_initialized")
 
@@ -407,15 +417,44 @@ class CompanionRuntime:
             await self._omnius.ensure_asr_model(asr_model)
             self.config.transcription.asr_model = asr_model
 
-    def update_occupancy_resolution(self, sample_stride: int) -> int:
+    def update_occupancy_resolution(self, sample_stride: int) -> dict[str, object]:
         """Live-adjust how many of DA3's per-frame depth points get
         back-projected into voxels each integration cycle -- lower is
-        denser/more expensive, higher is coarser/cheaper. Takes effect on
-        the next due camera's cycle; existing voxels are untouched.
-        Returns the clamped value actually applied."""
+        denser/more expensive, higher is coarser/cheaper.
+
+        Voxel size is auto-derived from the new stride (see
+        core.occupancy.resolve_voxel_size_meters) rather than left fixed,
+        so denser sampling actually resolves into visibly more/finer
+        voxels instead of just re-hitting the same coarse cells harder.
+        Because existing voxel indices are keyed to the *old* voxel size,
+        keeping them around under a new size would decode to the wrong
+        world position, so this starts a fresh grid rather than mixing
+        differently-scaled voxels together.
+
+        Every camera is also marked due again immediately (instead of
+        waiting up to occupancy.update_interval_seconds -- several
+        minutes -- per camera on the old staggered schedule) so the new
+        resolution is actually visible within the next few integration
+        cycles rather than the grid sitting empty/stale in the meantime.
+
+        Returns the clamped sample_stride and the derived voxel_size_meters
+        actually applied.
+        """
         clamped = max(1, min(32, int(sample_stride)))
         self.config.occupancy.sample_stride = clamped
-        return clamped
+        voxel_size_meters = resolve_voxel_size_meters(
+            clamped,
+            self._occupancy_base_stride,
+            self._occupancy_base_voxel_size_meters,
+        )
+        self.config.occupancy.voxel_size_meters = voxel_size_meters
+        self._occupancy_grid = VoxelGrid(
+            voxel_size_meters=voxel_size_meters,
+            max_range_meters=self.config.occupancy.max_range_meters,
+            max_voxels=self.config.occupancy.max_voxels,
+        )
+        self._occupancy_last_update.clear()
+        return {"sample_stride": clamped, "voxel_size_meters": voxel_size_meters}
 
     def memory_snapshot(self) -> dict[str, object]:
         snapshot = self._memory.governance_snapshot() if self._memory else {}
@@ -4127,7 +4166,7 @@ class CompanionRuntime:
             return None
         frame, _ = frame_entry
         try:
-            image_bytes = await asyncio.to_thread(self._encode_frame, frame)
+            image_bytes = await asyncio.to_thread(self._encode_frame_for_depth, frame)
             result = await self._depth_estimator.estimate(image_bytes)
             if result is None:
                 return None
@@ -7539,6 +7578,31 @@ class CompanionRuntime:
         ok, encoded = cv2.imencode(".jpg", source, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if not ok:
             raise RuntimeError("failed to encode calibration preview")
+        return encoded.tobytes()
+
+    def _encode_frame_for_depth(self, frame: np.ndarray) -> bytes:
+        """Full-resolution encode of a camera frame for the occupancy/
+        depth pipeline specifically -- deliberately NOT _encode_frame,
+        which downscales to vision.dashboard_max_width and lossily
+        compresses for the live dashboard preview stream. This instead
+        passes the camera's actual captured resolution through untouched
+        (only bounded by occupancy.max_input_width as a safety cap for
+        very large sources, default high enough to admit true 4K) and
+        encodes lossless PNG rather than JPEG, so the depth model sees as
+        much real detail as the camera captured -- not a preview-sized,
+        compression-artifacted crop of it.
+        """
+        import cv2
+
+        source = frame
+        height, width = frame.shape[:2]
+        max_width = self.config.occupancy.max_input_width
+        if width > max_width:
+            scale = max_width / width
+            source = cv2.resize(frame, (max_width, round(height * scale)), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".png", source)
+        if not ok:
+            raise RuntimeError("failed to encode depth-input frame")
         return encoded.tobytes()
 
     @staticmethod

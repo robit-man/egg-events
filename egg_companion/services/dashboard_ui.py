@@ -642,12 +642,12 @@ PAGE = r"""<!doctype html>
           <article id="occupancy-panel" class="card graph-panel">
             <div class="graph-toolbar">
               <div class="graph-toolbar-controls"><span class="card-note">Cameras video0–video3, right to left, counter-clockwise · 60° stitch</span></div>
-              <div class="graph-toolbar-actions"><button id="occupancy-voxel-scale-down" class="button" type="button" aria-label="Decrease voxel scale">Voxel −</button><button id="occupancy-voxel-scale-up" class="button" type="button" aria-label="Increase voxel scale">Voxel +</button><button id="occupancy-resolution-down" class="button" type="button" aria-label="Decrease resolution">Resolution −</button><button id="occupancy-resolution-up" class="button" type="button" aria-label="Increase resolution">Resolution +</button><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
+              <div class="graph-toolbar-actions"><button id="occupancy-voxel-scale-down" class="button" type="button" aria-label="Decrease voxel scale">Voxel −</button><button id="occupancy-voxel-scale-up" class="button" type="button" aria-label="Increase voxel scale">Voxel +</button><button id="occupancy-resolution-down" class="button" type="button" aria-label="Decrease resolution">Resolution −</button><button id="occupancy-resolution-up" class="button" type="button" aria-label="Increase resolution">Resolution +</button><button id="occupancy-pov-lock" class="button" type="button" aria-pressed="false" aria-label="Lock camera to the egg's point of view">Egg POV</button><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
             </div>
             <div class="graph-stage">
               <div id="occupancy-scene" class="graph-canvas" role="img" aria-label="Interactive three-dimensional voxel occupancy reconstruction of the environment"></div>
               <div id="occupancy-overlay" class="graph-overlay badge-row"><span class="badge">Loading occupancy</span></div>
-              <div class="graph-hint">Drag to orbit · scroll to zoom</div>
+              <div id="occupancy-hint" class="graph-hint">Drag to orbit · scroll to zoom</div>
             </div>
           </article>
         </section>
@@ -1492,6 +1492,17 @@ PAGE = r"""<!doctype html>
     }
     $('#occupancy-resolution-up')?.addEventListener('click', () => adjustOccupancyResolution(1));
     $('#occupancy-resolution-down')?.addEventListener('click', () => adjustOccupancyResolution(-1));
+    $('#occupancy-pov-lock')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-pov-toggle')));
+    window.addEventListener('egg:occupancy-pov-changed', event => {
+      const locked = !!event.detail?.locked;
+      const button = $('#occupancy-pov-lock');
+      if (button) {
+        button.classList.toggle('primary', locked);
+        button.setAttribute('aria-pressed', String(locked));
+      }
+      const hint = $('#occupancy-hint');
+      if (hint) hint.textContent = locked ? 'Egg POV locked · drag to look around' : 'Drag to orbit · scroll to zoom';
+    });
 
     $('#voice').addEventListener('input', () => { voiceFormDirty = true; });
     $('#voice').addEventListener('change', () => { voiceFormDirty = true; });

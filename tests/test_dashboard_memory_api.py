@@ -212,22 +212,38 @@ def test_occupancy_scene_borrows_graphs_webgl_renderer_instead_of_opening_a_seco
     assert "egg:vision-deactivate" in occupancy_source
 
 
-def test_occupancy_scene_places_camera_feeds_radially_matching_fusion_yaw() -> None:
-    """Each contributing camera's live frame must be textured onto a
-    plane positioned using the exact same yaw-rotation convention
-    core/occupancy.py uses to fuse depth into the shared frame (yaw
-    about +Y, 0deg = +Z: x=sin(yaw)*r, z=cos(yaw)*r) -- otherwise the
-    camera imagery and the voxels it produced would visually disagree."""
+def test_occupancy_scene_has_no_camera_sprite_previews() -> None:
+    """Camera source previews (textured planes / drawn images at each
+    camera's array position) were deliberately removed from both render
+    paths -- the 3D view shows only the fused voxel reconstruction now."""
     occupancy_source = (
         dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
     ).read_text()
 
-    assert "/api/cameras/" in occupancy_source
-    assert "raw.jpg" in occupancy_source
-    assert "TextureLoader" in occupancy_source
-    assert "Math.sin(yaw) * radius" in occupancy_source
-    assert "Math.cos(yaw) * radius" in occupancy_source
-    assert "lookAt(0, 0.05, 0)" in occupancy_source
+    assert "/api/cameras/" not in occupancy_source
+    assert "raw.jpg" not in occupancy_source
+    assert "TextureLoader" not in occupancy_source
+    assert "renderCameraMarkers" not in occupancy_source
+    assert "refreshCameraImage" not in occupancy_source
+
+
+def test_occupancy_scene_pov_lock_looks_around_from_the_fused_frame_origin() -> None:
+    """The Egg POV toolbar button locks the camera to (0,0,0) in the
+    fused frame -- per core/occupancy.py's module docstring, that origin
+    IS the rig's single modeled optical center (physically the center of
+    the 256mm ring the four cameras mount around) -- and dragging looks
+    around from there (FPS-style) instead of orbiting a target. Must be
+    implemented in both the WebGL and 2D-canvas-fallback render paths."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "egg:occupancy-pov-toggle" in occupancy_source
+    assert "egg:occupancy-pov-changed" in occupancy_source
+    assert occupancy_source.count("povLocked") > 4  # present in both render paths
+    assert "camera.position.set(0, 0, 0)" in occupancy_source  # WebGL path
+    assert "function povPoint(p)" in occupancy_source  # 2D fallback path
+    assert "controls.enabled = !locked" in occupancy_source
 
 
 def test_occupancy_scene_colors_voxels_from_source_frame_not_confidence_gradient() -> None:
@@ -282,8 +298,8 @@ def test_occupancy_scene_voxels_render_as_real_projected_cubes() -> None:
 
 
 def test_occupancy_scene_camera_array_reads_left_to_right_on_screen() -> None:
-    """Screen X is mirrored consistently in both render paths (voxels and
-    camera planes go through the same projection) so the panoramic array
+    """Screen X is mirrored consistently in both render paths (voxels
+    project through the same convention in both) so the panoramic array
     reads left-to-right on screen, and the orbit-drag yaw direction is
     compensated to still feel natural after that mirror -- the backend
     fusion geometry in core/occupancy.py is untouched, this is display-only."""
@@ -293,7 +309,6 @@ def test_occupancy_scene_camera_array_reads_left_to_right_on_screen() -> None:
 
     assert "panX - rx * zoom * perspective" in occupancy_source
     assert "tmpMatrix.setPosition(-voxel.x, voxel.y, voxel.z)" in occupancy_source
-    assert "const x = -Math.sin(yaw) * radius" in occupancy_source
     assert "yaw = drag.yaw + dx * 0.007" in occupancy_source
 
 
@@ -327,6 +342,17 @@ def test_occupancy_scene_resolution_control_exists_next_to_voxel_size() -> None:
     assert "/api/occupancy/resolution" in dashboard.PAGE
     assert "adjustOccupancyResolution" in dashboard.PAGE
     assert "currentSampleStride" in dashboard.PAGE
+
+
+def test_occupancy_pov_lock_button_exists_and_updates_hint_text() -> None:
+    """The Egg POV toolbar button must dispatch the toggle event the
+    renderer listens for, and the dashboard must update the hint text /
+    pressed state in response to the renderer's own change event -- not
+    just fire-and-forget the click."""
+    assert 'id="occupancy-pov-lock"' in dashboard.PAGE
+    assert "egg:occupancy-pov-toggle" in dashboard.PAGE
+    assert "egg:occupancy-pov-changed" in dashboard.PAGE
+    assert 'id="occupancy-hint"' in dashboard.PAGE
 
 
 def test_occupancy_scene_auto_frames_camera_on_real_voxel_data() -> None:
@@ -363,8 +389,6 @@ def test_occupancy_scene_falls_back_to_2d_canvas_when_no_webgl_exists_anywhere()
     assert "initCanvasFallback(container)" in occupancy_source
     # Same rotation/projection technique as knowledge_graph.js's own fallback.
     assert "Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch)" in occupancy_source
-    assert "drawImage" in occupancy_source
-    assert "raw.jpg" in occupancy_source
 
 
 def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> None:

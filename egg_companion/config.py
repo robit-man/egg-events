@@ -14,6 +14,14 @@ class CameraConfig(BaseModel):
     fps: float = Field(default=8.0, gt=0, le=60)
     rotation_degrees: int | Literal["auto"] = "auto"
     enabled: bool = True
+    # Unset (default) leaves the device at whatever resolution its driver
+    # opens with -- many UVC webcams default to a low mode (e.g. 640x480)
+    # until a higher one is explicitly requested. Set both to opt this
+    # camera into a higher native capture resolution (e.g. 3840x2160 for
+    # a 4K-capable sensor) so the occupancy/depth pipeline has real detail
+    # to work with instead of a driver-default low-res frame.
+    capture_width: int | None = Field(default=None, ge=320, le=7680)
+    capture_height: int | None = Field(default=None, ge=240, le=4320)
 
     @field_validator("source")
     @classmethod
@@ -35,6 +43,10 @@ class CameraDiscoveryConfig(BaseModel):
     source_glob: str = "/dev/video*"
     fps: float = Field(default=8.0, gt=0, le=60)
     rotation_degrees: int | Literal["auto"] = "auto"
+    # Applied to every auto-discovered camera -- see CameraConfig.
+    # capture_width/capture_height for what these do.
+    capture_width: int | None = Field(default=None, ge=320, le=7680)
+    capture_height: int | None = Field(default=None, ge=240, le=4320)
 
     @field_validator("source_glob")
     @classmethod
@@ -362,7 +374,14 @@ class OccupancyConfig(BaseModel):
     depth_worker_script: str = "scripts/depth_worker.py"
     depth_repo_dir: str = "/home/egg/Depth-Anything-3"
     model_name: str = "depth-anything/DA3METRIC-LARGE"
-    process_res: int = Field(default=504, ge=128, le=1024)
+    # Default (504) is the memory-safe value this hardware was validated
+    # against (see update_interval_seconds' comment on swap pressure) --
+    # the ceiling is raised to 3840 so a deployment with the memory/GPU
+    # headroom for it can opt into processing true full-4K input end to
+    # end (this is DA3's own internal working resolution, independent of
+    # occupancy.max_input_width below, which controls what resolution the
+    # source frame is encoded at before being handed to the model at all).
+    process_res: int = Field(default=504, ge=128, le=3840)
     subprocess_timeout_seconds: float = Field(default=90.0, ge=10.0, le=600.0)
     # Conservative default: live testing on this hardware showed swap usage
     # climb noticeably (5Gi -> 8.9Gi) across a handful of depth cycles on a
@@ -401,6 +420,14 @@ class OccupancyConfig(BaseModel):
     # CPU per cycle), higher means fewer (coarser, cheaper). Adjustable
     # live from the dashboard's Resolution +/- control.
     sample_stride: int = Field(default=8, ge=1, le=32)
+    # Cap on the frame width handed to the depth model, applied only to
+    # the occupancy pipeline's own encode of the source camera frame --
+    # NOT the same as vision.dashboard_max_width, which caps the lossy
+    # JPEG preview stream shown in the dashboard. Defaults to true 4K
+    # width so a camera capturing at 3840px (see CameraConfig.
+    # capture_width) is passed through to depth estimation untouched
+    # rather than silently cropped down to a preview-sized frame.
+    max_input_width: int = Field(default=3840, ge=320, le=7680)
     max_voxels: int = Field(default=60_000, ge=1_000, le=1_000_000)
     stale_after_seconds: float = Field(default=1800.0, ge=60.0, le=86400.0)
 
@@ -562,6 +589,8 @@ def _discover_cameras(config: EggConfig) -> list[CameraConfig]:
                 source=source,
                 fps=config.camera_discovery.fps,
                 rotation_degrees=config.camera_discovery.rotation_degrees,
+                capture_width=config.camera_discovery.capture_width,
+                capture_height=config.camera_discovery.capture_height,
             )
         )
     return cameras

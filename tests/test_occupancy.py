@@ -24,6 +24,7 @@ from egg_companion.core.occupancy import (
     VoxelGrid,
     log_odds_to_probability,
     resolve_camera_yaw_degrees,
+    resolve_voxel_size_meters,
 )
 
 
@@ -422,3 +423,29 @@ class TestResolveCameraYawDegrees:
 
     def test_single_camera_is_centered_at_zero(self) -> None:
         assert resolve_camera_yaw_degrees("camera-video0", ["camera-video0"], 60.0) == 0.0
+
+
+class TestResolveVoxelSizeMeters:
+    """Denser depth sampling (a lower sample_stride) should resolve into
+    proportionally finer voxels, and coarser sampling into proportionally
+    coarser ones, rather than a fixed voxel size mismatched to whatever
+    the dashboard's Resolution +/- control currently has sample_stride
+    set to."""
+
+    def test_matches_base_at_the_base_stride(self) -> None:
+        assert resolve_voxel_size_meters(8, 8, 0.1) == pytest.approx(0.1)
+
+    def test_denser_stride_yields_a_smaller_voxel(self) -> None:
+        assert resolve_voxel_size_meters(4, 8, 0.1) == pytest.approx(0.05)
+
+    def test_coarser_stride_yields_a_larger_voxel(self) -> None:
+        assert resolve_voxel_size_meters(16, 8, 0.1) == pytest.approx(0.2)
+
+    def test_extreme_density_is_clamped_to_the_floor(self) -> None:
+        assert resolve_voxel_size_meters(1, 8, 0.1, min_voxel_size_meters=0.02) == pytest.approx(0.02)
+
+    def test_extreme_coarseness_is_clamped_to_the_ceiling(self) -> None:
+        assert resolve_voxel_size_meters(64, 8, 0.1, max_voxel_size_meters=0.6) == pytest.approx(0.6)
+
+    def test_zero_base_stride_falls_back_to_base_size(self) -> None:
+        assert resolve_voxel_size_meters(8, 0, 0.1) == 0.1

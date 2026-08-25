@@ -85,6 +85,32 @@ def resolve_camera_yaw_degrees(
     center = (len(sorted_ids) - 1) / 2.0
     return (index - center) * spacing_degrees
 
+def resolve_voxel_size_meters(
+    sample_stride: int,
+    base_stride: int,
+    base_voxel_size_meters: float,
+    min_voxel_size_meters: float = 0.02,
+    max_voxel_size_meters: float = 0.6,
+) -> float:
+    """Voxel edge length scaled to match a given depth-sampling density.
+
+    sample_stride controls how many of the depth map's pixels actually
+    get back-projected (see VoxelGrid.integrate_depth) -- denser sampling
+    (a lower stride) produces proportionally more candidate points per
+    unit area, and a voxel size tuned for a coarser stride would merge
+    most of that extra density into the same handful of cells instead of
+    resolving it into more, finer voxels. Scaling voxel size linearly
+    with stride relative to a fixed (base_stride, base_voxel_size_meters)
+    pair keeps roughly the same points-per-voxel ratio at any density,
+    clamped to a sane range so an extreme stride can't collapse the grid
+    to a single voxel or explode it past what max_voxels can hold.
+    """
+    if base_stride <= 0:
+        return base_voxel_size_meters
+    scaled = base_voxel_size_meters * (sample_stride / base_stride)
+    return max(min_voxel_size_meters, min(max_voxel_size_meters, scaled))
+
+
 # Bounds keep any single voxel's log-odds from saturating to certainty
 # after many observations, so a real change in the environment can still
 # flip its classification within a bounded number of future updates.

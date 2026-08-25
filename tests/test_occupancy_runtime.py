@@ -8,6 +8,7 @@ gets updated, and that the result reaches current_property_state.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import numpy as np
 import pytest
@@ -60,6 +61,8 @@ def _runtime(tmp_path):
         max_range_meters=config.occupancy.max_range_meters,
         max_voxels=config.occupancy.max_voxels,
     )
+    runtime._occupancy_base_stride = config.occupancy.sample_stride
+    runtime._occupancy_base_voxel_size_meters = config.occupancy.voxel_size_meters
     runtime._occupancy_last_update = {}
     return runtime, pipeline
 
@@ -246,6 +249,52 @@ class TestOccupancyCycle:
         assert snapshot["camera_yaw_degrees"]["camera-video4"] == pytest.approx(120.0)
 
 
+class TestEncodeFrameForDepth:
+    """_encode_frame_for_depth is the occupancy pipeline's own frame
+    encode, deliberately separate from _encode_frame (which downscales
+    to vision.dashboard_max_width for the lossy dashboard preview
+    stream) -- this is what lets a full-4K-captured frame actually reach
+    the depth model instead of being silently cropped to preview size
+    first."""
+
+    def _decode(self, encoded: bytes):
+        import cv2
+
+        buffer = np.frombuffer(encoded, dtype=np.uint8)
+        return cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+
+    def test_passes_a_4k_frame_through_at_full_resolution(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        runtime.config.occupancy.max_input_width = 3840
+        frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+        encoded = runtime._encode_frame_for_depth(frame)
+        decoded = self._decode(encoded)
+
+        assert decoded.shape[:2] == (2160, 3840)
+
+    def test_downscales_only_when_exceeding_max_input_width(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        runtime.config.occupancy.max_input_width = 640
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+        encoded = runtime._encode_frame_for_depth(frame)
+        decoded = self._decode(encoded)
+
+        assert decoded.shape[1] == 640
+        assert decoded.shape[0] == pytest.approx(360, abs=1)
+
+    def test_encodes_lossless_png_not_lossy_jpeg(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        frame = np.zeros((16, 16, 3), dtype=np.uint8)
+        frame[8, 8] = (17, 31, 53)  # a single distinctive pixel
+
+        encoded = runtime._encode_frame_for_depth(frame)
+        decoded = self._decode(encoded)
+
+        assert tuple(int(c) for c in decoded[8, 8]) == (17, 31, 53)
+
+
 class TestOccupancySnapshot:
     def test_includes_sample_stride_and_dynamic_camera_yaw(self, tmp_path) -> None:
         runtime, _ = _runtime(tmp_path)
@@ -264,8 +313,44 @@ class TestUpdateOccupancyResolution:
     def test_applies_and_clamps_sample_stride(self, tmp_path) -> None:
         runtime, _ = _runtime(tmp_path)
 
-        assert runtime.update_occupancy_resolution(3) == 3
+        assert runtime.update_occupancy_resolution(3)["sample_stride"] == 3
         assert runtime.config.occupancy.sample_stride == 3
 
-        assert runtime.update_occupancy_resolution(0) == 1  # clamped to minimum
-        assert runtime.update_occupancy_resolution(999) == 32  # clamped to maximum
+        assert runtime.update_occupancy_resolution(0)["sample_stride"] == 1  # clamped to minimum
+        assert runtime.update_occupancy_resolution(999)["sample_stride"] == 32  # clamped to maximum
+
+    def test_derives_voxel_size_from_the_new_stride(self, tmp_path) -> None:
+        """The whole point of this control auto-adjusting voxel size:
+        denser sampling (lower stride) should produce visibly finer
+        voxels, not just re-hit the same coarse cells harder."""
+        runtime, _ = _runtime(tmp_path)
+        base_stride = runtime._occupancy_base_stride
+        base_voxel_size = runtime._occupancy_base_voxel_size_meters
+
+        denser = runtime.update_occupancy_resolution(max(1, base_stride // 2))
+        assert denser["voxel_size_meters"] < base_voxel_size
+        assert runtime.config.occupancy.voxel_size_meters == pytest.approx(denser["voxel_size_meters"])
+
+        coarser = runtime.update_occupancy_resolution(base_stride * 2)
+        assert coarser["voxel_size_meters"] > base_voxel_size
+
+    def test_resets_grid_and_due_schedule_so_the_change_is_visible_promptly(self, tmp_path) -> None:
+        """Existing voxel indices are keyed to the old voxel size, so
+        they'd decode to the wrong world position under a new size --
+        and the old per-camera due schedule (up to
+        update_interval_seconds, several minutes) shouldn't leave the
+        grid empty/stale in the meantime after a deliberate resolution
+        change."""
+        runtime, _ = _runtime(tmp_path)
+        runtime._occupancy_grid.integrate_depth(
+            np.full((8, 8), 2.0, dtype=np.float32), None, 60.0, sample_stride=1,
+        )
+        assert len(runtime._occupancy_grid) > 0
+        runtime._occupancy_last_update["camera-video1"] = time.monotonic()
+
+        old_grid = runtime._occupancy_grid
+        runtime.update_occupancy_resolution(4)
+
+        assert runtime._occupancy_grid is not old_grid
+        assert len(runtime._occupancy_grid) == 0
+        assert runtime._occupancy_last_update == {}

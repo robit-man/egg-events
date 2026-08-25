@@ -632,7 +632,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         except (KeyError, TypeError, ValueError) as error:
             raise web.HTTPBadRequest(text="sample_stride is required") from error
         applied = companion().update_occupancy_resolution(sample_stride)
-        return web.json_response({"sample_stride": applied})
+        return web.json_response(applied)
 
     async def world_entity_handler(request: web.Request) -> web.Response:
         entity_id = request.match_info["entity_id"]
