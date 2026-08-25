@@ -2471,6 +2471,112 @@ class OmniusClient:
             ] if isinstance(correspondences, list) else [],
         }
 
+    async def compare_identity_profiles(
+        self, reference_png: bytes, current_png: bytes
+    ) -> dict[str, object] | None:
+        """Visually confirm an offline dream's proposed identity merge.
+
+        Unlike compare_temporal_person_detections (same-camera, few-frames-
+        apart geometric continuity, explicitly not face recognition), this
+        is the actual reasoning gate for a cross-day, cross-camera identity
+        merge decision: face-embedding cosine similarity alone was found to
+        produce badly miscalibrated merges (a well-established named
+        profile absorbed into an unnamed fragment at 0.41 similarity), so
+        this is the VLM verification step that should confirm or reject an
+        embedding-consensus merge proposal before it's applied.
+        """
+        payload = {
+            "model": self.config.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Both images are retained face evidence for two currently-separate "
+                        "identity profiles that an automated face-embedding comparison proposed "
+                        "merging into one person. Decide whether they show the same real person. "
+                        "Embedding similarity is only a proposal, not proof -- confirm same_person "
+                        "only when visible facial structure, distinguishing features, and other "
+                        "durable appearance cues agree and no visible conflict exists. If pose, "
+                        "lighting, image quality, or occlusion prevents confident adjudication, "
+                        "return same_person=false with low confidence rather than guessing. Do not "
+                        "infer demographics, emotion, health, or other sensitive traits. Keep "
+                        "analysis at most 45 words. Return exactly these JSON fields and no prose: "
+                        '{"same_person":boolean,"confidence":number,"analysis":string,'
+                        '"visible_correspondences":[string],"visible_conflicts":[string]}.'
+                    ),
+                    "images": [
+                        base64.b64encode(reference_png).decode("ascii"),
+                        base64.b64encode(current_png).decode("ascii"),
+                    ],
+                }
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 260},
+            "keep_alive": "5m",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with self._background_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
+                    json=payload,
+                ) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(
+                            f"Ornith identity-merge comparison HTTP {response.status}: {detail}"
+                        )
+                    result = await response.json()
+        try:
+            content = result["message"]["content"]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(
+                "Ornith identity-merge comparison returned an invalid completion"
+            ) from error
+        return self.parse_identity_merge_comparison(content)
+
+    @staticmethod
+    def parse_identity_merge_comparison(content: object) -> dict[str, object] | None:
+        if not isinstance(content, str):
+            return None
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        same_person = parsed.get("same_person")
+        confidence = parsed.get("confidence")
+        analysis = parsed.get("analysis")
+        if (
+            not isinstance(same_person, bool)
+            or not isinstance(confidence, (int, float))
+            or not isinstance(analysis, str)
+            or not 0 <= float(confidence) <= 1
+        ):
+            return None
+        normalized_analysis = " ".join(analysis.split())[:600]
+        if not normalized_analysis:
+            return None
+
+        def _string_list(key: str) -> list[str]:
+            values = parsed.get(key)
+            if not isinstance(values, list):
+                return []
+            return [
+                " ".join(str(item).split())[:160]
+                for item in values[:8]
+                if isinstance(item, str) and item.strip()
+            ]
+
+        return {
+            "same_person": same_person,
+            "confidence": float(confidence),
+            "analysis": normalized_analysis,
+            "visible_correspondences": _string_list("visible_correspondences"),
+            "visible_conflicts": _string_list("visible_conflicts"),
+        }
+
     async def answer_visual_question_analysis(
         self,
         frames: list[tuple[str, bytes, str]],

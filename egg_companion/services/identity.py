@@ -440,6 +440,23 @@ class IdentityLibrary:
                 for alias_id, (canonical_id, similarity, reason) in sorted(self._aliases.items())
             ]
 
+    def remove_alias(self, alias_id: str) -> bool:
+        """Reverse one previously-applied merge, restoring alias_id to its
+        own independent canonical identity. Evidence and samples are
+        untouched -- only the alias_id -> canonical_id mapping is removed,
+        matching create_alias's "reversible" contract. Returns False if
+        alias_id was not actually an alias of anything."""
+        with self._lock:
+            if alias_id not in self._aliases:
+                return False
+            del self._aliases[alias_id]
+            if self._database is not None:
+                self._database.execute(
+                    "DELETE FROM profile_aliases WHERE alias_id=?", (alias_id,)
+                )
+                self._database.commit()
+            return True
+
     def create_alias(
         self,
         alias_id: str,

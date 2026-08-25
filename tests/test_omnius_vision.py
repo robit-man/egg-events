@@ -58,6 +58,37 @@ def test_temporal_person_comparison_requires_bounded_explainable_json() -> None:
     ) is None
 
 
+def test_identity_merge_comparison_requires_bounded_explainable_json() -> None:
+    """The VLM gate for offline dream identity merges (added after a
+    face-embedding-only consensus mislabeled a well-established profile)
+    must reject malformed/underspecified completions the same way the
+    other Ornith comparison parsers do."""
+    response = (
+        '{"same_person":true,"confidence":0.82,'
+        '"analysis":"Matching jawline, brow shape, and a visible scar above the left eyebrow.",'
+        '"visible_correspondences":["scar above left eyebrow","jawline shape"],'
+        '"visible_conflicts":[]}'
+    )
+
+    assert OmniusClient.parse_identity_merge_comparison(response) == {
+        "same_person": True,
+        "confidence": 0.82,
+        "analysis": "Matching jawline, brow shape, and a visible scar above the left eyebrow.",
+        "visible_correspondences": ["scar above left eyebrow", "jawline shape"],
+        "visible_conflicts": [],
+    }
+    assert OmniusClient.parse_identity_merge_comparison("same person") is None
+    assert OmniusClient.parse_identity_merge_comparison(
+        '{"same_person":true,"confidence":1.4,"analysis":"same"}'
+    ) is None
+    assert OmniusClient.parse_identity_merge_comparison(
+        '{"same_person":"maybe","confidence":0.8,"analysis":"same"}'
+    ) is None
+    assert OmniusClient.parse_identity_merge_comparison(
+        '{"same_person":false,"confidence":0.9,"analysis":""}'
+    ) is None
+
+
 def test_audio_classification_parser_accepts_only_numeric_yamnet_output() -> None:
     output = (
         'Audio scene classification:\n'

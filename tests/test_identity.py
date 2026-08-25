@@ -357,3 +357,33 @@ class IdentityLibraryTests(unittest.TestCase):
             self.assertIsNotNone(
                 library.face_sample(str(enrolled["id"]), str(sample["sample_id"]))
             )
+
+    def test_remove_alias_reverses_a_merge_and_survives_reopen(self) -> None:
+        """create_alias's docstring promises a "reversible" merge -- this
+        is the un-merge path used to correct a bad automatic identity
+        merge (see IdentityDreamEngine's VLM confirmation gate and the
+        raised similarity thresholds, added after exactly this kind of
+        merge silently mislabeled a well-established profile)."""
+        with tempfile.TemporaryDirectory() as directory:
+            library = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            left = self._enroll(
+                library, "front", np.array((1.0, 0.0, 0.0), dtype=np.float32)
+            )
+            right = self._enroll(
+                library, "side", np.array((0.0, 1.0, 0.0), dtype=np.float32)
+            )
+            left_id, right_id = str(left["id"]), str(right["id"])
+            mapping = library.create_alias(left_id, right_id, 0.9, "test_reason")
+            self.assertIsNotNone(mapping)
+            self.assertEqual(library.summary()["canonical_people"], 1)
+
+            removed = library.remove_alias(left_id)
+
+            self.assertTrue(removed)
+            self.assertEqual(library.summary()["canonical_people"], 2)
+            self.assertEqual(library.alias_mappings(), [])
+            self.assertFalse(library.remove_alias(left_id))  # already gone
+
+            reopened = IdentityLibrary(IdentityConfig(storage_dir=directory))
+            self.assertEqual(reopened.summary()["canonical_people"], 2)
+            self.assertEqual(reopened.alias_mappings(), [])

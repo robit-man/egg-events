@@ -239,24 +239,38 @@ class DreamsConfig(BaseModel):
     interval_min_seconds: float = Field(default=600, ge=30, le=86400)
     interval_max_seconds: float = Field(default=1800, ge=30, le=172800)
     convergence_interval_seconds: float = Field(default=60, ge=15, le=3600)
-    proposal_similarity: float = Field(default=0.35, ge=-1, le=1)
-    modern_merge_similarity: float = Field(default=0.40, ge=-1, le=1)
-    modern_strong_similarity: float = Field(default=0.54, ge=-1, le=1)
-    legacy_merge_similarity: float = Field(default=0.24, ge=-1, le=1)
-    legacy_strong_similarity: float = Field(default=0.55, ge=-1, le=1)
-    legacy_similarity_floor: float = Field(default=0.12, ge=-1, le=1)
+    # Raised from the original defaults (0.35/0.40/0.24/0.30/...) after
+    # live evidence: those thresholds let a 3-model "consensus" merge 86 of
+    # 95 total identity aliases at 0.35-0.65 average similarity, including
+    # absorbing a well-established named profile (1327 samples) into an
+    # unnamed fragment at just 0.41 similarity. Cosine similarity between
+    # face embeddings of genuinely the same person is typically well above
+    # 0.6 for these model families; scores in the 0.3-0.5 band are common
+    # between DIFFERENT people who simply share generic facial structure,
+    # pose, or lighting. These values plus the VLM confirmation gate below
+    # (see IdentityDreamEngine.run's verifier param) are the actual fix.
+    proposal_similarity: float = Field(default=0.55, ge=-1, le=1)
+    modern_merge_similarity: float = Field(default=0.62, ge=-1, le=1)
+    modern_strong_similarity: float = Field(default=0.72, ge=-1, le=1)
+    legacy_merge_similarity: float = Field(default=0.45, ge=-1, le=1)
+    legacy_strong_similarity: float = Field(default=0.70, ge=-1, le=1)
+    legacy_similarity_floor: float = Field(default=0.30, ge=-1, le=1)
     comparison_model_path: str | None = None
     comparison_model_id: str = "insightface/buffalo_s-w600k_mbf"
-    comparison_merge_similarity: float = Field(default=0.30, ge=-1, le=1)
-    comparison_strong_similarity: float = Field(default=0.50, ge=-1, le=1)
-    comparison_similarity_floor: float = Field(default=0.15, ge=-1, le=1)
+    comparison_merge_similarity: float = Field(default=0.50, ge=-1, le=1)
+    comparison_strong_similarity: float = Field(default=0.68, ge=-1, le=1)
+    comparison_similarity_floor: float = Field(default=0.32, ge=-1, le=1)
     minimum_model_votes: int = Field(default=2, ge=2, le=3)
-    separated_modern_similarity: float = Field(default=0.38, ge=-1, le=1)
-    separated_legacy_floor: float = Field(default=0.15, ge=-1, le=1)
+    separated_modern_similarity: float = Field(default=0.58, ge=-1, le=1)
+    separated_legacy_floor: float = Field(default=0.32, ge=-1, le=1)
     mutual_neighbor_margin: float = Field(default=0.025, ge=0, le=1)
     reciprocal_neighbor_rank: int = Field(default=8, ge=1, le=20)
     coobservation_min_confirmations: int = Field(default=3, ge=1, le=100)
     auto_merge_enabled: bool = True
+    # Minimum Ornith confidence (see IdentityDreamEngine.run's verifier
+    # param / OmniusClient.compare_identity_profiles) to accept a same_person
+    # confirmation for an embedding-consensus merge proposal.
+    vlm_confirmation_min_confidence: float = Field(default=0.6, ge=0, le=1)
 
 
 class ObjectLearningConfig(BaseModel):

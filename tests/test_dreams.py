@@ -152,6 +152,79 @@ def test_dream_accepts_two_of_three_models_without_reciprocal_margin(tmp_path) -
     assert candidate["reason"] == "quality_aggregated_multimodel_consensus"
 
 
+def test_dream_requires_vlm_confirmation_before_merging_a_named_profile(tmp_path) -> None:
+    """A named, already-identified profile must not be silently absorbed
+    into an unnamed fragment (or vice versa) on embedding similarity
+    alone -- this is exactly the failure mode that mislabeled a
+    well-established profile in production (a 1327-sample named profile
+    merged into an unnamed one at 0.41 similarity). No verifier configured
+    is the pre-fix baseline and must still merge (back-compat); a verifier
+    that returns False must block; a verifier returning None (VLM
+    unavailable) must ALSO block specifically because naming is asymmetric
+    here, unlike the fail-open default for two anonymous fragments."""
+    library = IdentityLibrary(
+        IdentityConfig(
+            storage_dir=str(tmp_path / "identities"),
+            face_similarity_threshold=0.9,
+            retroactive_merge_similarity=0.99,
+        )
+    )
+    left = _enroll(library, "front", np.array((1.0, 0.0, 0.0), dtype=np.float32), 40)
+    right = _enroll(
+        library, "side", np.array((0.82, 0.57236, 0.0), dtype=np.float32), 80
+    )
+    library.name_profile(left, "Cole")
+
+    calls: list[tuple[str, str, bool]] = []
+
+    def rejecting_verifier(alias_id: str, canonical_id: str, mandatory: bool) -> bool | None:
+        calls.append((alias_id, canonical_id, mandatory))
+        return False
+
+    result = _engine(tmp_path, library).run(set(), "test", rejecting_verifier)
+
+    assert result["merges"] == 0
+    assert calls and calls[0][2] is True  # mandatory=True: exactly one side named
+    assert library.summary()["canonical_people"] == 2
+
+    def unavailable_verifier(alias_id: str, canonical_id: str, mandatory: bool) -> bool | None:
+        return None
+
+    result_unavailable = _engine(tmp_path, library).run(set(), "test", unavailable_verifier)
+    assert result_unavailable["merges"] == 0  # fail-closed: naming is asymmetric
+
+    def confirming_verifier(alias_id: str, canonical_id: str, mandatory: bool) -> bool | None:
+        return True
+
+    result_confirmed = _engine(tmp_path, library).run(set(), "test", confirming_verifier)
+    assert result_confirmed["merges"] == 1
+    assert library.summary()["canonical_people"] == 1
+
+
+def test_dream_fails_open_for_two_anonymous_fragments_when_vlm_unavailable(tmp_path) -> None:
+    """Two unnamed fragments merging is lower-stakes and retryable -- a
+    verifier returning None (Ornith unreachable) must not block it, unlike
+    the asymmetric-naming case above."""
+    library = IdentityLibrary(
+        IdentityConfig(
+            storage_dir=str(tmp_path / "identities"),
+            face_similarity_threshold=0.9,
+            retroactive_merge_similarity=0.99,
+        )
+    )
+    _enroll(library, "front", np.array((1.0, 0.0, 0.0), dtype=np.float32), 40)
+    _enroll(library, "side", np.array((0.82, 0.57236, 0.0), dtype=np.float32), 80)
+
+    def unavailable_verifier(alias_id: str, canonical_id: str, mandatory: bool) -> bool | None:
+        assert mandatory is False
+        return None
+
+    result = _engine(tmp_path, library).run(set(), "test", unavailable_verifier)
+
+    assert result["merges"] == 1
+    assert library.summary()["canonical_people"] == 1
+
+
 def test_dream_marks_process_orphans_interrupted_on_reopen(tmp_path) -> None:
     library = IdentityLibrary(IdentityConfig(storage_dir=str(tmp_path / "identities")))
     engine = _engine(tmp_path, library)

@@ -2375,6 +2375,27 @@ class CompanionRuntime:
             ),
         }
 
+    async def _verify_identity_merge(
+        self, alias_id: str, canonical_id: str
+    ) -> bool | None:
+        """Ornith visual confirmation for one dream-proposed identity merge.
+        Returns True/False when Ornith gives a usable answer, None when no
+        representative image exists or the call itself fails (dreams.py's
+        verifier treats None as fail-open for two anonymous fragments and
+        fail-closed when either profile is already named)."""
+        reference_png, current_png = await asyncio.gather(
+            asyncio.to_thread(self.identities.thumbnail, canonical_id),
+            asyncio.to_thread(self.identities.thumbnail, alias_id),
+        )
+        if reference_png is None or current_png is None:
+            return None
+        analysis = await self._omnius.compare_identity_profiles(reference_png, current_png)
+        if analysis is None:
+            return None
+        if analysis.get("same_person") is not True:
+            return False
+        return float(analysis.get("confidence", 0.0)) >= self.config.dreams.vlm_confirmation_min_confidence
+
     async def run_identity_dream(self, requested_by: str = "manual") -> dict[str, object]:
         face_validation: dict[str, int] | None = None
         pending_samples = await asyncio.to_thread(
@@ -2407,8 +2428,27 @@ class CompanionRuntime:
             if self._memory is not None
             else set()
         )
+        main_loop = asyncio.get_running_loop()
+
+        def verify_merge(alias_id: str, canonical_id: str, mandatory: bool) -> bool | None:
+            # dreams.run() executes in a worker thread (asyncio.to_thread
+            # below); run_coroutine_threadsafe is the standard bridge to
+            # call back into the main event loop's Omnius/Ornith client
+            # from there and block this worker thread on the result.
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._verify_identity_merge(alias_id, canonical_id), main_loop
+                )
+                return future.result(timeout=self.config.omnius.timeout_seconds + 10)
+            except Exception as error:
+                logger.warning(
+                    "identity merge VLM verification failed for %s/%s (mandatory=%s)",
+                    alias_id, canonical_id, mandatory, exc_info=error,
+                )
+                return None
+
         result = await asyncio.to_thread(
-            self.dreams.run, conflicts, requested_by
+            self.dreams.run, conflicts, requested_by, verify_merge
         )
         result["requested_by"] = requested_by
         if face_validation is not None:

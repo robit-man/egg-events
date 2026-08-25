@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -477,7 +478,21 @@ class IdentityDreamEngine:
         self,
         conflicting_pairs: set[tuple[str, str]] | None = None,
         requested_by: str = "scheduler",
+        verifier: Callable[[str, str, bool], bool | None] | None = None,
     ) -> dict[str, object]:
+        """verifier, if given, is called as verifier(alias_id, canonical_id,
+        mandatory) for every candidate the embedding consensus alone
+        decided to merge, before create_alias is actually invoked --
+        typically a synchronous bridge into an Ornith VLM visual
+        confirmation (see runtime.CompanionRuntime.run_identity_dream).
+        It returns True (confirmed, proceed), False (VLM disagrees, block),
+        or None (verification unavailable/errored). `mandatory` is True
+        for the highest-stakes case -- exactly one profile in the pair is
+        named, so an unconfirmed merge risks silently mislabeling a real
+        person -- in which case None is treated as a block (fail closed)
+        rather than the normal fail-open behavior for two anonymous
+        fragments, where a missed cycle just tries again later.
+        """
         if not self.config.enabled:
             raise RuntimeError("identity dreaming is disabled")
         if not self._run_lock.acquire(blocking=False):
@@ -502,7 +517,7 @@ class IdentityDreamEngine:
             )
             self._database.commit()
         try:
-            result = self._run_once(run_id, conflicting_pairs or set())
+            result = self._run_once(run_id, conflicting_pairs or set(), verifier)
             result["duration_seconds"] = round(time.monotonic() - started_clock, 3)
             result["completed_at"] = datetime.now(timezone.utc).isoformat()
             self._finish_run(run_id, "completed", result)
@@ -523,7 +538,10 @@ class IdentityDreamEngine:
             self._run_lock.release()
 
     def _run_once(
-        self, run_id: str, conflicting_pairs: set[tuple[str, str]]
+        self,
+        run_id: str,
+        conflicting_pairs: set[tuple[str, str]],
+        verifier: Callable[[str, str, bool], bool | None] | None = None,
     ) -> dict[str, object]:
         profiles = self.identities.migration_profiles()
         alias_rows = self.identities.alias_mappings()
@@ -655,6 +673,13 @@ class IdentityDreamEngine:
                 reciprocal = left_rank < reciprocal_rank and right_rank < reciprocal_rank
                 pair = tuple(sorted((ids[left], ids[right])))
                 name_conflict = bool(names[ids[left]] and names[ids[right]] and names[ids[left]] != names[ids[right]])
+                # Exactly one side already has a user-visible name: absorbing
+                # it into an unnamed fragment (or vice versa) is the
+                # highest-stakes failure mode -- it silently mislabels a
+                # real, already-identified person. A same-name match on
+                # both sides is reinforcing evidence, not risk, so this is
+                # deliberately narrower than name_conflict above.
+                asymmetric_naming = bool(names[ids[left]]) != bool(names[ids[right]])
                 model_votes = int(modern >= self.config.modern_merge_similarity) + int(
                     legacy >= self.config.legacy_merge_similarity
                 )
@@ -695,6 +720,20 @@ class IdentityDreamEngine:
                     decision, reason = "review", "automatic_merge_disabled"
                 else:
                     decision, reason = "merge", "quality_aggregated_multimodel_consensus"
+                if decision == "merge" and verifier is not None:
+                    # Embedding consensus alone previously produced badly
+                    # miscalibrated merges (documented: an unnamed fragment
+                    # absorbing a well-established named profile at 0.41
+                    # similarity) -- a VLM visual pass is the actual
+                    # reasoning step that should gate an irreversible-ish
+                    # canonical/alias decision, not just cosine similarity.
+                    confirmed = verifier(ids[left], ids[right], asymmetric_naming)
+                    if confirmed is False or (confirmed is None and asymmetric_naming):
+                        decision = "review"
+                        reason = (
+                            "vlm_rejected_merge" if confirmed is False
+                            else "vlm_unavailable_for_named_profile"
+                        )
                 candidate = {
                     "run_id": run_id,
                     "left_id": ids[left],
