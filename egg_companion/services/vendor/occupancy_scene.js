@@ -16,6 +16,18 @@ import { OrbitControls } from '/assets/OrbitControls.js?v=20260811a';
 // into this page's container while /vision is active, and handing it
 // back on navigating away) rather than ever constructing its own.
 
+// Shared by both render paths (WebGL and the 2D canvas fallback below) so
+// the toolbar's Voxel +/- buttons work regardless of which one is active.
+let voxelScaleMultiplier = 1.0;
+const VOXEL_SCALE_MIN = 0.2, VOXEL_SCALE_MAX = 5.0, VOXEL_SCALE_STEP = 1.25;
+window.addEventListener('egg:occupancy-voxel-scale', event => {
+  const direction = event.detail?.direction || 1;
+  voxelScaleMultiplier = Math.max(
+    VOXEL_SCALE_MIN,
+    Math.min(VOXEL_SCALE_MAX, direction > 0 ? voxelScaleMultiplier * VOXEL_SCALE_STEP : voxelScaleMultiplier / VOXEL_SCALE_STEP),
+  );
+});
+
 function cameraRingRadiusFor(maxRange) {
   return Math.max(0.6, Math.min(3.0, (maxRange || 6.0) * 0.32));
 }
@@ -36,7 +48,7 @@ function initCanvasFallback(container) {
   container.replaceChildren(canvas);
   const context = canvas.getContext('2d', { alpha: false });
 
-  let voxels = [], cameras = [];
+  let voxels = [], cameras = [], voxelSizeMeters = 0.1;
   let pixelRatio = 1, width = 1, height = 1;
   let zoom = 60, panX = 0, panY = 0, yaw = 0.5, pitch = -0.25;
   let target = { x: 0, y: 0, z: 0 };
@@ -49,7 +61,13 @@ function initCanvasFallback(container) {
     const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
     const rx = cy * x + sy * z, rz = -sy * x + cy * z, ry = cp * y - sp * rz, depth = sp * y + cp * rz;
     const perspective = Math.max(0.25, Math.min(2.4, 1 - depth / 12));
-    return { x: width / 2 + panX + rx * zoom * perspective, y: height / 2 + panY - ry * zoom * perspective, depth, scale: perspective };
+    // Screen X is mirrored (-rx) so the camera array reads left-to-right
+    // on screen (matching how a viewer standing behind the rig reads
+    // video0..video3) -- both voxels and camera planes go through this
+    // same point() projection, so the mirror keeps them consistent with
+    // each other; it never touches core/occupancy.py's actual fusion
+    // geometry, which stays physically accurate independent of display.
+    return { x: width / 2 + panX - rx * zoom * perspective, y: height / 2 + panY - ry * zoom * perspective, depth, scale: perspective };
   }
 
   function refreshCameraImage(cameraId) {
@@ -84,7 +102,7 @@ function initCanvasFallback(container) {
     if (!drag) return;
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
     if (drag.pan) { panX = drag.panX + dx; panY = drag.panY + dy; }
-    else { yaw = drag.yaw - dx * 0.007; pitch = Math.max(-1.35, Math.min(1.35, drag.pitch - dy * 0.007)); }
+    else { yaw = drag.yaw + dx * 0.007; pitch = Math.max(-1.35, Math.min(1.35, drag.pitch - dy * 0.007)); }
   });
   canvas.addEventListener('pointerup', () => { drag = null; });
   canvas.addEventListener('pointercancel', () => { drag = null; });
@@ -97,6 +115,7 @@ function initCanvasFallback(container) {
   function applyPayload(payload) {
     if (!payload || !payload.enabled) { voxels = []; cameras = []; return; }
     voxels = payload.voxels || [];
+    voxelSizeMeters = payload.voxel_size_meters || 0.1;
     const radius = cameraRingRadiusFor(payload.max_range_meters);
     cameras = Object.entries(payload.cameras || {}).map(([id, info]) => {
       const yawRad = (Number(info.yaw_degrees || 0) * Math.PI) / 180;
@@ -117,22 +136,62 @@ function initCanvasFallback(container) {
     }
   }
 
+  // Real cube geometry, not a flat billboard sprite: each face's 4 local
+  // corner offsets (unit cube, -0.5..0.5 per axis) plus a flat per-axis
+  // shade so the cube reads as 3D without real lighting. Which 3 of 6
+  // faces are camera-facing is the same for every voxel simultaneously
+  // (axis-aligned cubes, one shared camera orientation), so it's computed
+  // once per frame in render(), not per voxel.
+  const CUBE_FACES = [
+    { normal: [1, 0, 0], corners: [[.5, -.5, -.5], [.5, .5, -.5], [.5, .5, .5], [.5, -.5, .5]], shade: 0.8 },
+    { normal: [-1, 0, 0], corners: [[-.5, -.5, .5], [-.5, .5, .5], [-.5, .5, -.5], [-.5, -.5, -.5]], shade: 0.55 },
+    { normal: [0, 1, 0], corners: [[-.5, .5, -.5], [-.5, .5, .5], [.5, .5, .5], [.5, .5, -.5]], shade: 1.0 },
+    { normal: [0, -1, 0], corners: [[-.5, -.5, .5], [-.5, -.5, -.5], [.5, -.5, -.5], [.5, -.5, .5]], shade: 0.35 },
+    { normal: [0, 0, 1], corners: [[-.5, -.5, .5], [.5, -.5, .5], [.5, .5, .5], [-.5, .5, .5]], shade: 0.7 },
+    { normal: [0, 0, -1], corners: [[.5, -.5, -.5], [-.5, -.5, -.5], [-.5, .5, -.5], [.5, .5, -.5]], shade: 0.9 },
+  ];
+
+  function visibleCubeFaces(cy, sy, cp, sp) {
+    return CUBE_FACES.filter(face => {
+      const [nx, ny, nz] = face.normal;
+      const rz = -sy * nx + cy * nz;
+      return sp * ny + cp * rz < 0; // faces toward the camera (see point()'s depth convention)
+    });
+  }
+
   function render() {
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.fillStyle = '#070d19';
     context.fillRect(0, 0, width, height);
 
+    const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const visibleFaces = visibleCubeFaces(cy, sy, cp, sp);
+    const voxelWorldSize = voxelSizeMeters * voxelScaleMultiplier;
+
     const drawables = [];
-    for (const v of voxels) drawables.push({ kind: 'voxel', v, ...point(v) });
+    for (const v of voxels) drawables.push({ kind: 'voxel', v, depth: point(v).depth });
     for (const cam of cameras) drawables.push({ kind: 'camera', cam, entry: refreshCameraImage(cam.id), ...point(cam) });
     drawables.sort((a, b) => b.depth - a.depth); // paint far first
 
     for (const d of drawables) {
       if (d.kind === 'voxel') {
-        const size = Math.max(1, 3.2 * d.scale);
         const [r, g, b] = d.v.color || [0x66, 0x7e, 0xa8];
-        context.fillStyle = `rgb(${r},${g},${b})`;
-        context.fillRect(d.x - size / 2, d.y - size / 2, size, size);
+        for (const face of visibleFaces) {
+          // Each corner is a REAL world-space offset of the voxel, so it
+          // goes through the same perspective/zoom projection as every
+          // other point -- the cube's on-screen size and shape follow
+          // actual spatial geometry (distance, zoom, viewing angle), not
+          // an arbitrary flat pixel constant.
+          const projected = face.corners.map(([lx, ly, lz]) => point({
+            x: d.v.x + lx * voxelWorldSize, y: d.v.y + ly * voxelWorldSize, z: d.v.z + lz * voxelWorldSize,
+          }));
+          context.fillStyle = `rgb(${Math.round(r * face.shade)},${Math.round(g * face.shade)},${Math.round(b * face.shade)})`;
+          context.beginPath();
+          context.moveTo(projected[0].x, projected[0].y);
+          for (let i = 1; i < projected.length; i++) context.lineTo(projected[i].x, projected[i].y);
+          context.closePath();
+          context.fill();
+        }
       } else {
         const img = d.entry.img;
         const h = 70 * d.scale;
@@ -190,12 +249,14 @@ if (container) {
   function renderVoxels(voxels, voxelSize) {
     if (voxelMesh) { scene.remove(voxelMesh); voxelMesh.geometry.dispose(); voxelMesh = null; }
     if (!voxels.length) return;
-    const size = Math.max(voxelSize, 0.01);
+    const size = Math.max(voxelSize, 0.01) * voxelScaleMultiplier;
     voxelMesh = new THREE.InstancedMesh(voxelGeometry, voxelMaterial, voxels.length);
     voxelMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(voxels.length * 3), 3);
     voxels.forEach((voxel, index) => {
       tmpMatrix.makeScale(size * 0.92, size * 0.92, size * 0.92);
-      tmpMatrix.setPosition(voxel.x, voxel.y, voxel.z);
+      // Mirrored X (see the 2D fallback's point() for why) so the array
+      // reads left-to-right on screen in both render paths consistently.
+      tmpMatrix.setPosition(-voxel.x, voxel.y, voxel.z);
       voxelMesh.setMatrixAt(index, tmpMatrix);
       const [r, g, b] = voxel.color || [0x66, 0x7e, 0xa8];
       tmpColor.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
@@ -245,7 +306,8 @@ if (container) {
     Object.entries(cameras || {}).forEach(([cameraId, info]) => {
       seen.add(cameraId);
       const yaw = THREE.MathUtils.degToRad(Number(info.yaw_degrees || 0));
-      const x = Math.sin(yaw) * radius;
+      // Mirrored X (matches renderVoxels() and the 2D fallback's point()).
+      const x = -Math.sin(yaw) * radius;
       const z = Math.cos(yaw) * radius;
       let entry = cameraPlanes.get(cameraId);
       if (!entry) {
@@ -307,7 +369,7 @@ if (container) {
     const box = new THREE.Box3();
     box.expandByPoint(new THREE.Vector3(-radius, 0, -radius));
     box.expandByPoint(new THREE.Vector3(radius, 0.5, radius));
-    for (const v of voxels) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+    for (const v of voxels) box.expandByPoint(new THREE.Vector3(-v.x, v.y, v.z)); // mirrored, matches renderVoxels()
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
     const span = Math.max(size.x, size.y, size.z, 1.0);
@@ -419,6 +481,9 @@ if (container) {
     camera.position.set(3.2, 2.4, 4.2);
     controls.target.set(0, 0.3, 0);
     controls.update();
+  });
+  window.addEventListener('egg:occupancy-voxel-scale', () => {
+    if (scene && lastPayload) renderVoxels(lastPayload.voxels || [], lastPayload.voxel_size_meters || 0.1);
   });
   window.addEventListener('egg:vision-activate', activate);
   window.addEventListener('egg:vision-deactivate', deactivate);

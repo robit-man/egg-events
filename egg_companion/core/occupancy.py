@@ -38,6 +38,7 @@ sigmoid p = 1 / (1 + exp(-log_odds)).
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass
 
@@ -94,6 +95,17 @@ class VoxelGrid:
         self.max_range = max_range_meters
         self.max_voxels = max_voxels
         self._voxels: dict[tuple[int, int, int], VoxelRecord] = {}
+        # integrate_depth() runs in a background thread (runtime.py wraps
+        # it in asyncio.to_thread) while the dashboard's /api/occupancy
+        # handler reads on the event loop thread. list(dict.items())
+        # snapshots alone were not sufficient -- observed in production
+        # and reproduced under real threaded load in tests: CPython's GIL
+        # does not guarantee a builtin like list()/sorted() is atomic
+        # against a concurrent dict mutation in every case. An explicit
+        # lock is the only correct fix. RLock, not Lock: summarize()
+        # calls free_count() while already holding the lock, which would
+        # otherwise deadlock.
+        self._lock = threading.RLock()
 
     def __len__(self) -> int:
         return len(self._voxels)
@@ -120,14 +132,15 @@ class VoxelGrid:
         now: float,
         color: tuple[int, int, int] | None = None,
     ) -> None:
-        existing = self._voxels.get(index)
-        prior = existing.log_odds if existing is not None else 0.0
-        updated = max(LOG_ODDS_MIN, min(LOG_ODDS_MAX, prior + log_odds_delta))
-        # A ray-miss update (color=None) passing through an already-colored
-        # voxel shouldn't erase its last observed surface color -- only a
-        # fresh hit (color provided) ever overwrites it.
-        resolved_color = color if color is not None else (existing.color if existing is not None else DEFAULT_VOXEL_COLOR)
-        self._voxels[index] = VoxelRecord(log_odds=updated, last_seen=now, color=resolved_color)
+        with self._lock:
+            existing = self._voxels.get(index)
+            prior = existing.log_odds if existing is not None else 0.0
+            updated = max(LOG_ODDS_MIN, min(LOG_ODDS_MAX, prior + log_odds_delta))
+            # A ray-miss update (color=None) passing through an already-colored
+            # voxel shouldn't erase its last observed surface color -- only a
+            # fresh hit (color provided) ever overwrites it.
+            resolved_color = color if color is not None else (existing.color if existing is not None else DEFAULT_VOXEL_COLOR)
+            self._voxels[index] = VoxelRecord(log_odds=updated, last_seen=now, color=resolved_color)
 
     def integrate_depth(
         self,
@@ -228,40 +241,44 @@ class VoxelGrid:
         return integrated
 
     def _evict_if_over_capacity(self) -> None:
-        if len(self._voxels) <= self.max_voxels:
-            return
-        ordered = sorted(self._voxels.items(), key=lambda item: item[1].last_seen)
-        excess = len(self._voxels) - self.max_voxels
-        for key, _ in ordered[:excess]:
-            del self._voxels[key]
+        with self._lock:
+            if len(self._voxels) <= self.max_voxels:
+                return
+            ordered = sorted(self._voxels.items(), key=lambda item: item[1].last_seen)
+            excess = len(self._voxels) - self.max_voxels
+            for key, _ in ordered[:excess]:
+                del self._voxels[key]
 
     def prune_stale(self, stale_after_seconds: float, now: float | None = None) -> int:
         now = now if now is not None else time.monotonic()
-        stale_keys = [
-            key for key, record in list(self._voxels.items())
-            if now - record.last_seen > stale_after_seconds
-        ]
-        for key in stale_keys:
-            del self._voxels[key]
-        return len(stale_keys)
+        with self._lock:
+            stale_keys = [
+                key for key, record in self._voxels.items()
+                if now - record.last_seen > stale_after_seconds
+            ]
+            for key in stale_keys:
+                del self._voxels[key]
+            return len(stale_keys)
 
     def occupied_count(self) -> int:
-        # integrate_depth() runs in a background thread (asyncio.to_thread)
-        # while the dashboard's /api/occupancy handler calls these read
-        # methods on the event loop thread -- iterating self._voxels
-        # directly here race with concurrent inserts/evictions there and
-        # raise "RuntimeError: dictionary changed size during iteration"
-        # (observed in production). list(...) snapshots before filtering.
-        return sum(
-            1 for record in list(self._voxels.values())
-            if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
-        )
+        # integrate_depth() runs in a background thread (runtime.py wraps
+        # it in asyncio.to_thread) while the dashboard's /api/occupancy
+        # handler calls these read methods on the event loop thread --
+        # a lock is the only reliably correct guard here (observed in
+        # production, and reproduced under real threaded load in tests,
+        # that CPython's GIL alone does not guarantee this is safe).
+        with self._lock:
+            return sum(
+                1 for record in self._voxels.values()
+                if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
+            )
 
     def free_count(self) -> int:
-        return sum(
-            1 for record in list(self._voxels.values())
-            if record.log_odds < FREE_LOG_ODDS_THRESHOLD
-        )
+        with self._lock:
+            return sum(
+                1 for record in self._voxels.values()
+                if record.log_odds < FREE_LOG_ODDS_THRESHOLD
+            )
 
     def occupied_voxels(self) -> list[dict[str, object]]:
         """Occupied voxel centers in shared-frame meters, for the
@@ -272,55 +289,57 @@ class VoxelGrid:
         actual RGB sampled from the source camera frame at the pixel that
         produced this voxel (see integrate_depth's color_frame param),
         not a synthetic confidence gradient."""
-        return [
-            {
-                "x": round((ix + 0.5) * self.voxel_size, 3),
-                "y": round((iy + 0.5) * self.voxel_size, 3),
-                "z": round((iz + 0.5) * self.voxel_size, 3),
-                "confidence": round(log_odds_to_probability(record.log_odds), 3),
-                "color": list(record.color),
-            }
-            for (ix, iy, iz), record in list(self._voxels.items())
-            if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
-        ]
+        with self._lock:
+            return [
+                {
+                    "x": round((ix + 0.5) * self.voxel_size, 3),
+                    "y": round((iy + 0.5) * self.voxel_size, 3),
+                    "z": round((iz + 0.5) * self.voxel_size, 3),
+                    "confidence": round(log_odds_to_probability(record.log_odds), 3),
+                    "color": list(record.color),
+                }
+                for (ix, iy, iz), record in self._voxels.items()
+                if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
+            ]
 
     def summarize(self) -> dict[str, object]:
         """Compact, LLM-context-friendly summary of the fused occupancy --
         coarse enough to describe in a sentence, not a raw voxel dump.
         Lateral sectors and distances use the horizontal (X, Z) plane
         only; height (Y) is not summarized separately."""
-        occupied = [
-            (key, math.hypot(key[0] * self.voxel_size, key[2] * self.voxel_size))
-            for key, record in list(self._voxels.items())
-            if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
-        ]
-        if not occupied:
-            return {
-                "occupied_voxels": 0,
-                "free_voxels": self.free_count(),
-                "nearest_occupied_meters": None,
-                "sectors": {},
+        with self._lock:
+            occupied = [
+                (key, math.hypot(key[0] * self.voxel_size, key[2] * self.voxel_size))
+                for key, record in self._voxels.items()
+                if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
+            ]
+            if not occupied:
+                return {
+                    "occupied_voxels": 0,
+                    "free_voxels": self.free_count(),
+                    "nearest_occupied_meters": None,
+                    "sectors": {},
+                }
+            sectors: dict[str, list[float]] = {}
+            for (ix, _iy, _iz), distance in occupied:
+                x = ix * self.voxel_size
+                if x < -self.voxel_size:
+                    lateral = "left"
+                elif x > self.voxel_size:
+                    lateral = "right"
+                else:
+                    lateral = "center"
+                sectors.setdefault(lateral, []).append(distance)
+            sector_summary = {
+                lateral: {"nearest_meters": round(min(distances), 2), "count": len(distances)}
+                for lateral, distances in sectors.items()
             }
-        sectors: dict[str, list[float]] = {}
-        for (ix, _iy, _iz), distance in occupied:
-            x = ix * self.voxel_size
-            if x < -self.voxel_size:
-                lateral = "left"
-            elif x > self.voxel_size:
-                lateral = "right"
-            else:
-                lateral = "center"
-            sectors.setdefault(lateral, []).append(distance)
-        sector_summary = {
-            lateral: {"nearest_meters": round(min(distances), 2), "count": len(distances)}
-            for lateral, distances in sectors.items()
-        }
-        return {
-            "occupied_voxels": len(occupied),
-            "free_voxels": self.free_count(),
-            "nearest_occupied_meters": round(min(d for _, d in occupied), 2),
-            "sectors": sector_summary,
-        }
+            return {
+                "occupied_voxels": len(occupied),
+                "free_voxels": self.free_count(),
+                "nearest_occupied_meters": round(min(d for _, d in occupied), 2),
+                "sectors": sector_summary,
+            }
 
     def summary_text(self) -> str:
         """One-sentence natural-language rendering of summarize(), meant

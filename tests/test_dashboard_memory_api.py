@@ -177,9 +177,12 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'data-graph-kind="world_model"' in dashboard.PAGE
     assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
     assert 'id="occupancy-scene"' in dashboard.PAGE
-    assert 'src="/assets/occupancy_scene.js?v=20260825a"' in dashboard.PAGE
+    assert 'src="/assets/occupancy_scene.js?v=20260825c"' in dashboard.PAGE
     assert "egg:occupancy-data" in dashboard.PAGE
     assert "loadOccupancy" in dashboard.PAGE
+    assert 'id="occupancy-voxel-scale-up"' in dashboard.PAGE
+    assert 'id="occupancy-voxel-scale-down"' in dashboard.PAGE
+    assert "egg:occupancy-voxel-scale" in dashboard.PAGE
 
 
 def test_occupancy_scene_borrows_graphs_webgl_renderer_instead_of_opening_a_second() -> None:
@@ -239,6 +242,58 @@ def test_occupancy_scene_colors_voxels_from_source_frame_not_confidence_gradient
     assert "d.v.color" in occupancy_source
     assert "lowColor" not in occupancy_source
     assert "highColor" not in occupancy_source
+
+
+def test_occupancy_scene_voxel_size_scales_with_zoom_and_manual_control() -> None:
+    """Voxel visual size was previously a fixed pixel constant, so it
+    stayed static as the user scrolled to zoom. Voxels now render as real
+    projected cubes: each face corner is a real-world offset
+    (voxelWorldSize = voxelSizeMeters * voxelScaleMultiplier) that goes
+    through the same point() perspective/zoom projection as every other
+    scene point, so on-screen size follows actual spatial geometry
+    (distance, zoom, viewing angle) rather than an arbitrary flat pixel
+    constant -- and a toolbar Voxel +/- control applies an additional
+    manual multiplier, honored in both render paths."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "voxelWorldSize = voxelSizeMeters * voxelScaleMultiplier" in occupancy_source
+    assert "lx * voxelWorldSize" in occupancy_source
+    assert "egg:occupancy-voxel-scale" in occupancy_source
+    assert "voxelScaleMultiplier" in occupancy_source
+    assert "* voxelScaleMultiplier" in occupancy_source  # applied in the WebGL path too
+
+
+def test_occupancy_scene_voxels_render_as_real_projected_cubes() -> None:
+    """Voxels must be real projected cube geometry (6 possible faces,
+    only the camera-facing subset drawn each frame via backface culling
+    on the rotated face normal), not a flat screen-aligned square sprite."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "CUBE_FACES" in occupancy_source
+    assert "visibleCubeFaces" in occupancy_source
+    assert "face.corners.map" in occupancy_source
+    assert "context.closePath()" in occupancy_source
+    assert "context.fillRect(d.x - size / 2" not in occupancy_source  # old flat-sprite path removed
+
+
+def test_occupancy_scene_camera_array_reads_left_to_right_on_screen() -> None:
+    """Screen X is mirrored consistently in both render paths (voxels and
+    camera planes go through the same projection) so the panoramic array
+    reads left-to-right on screen, and the orbit-drag yaw direction is
+    compensated to still feel natural after that mirror -- the backend
+    fusion geometry in core/occupancy.py is untouched, this is display-only."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "panX - rx * zoom * perspective" in occupancy_source
+    assert "tmpMatrix.setPosition(-voxel.x, voxel.y, voxel.z)" in occupancy_source
+    assert "const x = -Math.sin(yaw) * radius" in occupancy_source
+    assert "yaw = drag.yaw + dx * 0.007" in occupancy_source
 
 
 def test_occupancy_scene_auto_frames_camera_on_real_voxel_data() -> None:

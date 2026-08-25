@@ -642,7 +642,7 @@ PAGE = r"""<!doctype html>
           <article id="occupancy-panel" class="card graph-panel">
             <div class="graph-toolbar">
               <div class="graph-toolbar-controls"><span class="card-note">Cameras video0–video3, right to left, counter-clockwise · 60° stitch</span></div>
-              <div class="graph-toolbar-actions"><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
+              <div class="graph-toolbar-actions"><button id="occupancy-voxel-scale-down" class="button" type="button" aria-label="Decrease voxel scale">Voxel −</button><button id="occupancy-voxel-scale-up" class="button" type="button" aria-label="Increase voxel scale">Voxel +</button><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
             </div>
             <div class="graph-stage">
               <div id="occupancy-scene" class="graph-canvas" role="img" aria-label="Interactive three-dimensional voxel occupancy reconstruction of the environment"></div>
@@ -1465,6 +1465,8 @@ PAGE = r"""<!doctype html>
       }
     }
     $('#occupancy-reset')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-reset')));
+    $('#occupancy-voxel-scale-up')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-voxel-scale', {detail: {direction: 1}})));
+    $('#occupancy-voxel-scale-down')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-voxel-scale', {detail: {direction: -1}})));
 
     $('#voice').addEventListener('input', () => { voiceFormDirty = true; });
     $('#voice').addEventListener('change', () => { voiceFormDirty = true; });
@@ -1655,6 +1657,6 @@ PAGE = r"""<!doctype html>
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
   <script type="module" src="/assets/knowledge_graph.js?v=20260824e"></script>
-  <script type="module" src="/assets/occupancy_scene.js?v=20260825a"></script>
+  <script type="module" src="/assets/occupancy_scene.js?v=20260825c"></script>
 </body>
 </html>"""
