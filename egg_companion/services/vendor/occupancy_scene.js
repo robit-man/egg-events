@@ -6,17 +6,14 @@ import { OrbitControls } from '/assets/OrbitControls.js?v=20260811a';
 // core/occupancy.py's module docstring) built by rotating each camera's
 // monocular depth by its known array yaw before back-projecting.
 //
-// This borrows the exact same WebGLRenderer the /graph page's knowledge
-// graph creates (exposed as window.__eggGraph by knowledge_graph.js)
-// instead of opening a second WebGL context: two permanently-live
-// WebGLRenderer contexts on one page can exceed a browser/GPU driver's
-// concurrent-context limit -- often far below desktop Chrome's ~16 on
-// constrained or software GL stacks -- and that failure surfaces as a
-// generic "Error creating WebGL context" with no hint that a second
-// context was ever the cause. Reusing graph's renderer (moving its
-// <canvas> into this page's container while /vision is active, and
-// handing it back on navigating away) means this app never holds more
-// than one live WebGL context, independent of what that limit actually is.
+// WebGL setup deliberately mirrors knowledge_graph.js's proven renderer
+// construction (same options, same software-renderer fallback check) --
+// that scene is known-good on this hardware/browser, so this one is built
+// the same way rather than through any cross-module context sharing.
+// The context is still created lazily on first navigation to /vision and
+// released (renderer.dispose() + forceContextLoss()) on navigating away,
+// so a long session hopping between /graph and /vision doesn't pile up
+// GPU contexts that outlive their page.
 
 function initUnavailable(container, message) {
   const note = document.createElement('div');
@@ -169,6 +166,25 @@ if (container) {
     scene.add(rangeWireframe);
   }
 
+  // Frame the camera on the actual scene content once real data arrives,
+  // rather than trusting a single hardcoded guess to suit every room.
+  let framedOnce = false;
+  function fitCameraToScene(payload) {
+    const voxels = payload.voxels || [];
+    const radius = cameraRingRadius(payload.max_range_meters);
+    const box = new THREE.Box3();
+    box.expandByPoint(new THREE.Vector3(-radius, 0, -radius));
+    box.expandByPoint(new THREE.Vector3(radius, 0.5, radius));
+    for (const v of voxels) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const span = Math.max(size.x, size.y, size.z, 1.0);
+    controls.target.copy(center);
+    camera.position.set(center.x + span * 0.75, center.y + span * 0.6, center.z + span * 0.95);
+    controls.update();
+    framedOnce = true;
+  }
+
   function applyOccupancy(payload) {
     lastPayload = payload;
     if (!scene) return;
@@ -180,6 +196,7 @@ if (container) {
     renderVoxels(payload.voxels || [], payload.voxel_size_meters || 0.1);
     renderCameraMarkers(payload.cameras || {}, payload.max_range_meters);
     renderRangeWireframe(payload.max_range_meters);
+    if (!framedOnce) fitCameraToScene(payload);
   }
 
   function resize() {
@@ -200,18 +217,29 @@ if (container) {
   function activate() {
     if (renderer) return; // already active
     clearUnavailableNote();
-    const shared = window.__eggGraph;
-    if (!shared || !shared.renderer) {
-      unavailableNote = null;
-      initUnavailable(
-        container,
-        '3D voxel view unavailable: no shared WebGL renderer (the knowledge graph could not acquire one either).',
-      );
+    framedOnce = false;
+
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+      const context = renderer.getContext();
+      const debug = context.getExtension('WEBGL_debug_renderer_info');
+      const implementation = String(debug ? context.getParameter(debug.UNMASKED_RENDERER_WEBGL) : '');
+      if (/swiftshader|llvmpipe|software/i.test(implementation)) {
+        renderer.dispose();
+        renderer = undefined;
+        initUnavailable(container, '3D voxel view needs real WebGL acceleration, unavailable in this browser context.');
+        return;
+      }
+    } catch (error) {
+      console.error('occupancy_scene: WebGL context creation failed', error);
+      renderer = undefined;
+      initUnavailable(container, `3D voxel view unavailable: WebGL failed to initialize (${error && error.message ? error.message : error}).`);
       return;
     }
 
-    renderer = shared.renderer;
-    shared.pause();
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x070d19, 1);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(renderer.domElement);
 
     scene = new THREE.Scene();
@@ -223,6 +251,7 @@ if (container) {
     controls.minDistance = 0.4;
     controls.maxDistance = 60;
     controls.target.set(0, 0.3, 0);
+    controls.update();
 
     scene.add(new THREE.AmbientLight(0xffffff, 1.1));
     const key = new THREE.DirectionalLight(0xffffff, 0.6);
@@ -253,7 +282,9 @@ if (container) {
       node.material?.dispose?.();
     });
     cameraPlanes.clear(); // meshes just disposed above belong to the now-discarded scene
-    window.__eggGraph?.resume();
+    renderer.dispose();
+    renderer.forceContextLoss();
+    renderer.domElement.remove();
     scene = camera = renderer = controls = resizeObserver = undefined;
     voxelMesh = cameraRoot = rangeWireframe = null;
   }
