@@ -1654,7 +1654,7 @@ PAGE = r"""<!doctype html>
     connectLiveWaveform();
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
-  <script type="module" src="/assets/knowledge_graph.js?v=20260814b"></script>
-  <script type="module" src="/assets/occupancy_scene.js?v=20260824a"></script>
+  <script type="module" src="/assets/knowledge_graph.js?v=20260824b"></script>
+  <script type="module" src="/assets/occupancy_scene.js?v=20260824c"></script>
 </body>
 </html>"""

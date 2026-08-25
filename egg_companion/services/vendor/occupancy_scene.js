@@ -41,6 +41,20 @@ if (container) {
   const tmpColor = new THREE.Color();
   const tmpMatrix = new THREE.Matrix4();
 
+  // Each contributing camera's live frame, textured onto a plane and
+  // placed radially at that camera's known array yaw -- same rotation
+  // convention core/occupancy.py uses to fuse depth into the shared
+  // frame (yaw about +Y, 0deg = +Z), so a camera's image sits in the
+  // scene exactly where the voxels it contributed radiate outward from.
+  const textureLoader = new THREE.TextureLoader();
+  const cameraPlanes = new Map(); // cameraId -> { mesh, lastTextureLoad }
+  const CAMERA_TEXTURE_REFRESH_MS = 3000;
+  const CAMERA_PLANE_HEIGHT = 0.55;
+
+  function cameraRingRadius(maxRange) {
+    return THREE.MathUtils.clamp((maxRange || 6.0) * 0.32, 0.6, 3.0);
+  }
+
   function clearUnavailableNote() {
     if (unavailableNote) { unavailableNote.remove(); unavailableNote = null; }
   }
@@ -63,27 +77,82 @@ if (container) {
     scene.add(voxelMesh);
   }
 
-  // Small cone at the shared origin per contributing camera, pointed
-  // along that camera's known array yaw -- matches core/occupancy.py's
-  // rotation convention (yaw about +Y, +Z is the video0-local boresight).
-  function renderCameraMarkers(cameras) {
-    while (cameraRoot.children.length) {
-      const child = cameraRoot.children.pop();
-      child.geometry?.dispose?.();
-      child.material?.dispose?.();
-    }
-    const coneGeometry = new THREE.ConeGeometry(0.05, 0.16, 12);
+  function disposeCameraPlane(entry) {
+    entry.mesh.geometry.dispose();
+    entry.mesh.material.map?.dispose();
+    entry.mesh.material.dispose();
+  }
+
+  function refreshCameraTexture(cameraId, mesh) {
+    const url = `/api/cameras/${encodeURIComponent(cameraId)}/raw.jpg?t=${Date.now()}`;
+    textureLoader.load(
+      url,
+      texture => {
+        texture.colorSpace = THREE.SRGBColorSpace;
+        const image = texture.image;
+        if (image && image.width && image.height) {
+          const aspect = image.width / image.height;
+          mesh.geometry.dispose();
+          mesh.geometry = new THREE.PlaneGeometry(CAMERA_PLANE_HEIGHT * aspect, CAMERA_PLANE_HEIGHT);
+        }
+        mesh.material.map?.dispose();
+        mesh.material.map = texture;
+        mesh.material.color.set(0xffffff);
+        mesh.material.needsUpdate = true;
+      },
+      undefined,
+      () => {}, // camera frame not available yet -- keep the placeholder tile
+    );
+  }
+
+  // Each contributing camera's live frame, textured onto a plane
+  // positioned radially at that camera's known array yaw and facing the
+  // shared origin -- matches core/occupancy.py's rotation convention
+  // (yaw about +Y, +Z is the video0-local boresight), so a camera's
+  // image sits exactly where the voxels it contributed radiate from.
+  function renderCameraMarkers(cameras, maxRange) {
+    const radius = cameraRingRadius(maxRange);
+    const seen = new Set();
     Object.entries(cameras || {}).forEach(([cameraId, info]) => {
+      seen.add(cameraId);
       const yaw = THREE.MathUtils.degToRad(Number(info.yaw_degrees || 0));
+      const x = Math.sin(yaw) * radius;
+      const z = Math.cos(yaw) * radius;
+      let entry = cameraPlanes.get(cameraId);
+      if (!entry) {
+        const material = new THREE.MeshBasicMaterial({
+          color: 0x223344, side: THREE.DoubleSide, transparent: true, opacity: 0.96,
+        });
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(CAMERA_PLANE_HEIGHT, CAMERA_PLANE_HEIGHT), material);
+        mesh.userData.cameraId = cameraId;
+        cameraRoot.add(mesh);
+        entry = { mesh, lastTextureLoad: 0 };
+        cameraPlanes.set(cameraId, entry);
+      }
+      entry.mesh.position.set(x, 0.05, z);
+      entry.mesh.lookAt(0, 0.05, 0);
       const fresh = Number(info.age_seconds ?? 999) < 30;
-      const material = new THREE.MeshStandardMaterial({ color: fresh ? 0x34d399 : 0x667085 });
-      const marker = new THREE.Mesh(coneGeometry, material);
-      marker.rotation.x = Math.PI / 2;
-      marker.position.set(Math.sin(yaw) * 0.22, 0.05, Math.cos(yaw) * 0.22);
-      marker.rotation.z = -yaw;
-      marker.userData.cameraId = cameraId;
-      cameraRoot.add(marker);
+      entry.mesh.material.opacity = fresh ? 0.96 : 0.5;
+      const now = Date.now();
+      if (now - entry.lastTextureLoad > CAMERA_TEXTURE_REFRESH_MS) {
+        entry.lastTextureLoad = now;
+        refreshCameraTexture(cameraId, entry.mesh);
+      }
     });
+    for (const [cameraId, entry] of cameraPlanes) {
+      if (seen.has(cameraId)) continue;
+      cameraRoot.remove(entry.mesh);
+      disposeCameraPlane(entry);
+      cameraPlanes.delete(cameraId);
+    }
+  }
+
+  function clearCameraMarkers() {
+    for (const entry of cameraPlanes.values()) {
+      cameraRoot.remove(entry.mesh);
+      disposeCameraPlane(entry);
+    }
+    cameraPlanes.clear();
   }
 
   function renderRangeWireframe(maxRange) {
@@ -105,15 +174,11 @@ if (container) {
     if (!scene) return;
     if (!payload || !payload.enabled) {
       if (voxelMesh) { scene.remove(voxelMesh); voxelMesh.geometry.dispose(); voxelMesh = null; }
-      while (cameraRoot.children.length) {
-        const child = cameraRoot.children.pop();
-        child.geometry?.dispose?.();
-        child.material?.dispose?.();
-      }
+      clearCameraMarkers();
       return;
     }
     renderVoxels(payload.voxels || [], payload.voxel_size_meters || 0.1);
-    renderCameraMarkers(payload.cameras || {});
+    renderCameraMarkers(payload.cameras || {}, payload.max_range_meters);
     renderRangeWireframe(payload.max_range_meters);
   }
 
@@ -182,7 +247,12 @@ if (container) {
     resizeObserver?.disconnect();
     controls.dispose();
     voxelMesh?.geometry.dispose();
-    scene.traverse(node => { node.geometry?.dispose?.(); node.material?.dispose?.(); });
+    scene.traverse(node => {
+      node.geometry?.dispose?.();
+      node.material?.map?.dispose?.();
+      node.material?.dispose?.();
+    });
+    cameraPlanes.clear(); // meshes just disposed above belong to the now-discarded scene
     window.__eggGraph?.resume();
     scene = camera = renderer = controls = resizeObserver = undefined;
     voxelMesh = cameraRoot = rangeWireframe = null;
