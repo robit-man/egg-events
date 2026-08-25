@@ -71,10 +71,14 @@ def log_odds_to_probability(log_odds: float) -> float:
     return 1.0 / (1.0 + math.exp(-log_odds))
 
 
+DEFAULT_VOXEL_COLOR = (0x66, 0x7e, 0xa8)  # neutral blue-gray, used when no source frame is available
+
+
 @dataclass
 class VoxelRecord:
     log_odds: float
     last_seen: float  # time.monotonic()
+    color: tuple[int, int, int] = DEFAULT_VOXEL_COLOR  # RGB, 0-255 each
 
 
 class VoxelGrid:
@@ -110,12 +114,20 @@ class VoxelGrid:
         return record is not None and record.log_odds < FREE_LOG_ODDS_THRESHOLD
 
     def _update(
-        self, index: tuple[int, int, int], log_odds_delta: float, now: float
+        self,
+        index: tuple[int, int, int],
+        log_odds_delta: float,
+        now: float,
+        color: tuple[int, int, int] | None = None,
     ) -> None:
         existing = self._voxels.get(index)
         prior = existing.log_odds if existing is not None else 0.0
         updated = max(LOG_ODDS_MIN, min(LOG_ODDS_MAX, prior + log_odds_delta))
-        self._voxels[index] = VoxelRecord(log_odds=updated, last_seen=now)
+        # A ray-miss update (color=None) passing through an already-colored
+        # voxel shouldn't erase its last observed surface color -- only a
+        # fresh hit (color provided) ever overwrites it.
+        resolved_color = color if color is not None else (existing.color if existing is not None else DEFAULT_VOXEL_COLOR)
+        self._voxels[index] = VoxelRecord(log_odds=updated, last_seen=now, color=resolved_color)
 
     def integrate_depth(
         self,
@@ -127,6 +139,7 @@ class VoxelGrid:
         ray_steps: int = 12,
         now: float | None = None,
         yaw_degrees: float = 0.0,
+        color_frame: np.ndarray | None = None,
     ) -> int:
         """Back-project a depth map into this grid using an assumed pinhole
         model (no calibrated intrinsics exist for these cameras), rotate
@@ -138,6 +151,14 @@ class VoxelGrid:
         module docstring / config.OccupancyConfig.camera_yaw_degrees), not
         a per-call override of a calibrated pose -- pass 0.0 to integrate
         directly in camera-local coordinates without fusing.
+
+        color_frame, if given, is the source camera's raw HxWx3 uint8
+        frame in OpenCV's native BGR order (this codebase's convention
+        throughout) -- not necessarily the same resolution as depth, so
+        pixels are mapped proportionally, not 1:1. Each surface hit is
+        colored by sampling this frame at the corresponding pixel, so the
+        voxel scene reflects the actual observed scene rather than an
+        abstract confidence gradient.
 
         Returns the number of pixels integrated.
         """
@@ -152,6 +173,9 @@ class VoxelGrid:
         cx, cy = width / 2.0, height / 2.0
         yaw = math.radians(yaw_degrees)
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+        color_height, color_width = (
+            color_frame.shape[:2] if color_frame is not None and color_frame.ndim == 3 else (0, 0)
+        )
 
         integrated = 0
         for row in range(0, height, sample_stride):
@@ -191,7 +215,13 @@ class VoxelGrid:
                     visited.add(ray_index)
                     self._update(ray_index, LOG_ODDS_MISS, now)
 
-                self._update(surface_index, LOG_ODDS_HIT * pixel_conf, now)
+                hit_color = None
+                if color_height and color_width:
+                    color_row = min(color_height - 1, int(row / height * color_height))
+                    color_col = min(color_width - 1, int(col / width * color_width))
+                    b, g, r = color_frame[color_row, color_col][:3]
+                    hit_color = (int(r), int(g), int(b))
+                self._update(surface_index, LOG_ODDS_HIT * pixel_conf, now, color=hit_color)
                 integrated += 1
 
         self._evict_if_over_capacity()
@@ -238,13 +268,17 @@ class VoxelGrid:
         dashboard's 3D scene -- not the fastest representation for a large
         grid, but max_voxels already bounds how big this can get.
         confidence is the posterior occupancy probability (sigmoid of
-        log-odds), not a raw depth-model confidence score."""
+        log-odds), not a raw depth-model confidence score. color is the
+        actual RGB sampled from the source camera frame at the pixel that
+        produced this voxel (see integrate_depth's color_frame param),
+        not a synthetic confidence gradient."""
         return [
             {
                 "x": round((ix + 0.5) * self.voxel_size, 3),
                 "y": round((iy + 0.5) * self.voxel_size, 3),
                 "z": round((iz + 0.5) * self.voxel_size, 3),
                 "confidence": round(log_odds_to_probability(record.log_odds), 3),
+                "color": list(record.color),
             }
             for (ix, iy, iz), record in list(self._voxels.items())
             if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD

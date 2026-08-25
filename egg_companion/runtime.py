@@ -4079,6 +4079,7 @@ class CompanionRuntime:
                 self.config.occupancy.assumed_hfov_degrees,
                 self.config.occupancy.min_confidence,
                 yaw_degrees=yaw_degrees,
+                color_frame=frame,
             )
             self._occupancy_grid.prune_stale(self.config.occupancy.stale_after_seconds)
             self._memory.record_derived_property(

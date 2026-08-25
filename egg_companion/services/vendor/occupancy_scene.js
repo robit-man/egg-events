@@ -84,7 +84,7 @@ function initCanvasFallback(container) {
     if (!drag) return;
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
     if (drag.pan) { panX = drag.panX + dx; panY = drag.panY + dy; }
-    else { yaw = drag.yaw - dx * 0.007; pitch = Math.max(-1.35, Math.min(1.35, drag.pitch + dy * 0.007)); }
+    else { yaw = drag.yaw - dx * 0.007; pitch = Math.max(-1.35, Math.min(1.35, drag.pitch - dy * 0.007)); }
   });
   canvas.addEventListener('pointerup', () => { drag = null; });
   canvas.addEventListener('pointercancel', () => { drag = null; });
@@ -130,8 +130,7 @@ function initCanvasFallback(container) {
     for (const d of drawables) {
       if (d.kind === 'voxel') {
         const size = Math.max(1, 3.2 * d.scale);
-        const t = Math.max(0, Math.min(1, d.v.confidence ?? 0.5));
-        const r = Math.round(0x25 + (0xff - 0x25) * t), g = Math.round(0x63 + (0xae - 0x63) * t), b = Math.round(0xeb + (0x00 - 0xeb) * t);
+        const [r, g, b] = d.v.color || [0x66, 0x7e, 0xa8];
         context.fillStyle = `rgb(${r},${g},${b})`;
         context.fillRect(d.x - size / 2, d.y - size / 2, size, size);
       } else {
@@ -171,8 +170,6 @@ if (container) {
 
   const voxelGeometry = new THREE.BoxGeometry(1, 1, 1);
   const voxelMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.05 });
-  const lowColor = new THREE.Color(0x2563eb);
-  const highColor = new THREE.Color(0xffae00);
   const tmpColor = new THREE.Color();
   const tmpMatrix = new THREE.Matrix4();
 
@@ -200,7 +197,8 @@ if (container) {
       tmpMatrix.makeScale(size * 0.92, size * 0.92, size * 0.92);
       tmpMatrix.setPosition(voxel.x, voxel.y, voxel.z);
       voxelMesh.setMatrixAt(index, tmpMatrix);
-      tmpColor.copy(lowColor).lerp(highColor, THREE.MathUtils.clamp(voxel.confidence ?? 0.5, 0, 1));
+      const [r, g, b] = voxel.color || [0x66, 0x7e, 0xa8];
+      tmpColor.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
       voxelMesh.setColorAt(index, tmpColor);
     });
     voxelMesh.instanceMatrix.needsUpdate = true;

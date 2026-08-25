@@ -1655,6 +1655,6 @@ PAGE = r"""<!doctype html>
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
   <script type="module" src="/assets/knowledge_graph.js?v=20260824e"></script>
-  <script type="module" src="/assets/occupancy_scene.js?v=20260824g"></script>
+  <script type="module" src="/assets/occupancy_scene.js?v=20260825a"></script>
 </body>
 </html>"""

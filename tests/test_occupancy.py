@@ -273,6 +273,51 @@ class TestOccupiedVoxels:
         assert all(0.0 <= v["confidence"] <= 1.0 for v in voxels)
         assert all(v["confidence"] > 0.7 for v in voxels)
 
+    def test_voxel_color_is_sampled_from_source_frame_at_hit_pixel(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
+        depth = _flat_depth(4, 4, value=2.0)
+        # BGR frame, solid red in OpenCV's native channel order.
+        color_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        color_frame[:, :] = (0, 0, 255)  # B, G, R -- pure red
+        grid.integrate_depth(
+            depth, confidence=None, horizontal_fov_degrees=90.0,
+            sample_stride=1, ray_steps=2, color_frame=color_frame,
+        )
+        voxels = grid.occupied_voxels()
+        assert voxels
+        assert all(v["color"] == [255, 0, 0] for v in voxels)
+
+    def test_no_color_frame_falls_back_to_default_color(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        grid.integrate_depth(
+            _flat_depth(4, 4, value=2.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=1, ray_steps=2,
+        )
+        voxels = grid.occupied_voxels()
+        assert voxels
+        assert all(v["color"] == [0x66, 0x7e, 0xa8] for v in voxels)
+
+    def test_ray_miss_does_not_overwrite_an_existing_hit_colored_voxel(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
+        green_frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        green_frame[:, :] = (0, 255, 0)  # B, G, R -- pure green
+        grid.integrate_depth(
+            _flat_depth(8, 8, value=1.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=4,
+            color_frame=green_frame,
+        )
+        occupied_index = (0, 0, 1)
+        assert grid._voxels[occupied_index].color == (0, 255, 0)
+
+        # A farther hit whose ray passes through the same near voxel
+        # (a "miss" observation there, color_frame=None) must not erase
+        # its previously observed color.
+        grid.integrate_depth(
+            _flat_depth(8, 8, value=5.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=20,
+        )
+        assert grid._voxels[occupied_index].color == (0, 255, 0)
+
 
 class TestSummarize:
     def test_empty_grid_summary(self) -> None:

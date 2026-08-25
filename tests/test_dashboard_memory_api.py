@@ -177,7 +177,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'data-graph-kind="world_model"' in dashboard.PAGE
     assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
     assert 'id="occupancy-scene"' in dashboard.PAGE
-    assert 'src="/assets/occupancy_scene.js?v=20260824g"' in dashboard.PAGE
+    assert 'src="/assets/occupancy_scene.js?v=20260825a"' in dashboard.PAGE
     assert "egg:occupancy-data" in dashboard.PAGE
     assert "loadOccupancy" in dashboard.PAGE
 
@@ -224,6 +224,21 @@ def test_occupancy_scene_places_camera_feeds_radially_matching_fusion_yaw() -> N
     assert "Math.sin(yaw) * radius" in occupancy_source
     assert "Math.cos(yaw) * radius" in occupancy_source
     assert "lookAt(0, 0.05, 0)" in occupancy_source
+
+
+def test_occupancy_scene_colors_voxels_from_source_frame_not_confidence_gradient() -> None:
+    """Voxels must be colored by the real RGB sampled from the source
+    camera frame at the pixel that produced them (core/occupancy.py's
+    color_frame param), in both render paths (WebGL InstancedMesh and the
+    2D canvas fallback) -- not a synthetic confidence-lerp gradient."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "voxel.color" in occupancy_source
+    assert "d.v.color" in occupancy_source
+    assert "lowColor" not in occupancy_source
+    assert "highColor" not in occupancy_source
 
 
 def test_occupancy_scene_auto_frames_camera_on_real_voxel_data() -> None:
