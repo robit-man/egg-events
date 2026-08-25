@@ -827,6 +827,8 @@ PAGE = r"""<!doctype html>
       if (route === '/configuration' && !effectiveConfig) loadConfiguration();
       if (route === '/vision' && currentState) renderCameras(currentState.telemetry?.cameras || []);
       if (route === '/vision') loadOccupancy();
+      if (route === '/vision' && priorRoute !== '/vision') window.dispatchEvent(new CustomEvent('egg:vision-activate'));
+      if (priorRoute === '/vision' && route !== '/vision') window.dispatchEvent(new CustomEvent('egg:vision-deactivate'));
       if (route === '/voice' && !catalog) loadCatalog();
       if (route === '/' || route === '/voice') loadConversation();
       if (route === '/graph') loadGraph();

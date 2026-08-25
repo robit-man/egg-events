@@ -347,3 +347,6 @@ runtime:
   speech_queue_size: 1
   reasoning_queue_size: 4
   log_level: INFO
+
+occupancy:
+  enabled: true

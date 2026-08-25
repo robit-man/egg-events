@@ -1,4 +1,4 @@
-"""Tests for the per-camera sparse voxel occupancy grid.
+"""Tests for the fused sparse voxel occupancy grid.
 
 Pure math/data-structure tests -- no depth model involved. The depth
 model itself (DA3METRIC-LARGE via a subprocess) is exercised separately
@@ -11,7 +11,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from egg_companion.core.occupancy import VoxelGrid
+from egg_companion.core.occupancy import (
+    FREE_LOG_ODDS_THRESHOLD,
+    LOG_ODDS_HIT,
+    LOG_ODDS_MAX,
+    LOG_ODDS_MIN,
+    LOG_ODDS_MISS,
+    OCCUPIED_LOG_ODDS_THRESHOLD,
+    VoxelGrid,
+    log_odds_to_probability,
+)
 
 
 def _flat_depth(height: int, width: int, value: float) -> np.ndarray:
@@ -33,9 +42,9 @@ class TestIntegrateDepth:
         # The center pixel projects to (x=0, y=0, z=2.0) -- voxel index
         # along Z should correspond to floor(2.0 / 0.5) = 4.
         center_index = (0, 0, 4)
-        assert grid._voxels[center_index].occupied is True
+        assert grid.is_occupied(center_index) is True
 
-    def test_ray_to_surface_marks_intermediate_voxels_free(self) -> None:
+    def test_ray_to_surface_marks_intermediate_voxels_not_occupied(self) -> None:
         grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
         depth = _flat_depth(16, 16, value=4.0)
 
@@ -45,12 +54,20 @@ class TestIntegrateDepth:
         )
 
         # A voxel roughly halfway to the surface along the center ray
-        # should have been carved as free space, not left unknown.
+        # should have been carved as not-occupied (a ray miss), not left
+        # unobserved / accidentally marked occupied.
         near_index = (0, 0, 2)
         assert near_index in grid._voxels
-        assert grid._voxels[near_index].occupied is False
+        assert grid.is_occupied(near_index) is False
 
-    def test_occupied_voxel_is_never_downgraded_to_free(self) -> None:
+    def test_single_contrary_ray_does_not_immediately_clear_strong_occupied_evidence(
+        self,
+    ) -> None:
+        """Bayesian log-odds fusion (not a one-way ratchet): a single
+        contrary ray miss barely moves a voxel's estimate, so a
+        well-observed surface survives one noisy contrary observation --
+        while still being able to flip given enough accumulated evidence
+        (see the eventually-clears test below)."""
         grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
         # First pass: something at z=1 (close), marking that voxel occupied.
         grid.integrate_depth(
@@ -58,15 +75,45 @@ class TestIntegrateDepth:
             horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=4,
         )
         occupied_index = (0, 0, 1)
-        assert grid._voxels[occupied_index].occupied is True
+        assert grid.is_occupied(occupied_index) is True
 
         # Second pass: something farther away (z=5) whose ray passes
-        # through the same near voxel -- must not erase the occupied mark.
+        # through the same near voxel -- a single contrary observation
+        # must not erase strong occupied evidence.
         grid.integrate_depth(
             _flat_depth(8, 8, value=5.0), confidence=None,
             horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=20,
         )
-        assert grid._voxels[occupied_index].occupied is True
+        assert grid.is_occupied(occupied_index) is True
+
+    def test_sustained_contrary_evidence_eventually_clears_occupied_voxel(self) -> None:
+        """Unlike a one-way ratchet, enough accumulated free-space
+        evidence through a previously-occupied voxel does eventually
+        flip its classification -- e.g. an object that moves away."""
+        grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
+        grid.integrate_depth(
+            _flat_depth(8, 8, value=1.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=4,
+        )
+        occupied_index = (0, 0, 1)
+        assert grid.is_occupied(occupied_index) is True
+
+        for _ in range(10):
+            grid.integrate_depth(
+                _flat_depth(8, 8, value=5.0), confidence=None,
+                horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=20,
+            )
+        assert grid.is_occupied(occupied_index) is False
+
+    def test_log_odds_clamped_to_bounds(self) -> None:
+        grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
+        for _ in range(50):
+            grid.integrate_depth(
+                _flat_depth(4, 4, value=1.0), confidence=None,
+                horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=2,
+            )
+        record = grid._voxels[(0, 0, 1)]
+        assert LOG_ODDS_MIN <= record.log_odds <= LOG_ODDS_MAX
 
     def test_depth_beyond_max_range_is_ignored(self) -> None:
         grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=3.0, max_voxels=10_000)
@@ -109,10 +156,40 @@ class TestIntegrateDepth:
         )
         assert integrated > 0
 
+    def test_low_confidence_hit_contributes_weaker_evidence_than_high_confidence(
+        self,
+    ) -> None:
+        low = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        high = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        depth = _flat_depth(4, 4, value=2.0)
+
+        low.integrate_depth(
+            depth, confidence=np.full((4, 4), 0.35, dtype=np.float32),
+            horizontal_fov_degrees=90.0, min_confidence=0.3, sample_stride=1, ray_steps=2,
+        )
+        high.integrate_depth(
+            depth, confidence=np.full((4, 4), 1.0, dtype=np.float32),
+            horizontal_fov_degrees=90.0, min_confidence=0.3, sample_stride=1, ray_steps=2,
+        )
+
+        low_log_odds = low._voxels[(0, 0, 4)].log_odds
+        high_log_odds = high._voxels[(0, 0, 4)].log_odds
+        assert low_log_odds < high_log_odds
+
     def test_non_2d_depth_array_is_rejected(self) -> None:
         grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
         depth_3d = np.zeros((4, 4, 3), dtype=np.float32)
         assert grid.integrate_depth(depth_3d, None, 90.0) == 0
+
+
+class TestLogOddsHelpers:
+    def test_log_odds_to_probability_matches_sigmoid(self) -> None:
+        assert log_odds_to_probability(0.0) == pytest.approx(0.5)
+        assert log_odds_to_probability(LOG_ODDS_HIT) == pytest.approx(0.9, abs=1e-6)
+        assert log_odds_to_probability(LOG_ODDS_MISS) == pytest.approx(0.35, abs=1e-6)
+
+    def test_thresholds_bracket_uncertain_region(self) -> None:
+        assert FREE_LOG_ODDS_THRESHOLD < 0.0 < OCCUPIED_LOG_ODDS_THRESHOLD
 
 
 class TestCapacityAndStaleness:
@@ -159,10 +236,10 @@ class TestOccupiedVoxels:
         )
         voxels = grid.occupied_voxels()
         assert voxels
-        assert all(v["confidence"] > 0 for v in voxels)
+        assert all(v["confidence"] > 0.5 for v in voxels)
         # occupied_count() is the authoritative count of occupied cells;
         # occupied_voxels() must return exactly that many, not more (i.e.
-        # not accidentally including the free/ray-carved cells too).
+        # not accidentally including the free/uncertain cells too).
         assert len(voxels) == grid.occupied_count()
 
     def test_voxel_center_matches_grid_index_times_voxel_size(self) -> None:
@@ -180,17 +257,18 @@ class TestOccupiedVoxels:
                 remainder = (v[axis] / 0.5) % 1
                 assert remainder == pytest.approx(0.5, abs=1e-6) or remainder == pytest.approx(-0.5, abs=1e-6)
 
-    def test_confidence_is_carried_through(self) -> None:
+    def test_confidence_is_posterior_probability_in_zero_to_one_range(self) -> None:
         grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
         depth = _flat_depth(4, 4, value=2.0)
-        conf = np.full((4, 4), 0.73, dtype=np.float32)
+        conf = np.full((4, 4), 0.9, dtype=np.float32)
         grid.integrate_depth(
             depth, confidence=conf, horizontal_fov_degrees=90.0,
             sample_stride=1, ray_steps=2,
         )
         voxels = grid.occupied_voxels()
         assert voxels
-        assert all(v["confidence"] == pytest.approx(0.73) for v in voxels)
+        assert all(0.0 <= v["confidence"] <= 1.0 for v in voxels)
+        assert all(v["confidence"] > 0.7 for v in voxels)
 
 
 class TestSummarize:

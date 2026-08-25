@@ -17,6 +17,22 @@ in meters, right-handed, matching standard 3D-graphics/robotics "Y up"
 convention. Camera-local back-projection itself still uses the pinhole
 image convention (+Y down) before being rotated into the shared frame --
 see integrate_depth's yaw_degrees parameter.
+
+Per-voxel state is a log-odds occupancy estimate, not a binary flag --
+the standard Bayesian occupancy-grid-mapping formulation (Moravec &
+Elfes 1985; textbook treatment in Thrun/Burgard/Fox, "Probabilistic
+Robotics" ch.9) used throughout robotics mapping (OctoMap, ROS
+costmap_2d) and by camera/lidar occupancy stacks generally, including
+pre-transformer-era automotive occupancy grids. Each observation nudges
+a voxel's log-odds up (ray endpoint: a surface hit) or down (ray
+interior: free-space traversal); log-odds accumulate additively across
+observations and are clamped to bounded confidence, so noisy single
+observations barely move the estimate while corroborated evidence
+dominates -- and, critically, sustained contrary evidence CAN flip a
+voxel's classification (a chair that gets moved eventually reads as
+free again), unlike a one-way "occupied, once marked, forever occupied"
+ratchet. Converting log-odds back to probability uses the standard
+sigmoid p = 1 / (1 + exp(-log_odds)).
 """
 
 from __future__ import annotations
@@ -27,11 +43,37 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# Bounds keep any single voxel's log-odds from saturating to certainty
+# after many observations, so a real change in the environment can still
+# flip its classification within a bounded number of future updates.
+LOG_ODDS_MIN = -6.0
+LOG_ODDS_MAX = 6.0
+
+# Per-observation log-odds increments (an inverse sensor model): a direct
+# depth hit is strong evidence of occupancy (p=0.9 equivalent), a ray
+# passing through a cell on its way to a farther surface is weaker
+# evidence of free space (p=0.35 equivalent) -- ray misses are inherently
+# less reliable than direct hits (a thin or reflective surface can be
+# missed entirely), so the asymmetry favors not over-clearing real
+# obstacles. Hit strength is further scaled by the depth model's
+# per-pixel confidence in integrate_depth().
+LOG_ODDS_HIT = math.log(0.9 / 0.1)
+LOG_ODDS_MISS = math.log(0.35 / 0.65)
+
+# Classification thresholds (p=0.7 / p=0.3 equivalent) -- voxels between
+# these two bounds are neither confidently occupied nor confidently free,
+# and are excluded from both occupied_count() and free_count().
+OCCUPIED_LOG_ODDS_THRESHOLD = math.log(0.7 / 0.3)
+FREE_LOG_ODDS_THRESHOLD = math.log(0.3 / 0.7)
+
+
+def log_odds_to_probability(log_odds: float) -> float:
+    return 1.0 / (1.0 + math.exp(-log_odds))
+
 
 @dataclass
 class VoxelRecord:
-    occupied: bool
-    confidence: float
+    log_odds: float
     last_seen: float  # time.monotonic()
 
 
@@ -59,17 +101,21 @@ class VoxelGrid:
             int(math.floor(point[2] / self.voxel_size)),
         )
 
-    def _mark(
-        self, index: tuple[int, int, int], occupied: bool, confidence: float, now: float
+    def is_occupied(self, index: tuple[int, int, int]) -> bool:
+        record = self._voxels.get(index)
+        return record is not None and record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
+
+    def is_free(self, index: tuple[int, int, int]) -> bool:
+        record = self._voxels.get(index)
+        return record is not None and record.log_odds < FREE_LOG_ODDS_THRESHOLD
+
+    def _update(
+        self, index: tuple[int, int, int], log_odds_delta: float, now: float
     ) -> None:
         existing = self._voxels.get(index)
-        if existing is not None and existing.occupied and not occupied:
-            # A directly-observed surface must never be downgraded to
-            # "free" just because some other sample's ray happened to
-            # pass through the same cell -- occupied evidence outranks
-            # free-space inference through the same voxel.
-            return
-        self._voxels[index] = VoxelRecord(occupied=occupied, confidence=confidence, last_seen=now)
+        prior = existing.log_odds if existing is not None else 0.0
+        updated = max(LOG_ODDS_MIN, min(LOG_ODDS_MAX, prior + log_odds_delta))
+        self._voxels[index] = VoxelRecord(log_odds=updated, last_seen=now)
 
     def integrate_depth(
         self,
@@ -85,8 +131,8 @@ class VoxelGrid:
         """Back-project a depth map into this grid using an assumed pinhole
         model (no calibrated intrinsics exist for these cameras), rotate
         each point into the shared fused frame by this camera's known
-        mounting yaw, and carve free space along the ray from the shared
-        origin to each observed surface.
+        mounting yaw, and update log-odds along the ray from the shared
+        origin to each observed surface (see module docstring).
 
         yaw_degrees is this camera's angle in the panoramic array (see
         module docstring / config.OccupancyConfig.camera_yaw_degrees), not
@@ -133,14 +179,19 @@ class VoxelGrid:
                 z = -x_cam * sin_yaw + z_cam * cos_yaw
                 surface_index = self._to_index((x, y, z))
 
+                # One free-space update per traversed cell per ray -- a
+                # ray that clips a voxel across several march steps is
+                # still a single observation of that cell, not several.
+                visited: set[tuple[int, int, int]] = set()
                 for step in range(1, ray_steps):
                     t = step / ray_steps
                     ray_index = self._to_index((x * t, y * t, z * t))
-                    if ray_index == surface_index:
+                    if ray_index == surface_index or ray_index in visited:
                         continue
-                    self._mark(ray_index, occupied=False, confidence=0.5, now=now)
+                    visited.add(ray_index)
+                    self._update(ray_index, LOG_ODDS_MISS, now)
 
-                self._mark(surface_index, occupied=True, confidence=pixel_conf, now=now)
+                self._update(surface_index, LOG_ODDS_HIT * pixel_conf, now)
                 integrated += 1
 
         self._evict_if_over_capacity()
@@ -165,34 +216,43 @@ class VoxelGrid:
         return len(stale_keys)
 
     def occupied_count(self) -> int:
-        return sum(1 for record in self._voxels.values() if record.occupied)
+        return sum(
+            1 for record in self._voxels.values()
+            if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
+        )
 
     def free_count(self) -> int:
-        return sum(1 for record in self._voxels.values() if not record.occupied)
+        return sum(
+            1 for record in self._voxels.values()
+            if record.log_odds < FREE_LOG_ODDS_THRESHOLD
+        )
 
     def occupied_voxels(self) -> list[dict[str, object]]:
         """Occupied voxel centers in shared-frame meters, for the
         dashboard's 3D scene -- not the fastest representation for a large
-        grid, but max_voxels already bounds how big this can get."""
+        grid, but max_voxels already bounds how big this can get.
+        confidence is the posterior occupancy probability (sigmoid of
+        log-odds), not a raw depth-model confidence score."""
         return [
             {
                 "x": round((ix + 0.5) * self.voxel_size, 3),
                 "y": round((iy + 0.5) * self.voxel_size, 3),
                 "z": round((iz + 0.5) * self.voxel_size, 3),
-                "confidence": round(record.confidence, 3),
+                "confidence": round(log_odds_to_probability(record.log_odds), 3),
             }
             for (ix, iy, iz), record in self._voxels.items()
-            if record.occupied
+            if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
         ]
 
     def summarize(self) -> dict[str, object]:
-        """Compact, LLM-context-friendly summary of this camera's local
-        occupancy -- coarse enough to describe in a sentence, not a raw
-        voxel dump. Lateral sectors and distances use the horizontal
-        (X, Z) plane only; height (Y) is not summarized separately."""
+        """Compact, LLM-context-friendly summary of the fused occupancy --
+        coarse enough to describe in a sentence, not a raw voxel dump.
+        Lateral sectors and distances use the horizontal (X, Z) plane
+        only; height (Y) is not summarized separately."""
         occupied = [
             (key, math.hypot(key[0] * self.voxel_size, key[2] * self.voxel_size))
-            for key, record in self._voxels.items() if record.occupied
+            for key, record in self._voxels.items()
+            if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
         ]
         if not occupied:
             return {

@@ -182,6 +182,29 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "loadOccupancy" in dashboard.PAGE
 
 
+def test_occupancy_scene_borrows_graphs_webgl_renderer_instead_of_opening_a_second() -> None:
+    """Two permanently-live WebGLRenderer contexts on one page can exceed
+    a browser/GPU driver's concurrent-context limit -- occupancy_scene.js
+    must reuse knowledge_graph.js's renderer (window.__eggGraph) rather
+    than constructing its own THREE.WebGLRenderer."""
+    graph_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "knowledge_graph.js"
+    ).read_text()
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "window.__eggGraph" in graph_source
+    assert "pause()" in graph_source
+    assert "resume()" in graph_source
+    assert "new THREE.WebGLRenderer" not in occupancy_source
+    assert "window.__eggGraph" in occupancy_source
+    assert "shared.pause()" in occupancy_source
+    assert "window.__eggGraph?.resume()" in occupancy_source
+    assert "egg:vision-activate" in occupancy_source
+    assert "egg:vision-deactivate" in occupancy_source
+
+
 def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> None:
     graph_source = (
         dashboard.Path(dashboard.__file__).with_name("vendor") / "knowledge_graph.js"

@@ -643,6 +643,25 @@ if (container) {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(renderer.domElement);
 
+    // A second permanently-live WebGLRenderer (e.g. the /vision page's
+    // voxel occupancy scene) can exceed this browser/GPU's concurrent
+    // WebGL context limit, which is often far below desktop Chrome's ~16
+    // on constrained or software GL stacks -- so rather than opening its
+    // own context, occupancy_scene.js borrows this exact renderer via
+    // window.__eggGraph while /vision is active, and hands it back here.
+    let graphRendering = true;
+    window.__eggGraph = {
+      renderer,
+      homeContainer: container,
+      resize: () => resize(),
+      pause() { graphRendering = false; },
+      resume() {
+        graphRendering = true;
+        container.appendChild(renderer.domElement);
+        resize();
+      },
+    };
+
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 500);
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -1083,6 +1102,7 @@ if (container) {
     });
 
     function resize() {
+      if (!graphRendering) return;
       const w = Math.max(1, container.clientWidth), h = Math.max(1, container.clientHeight);
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
@@ -1103,6 +1123,7 @@ if (container) {
     const dummy = new THREE.Object3D();
     function animate() {
       requestAnimationFrame(animate);
+      if (!graphRendering) return;
       const elapsed = clock.getElapsedTime();
       const now = performance.now();
       let selectedMoved = false;
