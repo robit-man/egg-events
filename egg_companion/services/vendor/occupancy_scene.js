@@ -6,14 +6,15 @@ import { OrbitControls } from '/assets/OrbitControls.js?v=20260811a';
 // core/occupancy.py's module docstring) built by rotating each camera's
 // monocular depth by its known array yaw before back-projecting.
 //
-// WebGL setup deliberately mirrors knowledge_graph.js's proven renderer
-// construction (same options, same software-renderer fallback check) --
-// that scene is known-good on this hardware/browser, so this one is built
-// the same way rather than through any cross-module context sharing.
-// The context is still created lazily on first navigation to /vision and
-// released (renderer.dispose() + forceContextLoss()) on navigating away,
-// so a long session hopping between /graph and /vision doesn't pile up
-// GPU contexts that outlive their page.
+// Confirmed on real hardware (Chromium GPU-process log): "Could not
+// create a WebGL context ... GL_VENDOR = Disabled, Sandboxed = yes,
+// BindToCurrentSequence failed" when a second, fully independent
+// THREE.WebGLRenderer is constructed while knowledge_graph.js's own
+// renderer is already alive -- this browser/GPU only sustains ONE live
+// WebGL context, not "fewer than desktop Chrome's ~16." So this MUST
+// borrow that exact renderer via window.__eggGraph (moving its <canvas>
+// into this page's container while /vision is active, and handing it
+// back on navigating away) rather than ever constructing its own.
 
 function initUnavailable(container, message) {
   const note = document.createElement('div');
@@ -21,6 +22,7 @@ function initUnavailable(container, message) {
   note.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;';
   note.textContent = message;
   container.appendChild(note);
+  return note;
 }
 
 const container = document.getElementById('occupancy-scene');
@@ -219,27 +221,16 @@ if (container) {
     clearUnavailableNote();
     framedOnce = false;
 
-    try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
-      const context = renderer.getContext();
-      const debug = context.getExtension('WEBGL_debug_renderer_info');
-      const implementation = String(debug ? context.getParameter(debug.UNMASKED_RENDERER_WEBGL) : '');
-      if (/swiftshader|llvmpipe|software/i.test(implementation)) {
-        renderer.dispose();
-        renderer = undefined;
-        initUnavailable(container, '3D voxel view needs real WebGL acceleration, unavailable in this browser context.');
-        return;
-      }
-    } catch (error) {
-      console.error('occupancy_scene: WebGL context creation failed', error);
-      renderer = undefined;
-      initUnavailable(container, `3D voxel view unavailable: WebGL failed to initialize (${error && error.message ? error.message : error}).`);
+    const shared = window.__eggGraph;
+    if (!shared || !shared.renderer) {
+      unavailableNote = initUnavailable(
+        container,
+        '3D voxel view unavailable: no shared WebGL renderer (the knowledge graph could not acquire one either).',
+      );
       return;
     }
-
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.setClearColor(0x070d19, 1);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer = shared.renderer;
+    shared.pause();
     container.appendChild(renderer.domElement);
 
     scene = new THREE.Scene();
@@ -282,9 +273,7 @@ if (container) {
       node.material?.dispose?.();
     });
     cameraPlanes.clear(); // meshes just disposed above belong to the now-discarded scene
-    renderer.dispose();
-    renderer.forceContextLoss();
-    renderer.domElement.remove();
+    window.__eggGraph?.resume();
     scene = camera = renderer = controls = resizeObserver = undefined;
     voxelMesh = cameraRoot = rangeWireframe = null;
   }

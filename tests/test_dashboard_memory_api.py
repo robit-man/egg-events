@@ -140,7 +140,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "loadNarrativeDetail" in dashboard.PAGE
     assert "narrative-artifacts" in dashboard.PAGE
     assert 'href="/configuration" data-route="/configuration"' in dashboard.PAGE
-    assert 'src="/assets/knowledge_graph.js?v=20260824c"' in dashboard.PAGE
+    assert 'src="/assets/knowledge_graph.js?v=20260824e"' in dashboard.PAGE
     assert '"three":"/assets/three.module.min.js"' in dashboard.PAGE
     assert "window.open(" not in dashboard.PAGE
     assert "graphDataSignature" in dashboard.PAGE
@@ -177,17 +177,19 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'data-graph-kind="world_model"' in dashboard.PAGE
     assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
     assert 'id="occupancy-scene"' in dashboard.PAGE
-    assert 'src="/assets/occupancy_scene.js?v=20260824d"' in dashboard.PAGE
+    assert 'src="/assets/occupancy_scene.js?v=20260824f"' in dashboard.PAGE
     assert "egg:occupancy-data" in dashboard.PAGE
     assert "loadOccupancy" in dashboard.PAGE
 
 
-def test_occupancy_scene_builds_its_own_renderer_matching_graphs_pattern() -> None:
-    """occupancy_scene.js constructs its own THREE.WebGLRenderer using the
-    exact same options and software-renderer fallback check as
-    knowledge_graph.js's proven, known-working setup, and fully releases
-    the GPU context (dispose + forceContextLoss) when /vision goes
-    inactive rather than leaving it live for the whole page lifetime."""
+def test_occupancy_scene_borrows_graphs_webgl_renderer_instead_of_opening_a_second() -> None:
+    """Confirmed on real hardware (Chromium GPU-process log: "Could not
+    create a WebGL context ... GL_VENDOR = Disabled, Sandboxed = yes,
+    BindToCurrentSequence failed") that this browser/GPU can only sustain
+    ONE live WebGL context -- a second, fully independent
+    THREE.WebGLRenderer fails outright while knowledge_graph.js's is
+    alive. occupancy_scene.js must borrow that exact renderer via
+    window.__eggGraph rather than ever constructing its own."""
     graph_source = (
         dashboard.Path(dashboard.__file__).with_name("vendor") / "knowledge_graph.js"
     ).read_text()
@@ -195,12 +197,13 @@ def test_occupancy_scene_builds_its_own_renderer_matching_graphs_pattern() -> No
         dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
     ).read_text()
 
-    assert "window.__eggGraph =" not in graph_source
-    assert "new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' })" in graph_source
-    assert "new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' })" in occupancy_source
-    assert "swiftshader|llvmpipe|software" in occupancy_source
-    assert "renderer.dispose()" in occupancy_source
-    assert "renderer.forceContextLoss()" in occupancy_source
+    assert "window.__eggGraph =" in graph_source
+    assert "pause()" in graph_source
+    assert "resume()" in graph_source
+    assert "new THREE.WebGLRenderer" not in occupancy_source
+    assert "window.__eggGraph" in occupancy_source
+    assert "shared.pause()" in occupancy_source
+    assert "window.__eggGraph?.resume()" in occupancy_source
     assert "egg:vision-activate" in occupancy_source
     assert "egg:vision-deactivate" in occupancy_source
 
