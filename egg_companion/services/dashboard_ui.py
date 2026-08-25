@@ -642,7 +642,7 @@ PAGE = r"""<!doctype html>
           <article id="occupancy-panel" class="card graph-panel">
             <div class="graph-toolbar">
               <div class="graph-toolbar-controls"><span class="card-note">Cameras video0–video3, right to left, counter-clockwise · 60° stitch</span></div>
-              <div class="graph-toolbar-actions"><button id="occupancy-voxel-scale-down" class="button" type="button" aria-label="Decrease voxel scale">Voxel −</button><button id="occupancy-voxel-scale-up" class="button" type="button" aria-label="Increase voxel scale">Voxel +</button><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
+              <div class="graph-toolbar-actions"><button id="occupancy-voxel-scale-down" class="button" type="button" aria-label="Decrease voxel scale">Voxel −</button><button id="occupancy-voxel-scale-up" class="button" type="button" aria-label="Increase voxel scale">Voxel +</button><button id="occupancy-resolution-down" class="button" type="button" aria-label="Decrease resolution">Resolution −</button><button id="occupancy-resolution-up" class="button" type="button" aria-label="Increase resolution">Resolution +</button><button id="occupancy-reset" class="button" type="button">Reset view</button></div>
             </div>
             <div class="graph-stage">
               <div id="occupancy-scene" class="graph-canvas" role="img" aria-label="Interactive three-dimensional voxel occupancy reconstruction of the environment"></div>
@@ -1441,6 +1441,7 @@ PAGE = r"""<!doctype html>
       }
     }
 
+    let currentSampleStride = 8;
     async function loadOccupancy() {
       if (Date.now() - occupancyLoadedAt < 4000) return;
       occupancyLoadedAt = Date.now();
@@ -1448,6 +1449,7 @@ PAGE = r"""<!doctype html>
         const response = await fetch('/api/occupancy', {cache:'no-store'});
         if (!response.ok) throw new Error(await response.text());
         const payload = await response.json();
+        if (payload.sample_stride) currentSampleStride = payload.sample_stride;
         window.dispatchEvent(new CustomEvent('egg:occupancy-data', {detail: payload}));
         if (!payload.enabled) {
           $('#occupancy-status').innerHTML = '<span class="badge">Occupancy mapping disabled</span>';
@@ -1456,7 +1458,7 @@ PAGE = r"""<!doctype html>
         }
         const voxels = payload.voxels || [];
         const cameraCount = Object.keys(payload.cameras || {}).length;
-        $('#occupancy-status').innerHTML = `<span class="badge ${voxels.length ? 'good' : ''}">${esc(payload.occupied_count || 0)} occupied voxels</span><span class="badge">${esc(cameraCount)} camera${cameraCount === 1 ? '' : 's'} contributing</span>`;
+        $('#occupancy-status').innerHTML = `<span class="badge ${voxels.length ? 'good' : ''}">${esc(payload.occupied_count || 0)} occupied voxels</span><span class="badge">${esc(cameraCount)} camera${cameraCount === 1 ? '' : 's'} contributing</span><span class="badge">resolution: every ${esc(currentSampleStride)}px</span>`;
         $('#occupancy-overlay').innerHTML = voxels.length ? `<span class="badge good">${esc(voxels.length)} voxels</span><span class="badge">${esc(payload.max_range_meters)}m range</span>` : '<span class="badge">No occupied space observed yet</span>';
       } catch (error) {
         occupancyLoadedAt = 0;
@@ -1467,6 +1469,29 @@ PAGE = r"""<!doctype html>
     $('#occupancy-reset')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-reset')));
     $('#occupancy-voxel-scale-up')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-voxel-scale', {detail: {direction: 1}})));
     $('#occupancy-voxel-scale-down')?.addEventListener('click', () => window.dispatchEvent(new CustomEvent('egg:occupancy-voxel-scale', {detail: {direction: -1}})));
+    async function adjustOccupancyResolution(direction) {
+      // Lower sample_stride = denser/more of DA3's per-frame points used
+      // (higher resolution); higher = coarser/cheaper. Step by roughly
+      // sqrt(2) so each click meaningfully changes point density.
+      const next = direction > 0
+        ? Math.max(1, Math.round(currentSampleStride / 1.4))
+        : Math.min(32, Math.round(currentSampleStride * 1.4) || currentSampleStride + 1);
+      try {
+        const response = await fetch('/api/occupancy/resolution', {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sample_stride: next}),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const applied = await response.json();
+        currentSampleStride = applied.sample_stride;
+        occupancyLoadedAt = 0;
+        loadOccupancy();
+      } catch (error) {
+        $('#occupancy-status').innerHTML = `<span class="badge bad">Resolution change failed: ${esc(error.message)}</span>`;
+      }
+    }
+    $('#occupancy-resolution-up')?.addEventListener('click', () => adjustOccupancyResolution(1));
+    $('#occupancy-resolution-down')?.addEventListener('click', () => adjustOccupancyResolution(-1));
 
     $('#voice').addEventListener('input', () => { voiceFormDirty = true; });
     $('#voice').addEventListener('change', () => { voiceFormDirty = true; });
@@ -1657,6 +1682,6 @@ PAGE = r"""<!doctype html>
   </script>
   <script type="importmap">{"imports":{"three":"/assets/three.module.min.js"}}</script>
   <script type="module" src="/assets/knowledge_graph.js?v=20260824e"></script>
-  <script type="module" src="/assets/occupancy_scene.js?v=20260825c"></script>
+  <script type="module" src="/assets/occupancy_scene.js?v=20260825d"></script>
 </body>
 </html>"""

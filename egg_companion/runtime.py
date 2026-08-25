@@ -49,7 +49,7 @@ from egg_companion.config import EggConfig
 from egg_companion.core.activity import ActivityGovernor
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
-from egg_companion.core.occupancy import VoxelGrid
+from egg_companion.core.occupancy import VoxelGrid, resolve_camera_yaw_degrees
 from egg_companion.memory.pipeline import MemoryPipeline
 from egg_companion.memory.buffer import BufferedMediaRef, PerceptualBuffer
 from egg_companion.memory.migrate_legacy import LegacyMemoryMigrator
@@ -407,6 +407,16 @@ class CompanionRuntime:
             await self._omnius.ensure_asr_model(asr_model)
             self.config.transcription.asr_model = asr_model
 
+    def update_occupancy_resolution(self, sample_stride: int) -> int:
+        """Live-adjust how many of DA3's per-frame depth points get
+        back-projected into voxels each integration cycle -- lower is
+        denser/more expensive, higher is coarser/cheaper. Takes effect on
+        the next due camera's cycle; existing voxels are untouched.
+        Returns the clamped value actually applied."""
+        clamped = max(1, min(32, int(sample_stride)))
+        self.config.occupancy.sample_stride = clamped
+        return clamped
+
     def memory_snapshot(self) -> dict[str, object]:
         snapshot = self._memory.governance_snapshot() if self._memory else {}
         buffered = self._perceptual_buffer.snapshot(datetime.now(timezone.utc))
@@ -427,18 +437,28 @@ class CompanionRuntime:
         mounting angles so the dashboard can draw camera position markers.
         """
         now = time.monotonic()
+        known_camera_ids = list(self._latest_frames.keys())
+        yaw_by_camera = {
+            camera_id: resolve_camera_yaw_degrees(
+                camera_id, known_camera_ids,
+                self.config.occupancy.camera_array_spacing_degrees,
+                self.config.occupancy.camera_yaw_degrees,
+            )
+            for camera_id in known_camera_ids
+        }
         return {
             "enabled": self.config.occupancy.enabled,
             "voxel_size_meters": self.config.occupancy.voxel_size_meters,
             "max_range_meters": self.config.occupancy.max_range_meters,
-            "camera_yaw_degrees": dict(self.config.occupancy.camera_yaw_degrees),
+            "sample_stride": self.config.occupancy.sample_stride,
+            "camera_yaw_degrees": yaw_by_camera,
             "voxels": self._occupancy_grid.occupied_voxels(),
             "occupied_count": self._occupancy_grid.occupied_count(),
             "free_count": self._occupancy_grid.free_count(),
             "cameras": {
                 camera_id: {
                     "age_seconds": round(now - last_update, 1),
-                    "yaw_degrees": self.config.occupancy.camera_yaw_degrees.get(camera_id, 0.0),
+                    "yaw_degrees": yaw_by_camera.get(camera_id, 0.0),
                 }
                 for camera_id, last_update in self._occupancy_last_update.items()
             },
@@ -4071,13 +4091,19 @@ class CompanionRuntime:
             result = await self._depth_estimator.estimate(image_bytes)
             if result is None:
                 return None
-            yaw_degrees = self.config.occupancy.camera_yaw_degrees.get(camera_id, 0.0)
+            yaw_degrees = resolve_camera_yaw_degrees(
+                camera_id,
+                self._latest_frames.keys(),
+                self.config.occupancy.camera_array_spacing_degrees,
+                self.config.occupancy.camera_yaw_degrees,
+            )
             await asyncio.to_thread(
                 self._occupancy_grid.integrate_depth,
                 result.depth,
                 result.confidence,
                 self.config.occupancy.assumed_hfov_degrees,
                 self.config.occupancy.min_confidence,
+                self.config.occupancy.sample_stride,
                 yaw_degrees=yaw_degrees,
                 color_frame=frame,
             )

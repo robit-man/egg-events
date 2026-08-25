@@ -32,6 +32,41 @@ function cameraRingRadiusFor(maxRange) {
   return Math.max(0.6, Math.min(3.0, (maxRange || 6.0) * 0.32));
 }
 
+// Increasing the Voxel +/- control must consolidate neighboring points
+// into larger, gap-filling blocks -- not just inflate each native voxel's
+// own footprint in place, which only produces overlap and, when shrunk,
+// visible negative space between the still-native-spaced points. Cells
+// coarser than the native voxel_size_meters are re-bucketed here (color
+// averaged across every native voxel that lands in the same coarser
+// cell), so a coarser "voxel size" genuinely represents a lower-resolution
+// resampling of the same reconstruction, the way it would if the grid
+// itself were built at that resolution. Below native size there's no
+// finer data to recover, so the raw (native-resolution) list is used
+// as-is -- shrinking legitimately reveals the true sparsity there.
+function rebucketVoxels(rawVoxels, cellSize, nativeSize) {
+  if (!rawVoxels.length || cellSize <= nativeSize * 1.02) return rawVoxels;
+  const buckets = new Map();
+  for (const v of rawVoxels) {
+    const bx = Math.floor(v.x / cellSize), by = Math.floor(v.y / cellSize), bz = Math.floor(v.z / cellSize);
+    const key = `${bx}|${by}|${bz}`;
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = { x: (bx + 0.5) * cellSize, y: (by + 0.5) * cellSize, z: (bz + 0.5) * cellSize, r: 0, g: 0, b: 0, n: 0 };
+      buckets.set(key, bucket);
+    }
+    const [r, g, b] = v.color || [0x66, 0x7e, 0xa8];
+    bucket.r += r; bucket.g += g; bucket.b += b; bucket.n += 1;
+  }
+  const merged = [];
+  for (const bucket of buckets.values()) {
+    merged.push({
+      x: bucket.x, y: bucket.y, z: bucket.z,
+      color: [Math.round(bucket.r / bucket.n), Math.round(bucket.g / bucket.n), Math.round(bucket.b / bucket.n)],
+    });
+  }
+  return merged;
+}
+
 // Pure-2D-canvas compatibility renderer, used whenever no real WebGL
 // context is available at all (confirmed on real hardware: this
 // Chromium instance runs with its GPU process launched with
@@ -48,7 +83,7 @@ function initCanvasFallback(container) {
   container.replaceChildren(canvas);
   const context = canvas.getContext('2d', { alpha: false });
 
-  let voxels = [], cameras = [], voxelSizeMeters = 0.1;
+  let rawVoxels = [], voxels = [], cameras = [], voxelSizeMeters = 0.1;
   let pixelRatio = 1, width = 1, height = 1;
   let zoom = 60, panX = 0, panY = 0, yaw = 0.5, pitch = -0.25;
   let target = { x: 0, y: 0, z: 0 };
@@ -112,10 +147,15 @@ function initCanvasFallback(container) {
     zoom = Math.max(8, Math.min(400, zoom * Math.exp(-event.deltaY * 0.001)));
   }, { passive: false });
 
+  function rebucket() {
+    voxels = rebucketVoxels(rawVoxels, voxelSizeMeters * voxelScaleMultiplier, voxelSizeMeters);
+  }
+
   function applyPayload(payload) {
-    if (!payload || !payload.enabled) { voxels = []; cameras = []; return; }
-    voxels = payload.voxels || [];
+    if (!payload || !payload.enabled) { rawVoxels = []; voxels = []; cameras = []; return; }
+    rawVoxels = payload.voxels || [];
     voxelSizeMeters = payload.voxel_size_meters || 0.1;
+    rebucket();
     const radius = cameraRingRadiusFor(payload.max_range_meters);
     cameras = Object.entries(payload.cameras || {}).map(([id, info]) => {
       const yawRad = (Number(info.yaw_degrees || 0) * Math.PI) / 180;
@@ -125,12 +165,12 @@ function initCanvasFallback(container) {
         x: Math.sin(yawRad) * radius, y: 0.1, z: Math.cos(yawRad) * radius,
       };
     });
-    if (!framed && voxels.length) {
-      const n = voxels.length;
+    if (!framed && rawVoxels.length) {
+      const n = rawVoxels.length;
       target = {
-        x: voxels.reduce((sum, v) => sum + v.x, 0) / n,
-        y: voxels.reduce((sum, v) => sum + v.y, 0) / n,
-        z: voxels.reduce((sum, v) => sum + v.z, 0) / n,
+        x: rawVoxels.reduce((sum, v) => sum + v.x, 0) / n,
+        y: rawVoxels.reduce((sum, v) => sum + v.y, 0) / n,
+        z: rawVoxels.reduce((sum, v) => sum + v.z, 0) / n,
       };
       framed = true;
     }
@@ -216,6 +256,7 @@ function initCanvasFallback(container) {
   window.addEventListener('egg:occupancy-reset', () => {
     target = { x: 0, y: 0, z: 0 }; yaw = 0.5; pitch = -0.25; zoom = 60; panX = 0; panY = 0; framed = false;
   });
+  window.addEventListener('egg:occupancy-voxel-scale', () => rebucket());
   window.dispatchEvent(new CustomEvent('egg:occupancy-renderer', { detail: { mode: 'canvas-2d' } }));
   render();
 }
@@ -249,7 +290,10 @@ if (container) {
   function renderVoxels(voxels, voxelSize) {
     if (voxelMesh) { scene.remove(voxelMesh); voxelMesh.geometry.dispose(); voxelMesh = null; }
     if (!voxels.length) return;
-    const size = Math.max(voxelSize, 0.01) * voxelScaleMultiplier;
+    // voxelSize is already the fully-resolved cell size (native size *
+    // voxelScaleMultiplier, applied by the caller before rebucketing) --
+    // do not multiply by voxelScaleMultiplier again here.
+    const size = Math.max(voxelSize, 0.01);
     voxelMesh = new THREE.InstancedMesh(voxelGeometry, voxelMaterial, voxels.length);
     voxelMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(voxels.length * 3), 3);
     voxels.forEach((voxel, index) => {
@@ -387,7 +431,9 @@ if (container) {
       clearCameraMarkers();
       return;
     }
-    renderVoxels(payload.voxels || [], payload.voxel_size_meters || 0.1);
+    const nativeSize = payload.voxel_size_meters || 0.1;
+    const cellSize = nativeSize * voxelScaleMultiplier;
+    renderVoxels(rebucketVoxels(payload.voxels || [], cellSize, nativeSize), cellSize);
     renderCameraMarkers(payload.cameras || {}, payload.max_range_meters);
     renderRangeWireframe(payload.max_range_meters);
     if (!framedOnce) fitCameraToScene(payload);
@@ -483,7 +529,10 @@ if (container) {
     controls.update();
   });
   window.addEventListener('egg:occupancy-voxel-scale', () => {
-    if (scene && lastPayload) renderVoxels(lastPayload.voxels || [], lastPayload.voxel_size_meters || 0.1);
+    if (!scene || !lastPayload) return;
+    const nativeSize = lastPayload.voxel_size_meters || 0.1;
+    const cellSize = nativeSize * voxelScaleMultiplier;
+    renderVoxels(rebucketVoxels(lastPayload.voxels || [], cellSize, nativeSize), cellSize);
   });
   window.addEventListener('egg:vision-activate', activate);
   window.addEventListener('egg:vision-deactivate', deactivate);

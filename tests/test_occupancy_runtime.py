@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 
 import numpy as np
+import pytest
 
 from egg_companion.adapters.depth import DepthResult
 from egg_companion.config import EggConfig
@@ -191,3 +192,80 @@ class TestOccupancyCycle:
         # Only the camera actually integrated this cycle gets an
         # updated timestamp -- the other stays due for the next cycle.
         assert len(runtime._occupancy_last_update) == 1
+
+    def test_sample_stride_is_read_live_from_config_each_cycle(self, tmp_path) -> None:
+        """A denser sample_stride must actually integrate more points --
+        this is the whole point of the Resolution +/- dashboard control,
+        wired through config.occupancy.sample_stride rather than the
+        integrate_depth() default that used to be silently hardcoded."""
+        runtime, _ = _runtime(tmp_path / "a")
+        runtime.config.occupancy.sample_stride = 1
+        runtime._depth_estimator = _FakeDepthEstimator(
+            DepthResult(depth=np.full((16, 16), 2.0, dtype=np.float32), confidence=None, model="fake")
+        )
+        runtime._latest_frames["camera-video1"] = (
+            np.zeros((16, 16, 3), dtype=np.uint8), 0.0,
+        )
+
+        asyncio.run(runtime._run_occupancy_cycle())
+        dense_voxel_count = len(runtime._occupancy_grid)
+
+        runtime2, _ = _runtime(tmp_path / "b")
+        runtime2.config.occupancy.sample_stride = 8
+        runtime2._depth_estimator = _FakeDepthEstimator(
+            DepthResult(depth=np.full((16, 16), 2.0, dtype=np.float32), confidence=None, model="fake")
+        )
+        runtime2._latest_frames["camera-video1"] = (
+            np.zeros((16, 16, 3), dtype=np.uint8), 0.0,
+        )
+        asyncio.run(runtime2._run_occupancy_cycle())
+        coarse_voxel_count = len(runtime2._occupancy_grid)
+
+        assert dense_voxel_count > coarse_voxel_count
+
+    def test_yaw_auto_computed_from_live_camera_set_not_hardcoded(self, tmp_path) -> None:
+        """A camera beyond the physically-mounted 4 (e.g. camera-video4)
+        must still integrate with a correctly auto-computed yaw, not
+        silently default to yaw=0 for lack of a hardcoded mapping entry."""
+        runtime, _ = _runtime(tmp_path)
+        runtime._depth_estimator = _FakeDepthEstimator(_fake_depth_result())
+        for camera_id in ("camera-video0", "camera-video1", "camera-video2", "camera-video3", "camera-video4"):
+            runtime._latest_frames[camera_id] = (np.zeros((10, 10, 3), dtype=np.uint8), 0.0)
+
+        # Drain the queue until camera-video4 gets its turn.
+        seen = set()
+        for _ in range(10):
+            result = asyncio.run(runtime._run_occupancy_cycle())
+            if result:
+                seen.add(result)
+            if "camera-video4" in seen:
+                break
+
+        assert "camera-video4" in seen
+        snapshot = runtime.occupancy_snapshot()
+        assert snapshot["camera_yaw_degrees"]["camera-video4"] == pytest.approx(120.0)
+
+
+class TestOccupancySnapshot:
+    def test_includes_sample_stride_and_dynamic_camera_yaw(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        runtime.config.occupancy.sample_stride = 4
+        runtime._latest_frames["camera-video0"] = (np.zeros((4, 4, 3), dtype=np.uint8), 0.0)
+        runtime._latest_frames["camera-video1"] = (np.zeros((4, 4, 3), dtype=np.uint8), 0.0)
+
+        snapshot = runtime.occupancy_snapshot()
+
+        assert snapshot["sample_stride"] == 4
+        assert snapshot["camera_yaw_degrees"]["camera-video0"] == pytest.approx(-30.0)
+        assert snapshot["camera_yaw_degrees"]["camera-video1"] == pytest.approx(30.0)
+
+
+class TestUpdateOccupancyResolution:
+    def test_applies_and_clamps_sample_stride(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+
+        assert runtime.update_occupancy_resolution(3) == 3
+        assert runtime.config.occupancy.sample_stride == 3
+
+        assert runtime.update_occupancy_resolution(0) == 1  # clamped to minimum
+        assert runtime.update_occupancy_resolution(999) == 32  # clamped to maximum

@@ -38,11 +38,52 @@ sigmoid p = 1 / (1 + exp(-log_odds)).
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
+
+_CAMERA_INDEX_PATTERN = re.compile(r"(\d+)\s*$")
+
+
+def _camera_sort_key(camera_id: str) -> tuple[int, str]:
+    match = _CAMERA_INDEX_PATTERN.search(camera_id)
+    return (int(match.group(1)) if match else 0, camera_id)
+
+
+def resolve_camera_yaw_degrees(
+    camera_id: str,
+    known_camera_ids: Iterable[str],
+    spacing_degrees: float,
+    overrides: dict[str, float] | None = None,
+) -> float:
+    """Yaw for camera_id within the shared panoramic-array frame.
+
+    An explicit entry in `overrides` (config.OccupancyConfig.
+    camera_yaw_degrees) always wins. Otherwise this is computed from
+    camera_id's parsed trailing index among every camera currently known
+    (known_camera_ids -- e.g. runtime._latest_frames.keys(), the live
+    discovered set), evenly spaced by spacing_degrees and centered on the
+    array's midpoint. This is why the rig doesn't need a hardcoded
+    per-camera-count mapping: a camera-video4/video5 discovered later is
+    automatically placed at its evenly-spaced position, and because the
+    center recomputes from however many cameras are currently known, the
+    existing cameras' yaw shifts too if the array actually grows -- the
+    default 4-camera formula already reproduces the original
+    -90/-30/30/90 mapping exactly (N=4, spacing=60), so this changes
+    nothing for the array as currently mounted.
+    """
+    if overrides and camera_id in overrides:
+        return overrides[camera_id]
+    sorted_ids = sorted(set(known_camera_ids), key=_camera_sort_key)
+    if camera_id not in sorted_ids:
+        return 0.0
+    index = sorted_ids.index(camera_id)
+    center = (len(sorted_ids) - 1) / 2.0
+    return (index - center) * spacing_degrees
 
 # Bounds keep any single voxel's log-odds from saturating to certainty
 # after many observations, so a real change in the environment can still

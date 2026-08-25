@@ -63,6 +63,7 @@ global.fetch = async (url) => {
 const $ = (selector, root = document) => root.querySelector(selector);
 const esc = value => String(value ?? '');
 let occupancyLoadedAt = 0;
+let currentSampleStride = 8;
 
 __LOAD_OCCUPANCY_SOURCE__
 

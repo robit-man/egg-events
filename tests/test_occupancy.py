@@ -23,6 +23,7 @@ from egg_companion.core.occupancy import (
     OCCUPIED_LOG_ODDS_THRESHOLD,
     VoxelGrid,
     log_odds_to_probability,
+    resolve_camera_yaw_degrees,
 )
 
 
@@ -386,3 +387,38 @@ class TestConcurrentReadDuringIntegration:
             writer_thread.join(timeout=5)
 
         assert errors == []
+
+
+class TestResolveCameraYawDegrees:
+    """The physically-mounted 4-camera rig must never need a hardcoded
+    per-camera-count mapping -- yaw is auto-computed from each camera's
+    parsed trailing index among whatever cameras are currently known,
+    evenly spaced and centered on the array midpoint, so a camera added
+    later (video4, video5, ...) is automatically placed correctly."""
+
+    def test_four_camera_default_reproduces_the_physically_mounted_spacing(self) -> None:
+        known = ["camera-video0", "camera-video1", "camera-video2", "camera-video3"]
+        assert resolve_camera_yaw_degrees("camera-video0", known, 60.0) == pytest.approx(-90.0)
+        assert resolve_camera_yaw_degrees("camera-video1", known, 60.0) == pytest.approx(-30.0)
+        assert resolve_camera_yaw_degrees("camera-video2", known, 60.0) == pytest.approx(30.0)
+        assert resolve_camera_yaw_degrees("camera-video3", known, 60.0) == pytest.approx(90.0)
+
+    def test_a_fifth_camera_is_automatically_placed_and_recenters_the_array(self) -> None:
+        known = ["camera-video0", "camera-video1", "camera-video2", "camera-video3", "camera-video4"]
+        # N=5, spacing=60: centered on index 2 -> -120,-60,0,60,120.
+        assert resolve_camera_yaw_degrees("camera-video0", known, 60.0) == pytest.approx(-120.0)
+        assert resolve_camera_yaw_degrees("camera-video2", known, 60.0) == pytest.approx(0.0)
+        assert resolve_camera_yaw_degrees("camera-video4", known, 60.0) == pytest.approx(120.0)
+
+    def test_unknown_camera_id_defaults_to_zero(self) -> None:
+        assert resolve_camera_yaw_degrees("camera-video9", ["camera-video0"], 60.0) == 0.0
+
+    def test_explicit_override_wins_over_auto_computation(self) -> None:
+        known = ["camera-video0", "camera-video1"]
+        overrides = {"camera-video0": -45.0}
+        assert resolve_camera_yaw_degrees("camera-video0", known, 60.0, overrides) == -45.0
+        # The un-overridden camera still gets the auto-computed value.
+        assert resolve_camera_yaw_degrees("camera-video1", known, 60.0, overrides) == pytest.approx(30.0)
+
+    def test_single_camera_is_centered_at_zero(self) -> None:
+        assert resolve_camera_yaw_degrees("camera-video0", ["camera-video0"], 60.0) == 0.0

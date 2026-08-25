@@ -118,6 +118,7 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
                 "/api/memory/export/{entity_id}",
                 "/api/cognition/state",
                 "/api/occupancy",
+                "/api/occupancy/resolution",
             } <= paths
             assert "/assets" in paths
         finally:
@@ -177,7 +178,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'data-graph-kind="world_model"' in dashboard.PAGE
     assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
     assert 'id="occupancy-scene"' in dashboard.PAGE
-    assert 'src="/assets/occupancy_scene.js?v=20260825c"' in dashboard.PAGE
+    assert 'src="/assets/occupancy_scene.js?v=20260825d"' in dashboard.PAGE
     assert "egg:occupancy-data" in dashboard.PAGE
     assert "loadOccupancy" in dashboard.PAGE
     assert 'id="occupancy-voxel-scale-up"' in dashboard.PAGE
@@ -294,6 +295,38 @@ def test_occupancy_scene_camera_array_reads_left_to_right_on_screen() -> None:
     assert "tmpMatrix.setPosition(-voxel.x, voxel.y, voxel.z)" in occupancy_source
     assert "const x = -Math.sin(yaw) * radius" in occupancy_source
     assert "yaw = drag.yaw + dx * 0.007" in occupancy_source
+
+
+def test_occupancy_scene_increasing_voxel_size_rebuckets_instead_of_producing_gaps() -> None:
+    """Increasing the Voxel +/- control must merge neighboring native
+    voxels into larger, gap-filling blocks (client-side rebucketing at
+    the coarser effective cell size), not just inflate each native
+    voxel's own footprint in place -- which only produces overlap when
+    enlarged and visible negative space between unmoved points when
+    shrunk. Both render paths (WebGL and the 2D canvas fallback) must
+    use the shared rebucketVoxels() helper rather than rendering the raw
+    per-voxel list directly at a scaled size."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "function rebucketVoxels(rawVoxels, cellSize, nativeSize)" in occupancy_source
+    assert "Math.floor(v.x / cellSize)" in occupancy_source
+    assert "renderVoxels(rebucketVoxels(payload.voxels || [], cellSize, nativeSize), cellSize)" in occupancy_source
+    assert "voxels = rebucketVoxels(rawVoxels, voxelSizeMeters * voxelScaleMultiplier, voxelSizeMeters)" in occupancy_source
+
+
+def test_occupancy_scene_resolution_control_exists_next_to_voxel_size() -> None:
+    """A separate Resolution +/- control (backend sample_stride, how many
+    of DA3's actual per-frame depth points get processed into voxels)
+    must exist next to the client-side Voxel +/- display-scale control,
+    PUTting to /api/occupancy/resolution rather than only adjusting the
+    already-fetched voxel list."""
+    assert 'id="occupancy-resolution-up"' in dashboard.PAGE
+    assert 'id="occupancy-resolution-down"' in dashboard.PAGE
+    assert "/api/occupancy/resolution" in dashboard.PAGE
+    assert "adjustOccupancyResolution" in dashboard.PAGE
+    assert "currentSampleStride" in dashboard.PAGE
 
 
 def test_occupancy_scene_auto_frames_camera_on_real_voxel_data() -> None:

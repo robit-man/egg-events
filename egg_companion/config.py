@@ -320,23 +320,6 @@ class OcrConfig(BaseModel):
     backfill: OcrBackfillConfig = Field(default_factory=OcrBackfillConfig)
 
 
-def _default_camera_yaw_degrees() -> dict[str, float]:
-    # The four cameras are a co-located panoramic rig, not independent
-    # viewpoints: video0 mounted farthest right, sweeping counter-clockwise
-    # through video1/video2/video3 at ~60-degree increments so adjacent
-    # fields of view stitch together (per the physical mounting -- not
-    # independently measured/verified, hence fully overridable here).
-    # Modeled as pure yaw about a shared optical center spanning a 180-
-    # degree forward arc, boresight to boresight: video0=-90 (rightmost)
-    # ... video3=+90 (leftmost), positive = counter-clockwise from above.
-    return {
-        "camera-video0": -90.0,
-        "camera-video1": -30.0,
-        "camera-video2": 30.0,
-        "camera-video3": 90.0,
-    }
-
-
 class OccupancyConfig(BaseModel):
     """Fused voxel occupancy mapping via on-demand monocular metric depth.
 
@@ -383,13 +366,27 @@ class OccupancyConfig(BaseModel):
     # 60 degrees the array is described as stitching at, since adjacent
     # cameras' edges meeting implies each one's own FOV is close to that.
     assumed_hfov_degrees: float = Field(default=60.0, ge=20.0, le=170.0)
-    # camera_id -> yaw in degrees within the shared array frame (positive =
-    # counter-clockwise from above). Cameras with no entry here (e.g. a
-    # newly discovered /dev/videoN not yet in the array) are treated as
-    # yaw=0 -- their depth still integrates, just not correctly positioned
-    # relative to the rest of the array, so it's worth keeping this
-    # up to date with the real physical mounting.
-    camera_yaw_degrees: dict[str, float] = Field(default_factory=_default_camera_yaw_degrees)
+    # Degrees between adjacent cameras in the array, positive = counter-
+    # clockwise from above. Every camera's yaw is auto-computed from its
+    # parsed trailing index among whatever cameras are currently live
+    # (see core/occupancy.py's resolve_camera_yaw_degrees), evenly spaced
+    # by this and centered on the array midpoint -- so a camera-video4/
+    # video5 discovered later is automatically placed, and the whole
+    # array recenters correctly rather than defaulting new cameras to
+    # yaw=0 or needing a hardcoded per-camera-count mapping. The default
+    # (60.0) reproduces the physically-mounted 4-camera rig's exact
+    # -90/-30/30/90 spacing for N=4, so this changes no existing behavior.
+    camera_array_spacing_degrees: float = Field(default=60.0, ge=1.0, le=180.0)
+    # camera_id -> yaw in degrees: an explicit override for a specific
+    # camera, taking priority over the auto-computed value above (e.g. if
+    # the real mounting isn't perfectly evenly spaced). Empty by default.
+    camera_yaw_degrees: dict[str, float] = Field(default_factory=dict)
+    # Every Nth depth-map pixel (in both row and column) gets back-
+    # projected into a voxel per integration cycle -- lower means more of
+    # DA3's actual per-frame points get used (denser reconstruction, more
+    # CPU per cycle), higher means fewer (coarser, cheaper). Adjustable
+    # live from the dashboard's Resolution +/- control.
+    sample_stride: int = Field(default=8, ge=1, le=32)
     max_voxels: int = Field(default=60_000, ge=1_000, le=1_000_000)
     stale_after_seconds: float = Field(default=1800.0, ge=60.0, le=86400.0)
 
