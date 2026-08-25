@@ -8,6 +8,9 @@ a ~4GB model load and a sibling project's venv.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -291,3 +294,50 @@ class TestSummarize:
         assert summary["nearest_occupied_meters"] <= 2.5
         assert "center" in summary["sectors"]
         assert "nearest occupied surface" in grid.summary_text()
+
+
+class TestConcurrentReadDuringIntegration:
+    """The dashboard's /api/occupancy handler runs on the asyncio event
+    loop thread and calls occupied_count()/free_count()/occupied_voxels()/
+    summarize() while integrate_depth() runs concurrently in a background
+    thread (runtime.py wraps it in asyncio.to_thread) -- observed in
+    production: 'RuntimeError: dictionary changed size during iteration'
+    when a snapshot read raced a live mutation of self._voxels."""
+
+    def test_reads_do_not_raise_while_writer_thread_mutates_concurrently(
+        self,
+    ) -> None:
+        grid = VoxelGrid(voxel_size_meters=0.05, max_range_meters=10.0, max_voxels=2000)
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            depth = _flat_depth(64, 64, value=2.0)
+            while not stop.is_set():
+                try:
+                    grid.integrate_depth(
+                        depth, confidence=None, horizontal_fov_degrees=90.0,
+                        sample_stride=1, ray_steps=6,
+                    )
+                except BaseException as error:  # noqa: BLE001
+                    errors.append(error)
+                    return
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        try:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    grid.occupied_count()
+                    grid.free_count()
+                    grid.occupied_voxels()
+                    grid.summarize()
+                except BaseException as error:  # noqa: BLE001
+                    errors.append(error)
+                    break
+        finally:
+            stop.set()
+            writer_thread.join(timeout=5)
+
+        assert errors == []

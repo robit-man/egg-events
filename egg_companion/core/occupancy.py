@@ -208,7 +208,7 @@ class VoxelGrid:
     def prune_stale(self, stale_after_seconds: float, now: float | None = None) -> int:
         now = now if now is not None else time.monotonic()
         stale_keys = [
-            key for key, record in self._voxels.items()
+            key for key, record in list(self._voxels.items())
             if now - record.last_seen > stale_after_seconds
         ]
         for key in stale_keys:
@@ -216,14 +216,20 @@ class VoxelGrid:
         return len(stale_keys)
 
     def occupied_count(self) -> int:
+        # integrate_depth() runs in a background thread (asyncio.to_thread)
+        # while the dashboard's /api/occupancy handler calls these read
+        # methods on the event loop thread -- iterating self._voxels
+        # directly here race with concurrent inserts/evictions there and
+        # raise "RuntimeError: dictionary changed size during iteration"
+        # (observed in production). list(...) snapshots before filtering.
         return sum(
-            1 for record in self._voxels.values()
+            1 for record in list(self._voxels.values())
             if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
         )
 
     def free_count(self) -> int:
         return sum(
-            1 for record in self._voxels.values()
+            1 for record in list(self._voxels.values())
             if record.log_odds < FREE_LOG_ODDS_THRESHOLD
         )
 
@@ -240,7 +246,7 @@ class VoxelGrid:
                 "z": round((iz + 0.5) * self.voxel_size, 3),
                 "confidence": round(log_odds_to_probability(record.log_odds), 3),
             }
-            for (ix, iy, iz), record in self._voxels.items()
+            for (ix, iy, iz), record in list(self._voxels.items())
             if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
         ]
 
@@ -251,7 +257,7 @@ class VoxelGrid:
         only; height (Y) is not summarized separately."""
         occupied = [
             (key, math.hypot(key[0] * self.voxel_size, key[2] * self.voxel_size))
-            for key, record in self._voxels.items()
+            for key, record in list(self._voxels.items())
             if record.log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
         ]
         if not occupied:

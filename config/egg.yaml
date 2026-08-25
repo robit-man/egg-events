@@ -349,4 +349,4 @@ runtime:
   log_level: INFO
 
 occupancy:
-  enabled: false
+  enabled: true
