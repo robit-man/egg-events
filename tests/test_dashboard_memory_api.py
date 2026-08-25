@@ -177,7 +177,7 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'data-graph-kind="world_model"' in dashboard.PAGE
     assert "Hover to isolate · click to lock the filter" in dashboard.PAGE
     assert 'id="occupancy-scene"' in dashboard.PAGE
-    assert 'src="/assets/occupancy_scene.js?v=20260824f"' in dashboard.PAGE
+    assert 'src="/assets/occupancy_scene.js?v=20260824g"' in dashboard.PAGE
     assert "egg:occupancy-data" in dashboard.PAGE
     assert "loadOccupancy" in dashboard.PAGE
 
@@ -237,6 +237,31 @@ def test_occupancy_scene_auto_frames_camera_on_real_voxel_data() -> None:
     assert "fitCameraToScene" in occupancy_source
     assert "Box3" in occupancy_source
     assert "framedOnce" in occupancy_source
+
+
+def test_occupancy_scene_falls_back_to_2d_canvas_when_no_webgl_exists_anywhere() -> None:
+    """Confirmed on real hardware (browser console log): knowledge_graph.js's
+    own WebGLRenderer construction fails identically to occupancy_scene.js's
+    borrowed-renderer attempt ("GL_VENDOR = Disabled ... BindToCurrentSequence
+    failed") because this Chromium instance's GPU process is launched with
+    --use-gl=disabled -- a real, deterministic condition (likely a
+    GPU-less remote-desktop/X11 session), not a transient failure. When no
+    live WebGL context exists anywhere on the page, occupancy_scene.js
+    must render via a pure 2D canvas (mirroring knowledge_graph.js's own
+    proven initCanvasFallback technique) rather than leaving the /vision
+    page permanently inert."""
+    occupancy_source = (
+        dashboard.Path(dashboard.__file__).with_name("vendor") / "occupancy_scene.js"
+    ).read_text()
+
+    assert "function initCanvasFallback(container)" in occupancy_source
+    assert "getContext('2d'" in occupancy_source
+    assert "fallbackActive = true" in occupancy_source
+    assert "initCanvasFallback(container)" in occupancy_source
+    # Same rotation/projection technique as knowledge_graph.js's own fallback.
+    assert "Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch)" in occupancy_source
+    assert "drawImage" in occupancy_source
+    assert "raw.jpg" in occupancy_source
 
 
 def test_graph_horizontal_orbit_is_flipped_in_webgl_and_canvas_renderers() -> None:
