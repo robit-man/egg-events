@@ -1243,7 +1243,6 @@ PAGE = r"""<!doctype html>
         $('#world-metric-relations-detail').textContent = topRel ? `top: ${topRel[0]} ×${topRel[1]}` : 'No relation types';
         $('#world-metric-conflicts').textContent = conflictCount;
         $('#world-metric-conflicts-detail').textContent = conflictCount ? `${conflictCount} unresolved` : 'No conflicts';
-        $('#world-metric-conflicts').parentElement.querySelector('.metric-card, .card').className = `card metric-card span-3${conflictCount ? '' : ''}`;
         $('#world-metric-revision').textContent = revision;
         $('#world-metric-revision-detail').textContent = revision ? `Version ${revision}` : 'Not yet revised';
         $('#world-conflicts').innerHTML = conflicts.length
