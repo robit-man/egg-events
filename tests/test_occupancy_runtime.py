@@ -64,6 +64,8 @@ def _runtime(tmp_path):
     runtime._occupancy_base_stride = config.occupancy.sample_stride
     runtime._occupancy_base_voxel_size_meters = config.occupancy.voxel_size_meters
     runtime._occupancy_last_update = {}
+    runtime._occupancy_previous_grid = None
+    runtime._occupancy_previous_grid_since = 0.0
     return runtime, pipeline
 
 
@@ -354,3 +356,87 @@ class TestUpdateOccupancyResolution:
         assert runtime._occupancy_grid is not old_grid
         assert len(runtime._occupancy_grid) == 0
         assert runtime._occupancy_last_update == {}
+
+    def test_keeps_the_old_grid_as_a_fallback_for_the_dashboard(self, tmp_path) -> None:
+        """The fresh grid a resolution change starts is empty until
+        cameras re-integrate over the next several cycles -- the old
+        (occupied) grid must be kept as a fallback rather than discarded,
+        so occupancy_snapshot() has something real to serve in the
+        meantime instead of blanking the dashboard's 3D view."""
+        runtime, _ = _runtime(tmp_path)
+        runtime._occupancy_grid.integrate_depth(
+            np.full((8, 8), 2.0, dtype=np.float32), None, 60.0, sample_stride=1,
+        )
+        old_grid = runtime._occupancy_grid
+
+        runtime.update_occupancy_resolution(4)
+
+        assert runtime._occupancy_previous_grid is old_grid
+
+    def test_does_not_keep_an_already_empty_grid_as_a_fallback(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+
+        runtime.update_occupancy_resolution(4)
+
+        assert runtime._occupancy_previous_grid is None
+
+
+class TestOccupancySnapshotPreviousGridFallback:
+    """occupancy_snapshot() must bridge a resolution change's empty new
+    grid with the previous (occupied) one, rather than the dashboard
+    seeing zero voxels until the new grid repopulates."""
+
+    def test_serves_the_previous_grid_while_the_new_one_is_still_empty(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        runtime._occupancy_grid.integrate_depth(
+            np.full((8, 8), 2.0, dtype=np.float32), None, 60.0, sample_stride=1,
+        )
+        expected_voxels = runtime._occupancy_grid.occupied_voxels()
+        expected_voxel_size = runtime._occupancy_grid.voxel_size
+
+        runtime.update_occupancy_resolution(4)
+        snapshot = runtime.occupancy_snapshot()
+
+        assert snapshot["voxels"] == expected_voxels
+        assert snapshot["voxel_size_meters"] == pytest.approx(expected_voxel_size)
+        assert snapshot["occupied_count"] == len(expected_voxels)
+
+    def test_switches_over_once_the_new_grid_has_real_content(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        runtime._occupancy_grid.integrate_depth(
+            np.full((8, 8), 2.0, dtype=np.float32), None, 60.0, sample_stride=1,
+        )
+        runtime.update_occupancy_resolution(4)
+        assert runtime.occupancy_snapshot()["voxels"]  # still serving the old grid
+
+        runtime._occupancy_grid.integrate_depth(
+            np.full((8, 8), 3.0, dtype=np.float32), None, 60.0, sample_stride=1,
+        )
+        snapshot = runtime.occupancy_snapshot()
+
+        assert snapshot["voxel_size_meters"] == pytest.approx(runtime._occupancy_grid.voxel_size)
+        assert snapshot["voxels"] == runtime._occupancy_grid.occupied_voxels()
+        assert runtime._occupancy_previous_grid is None  # dropped once real data exists
+
+    def test_stops_falling_back_once_the_previous_grid_goes_stale(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+        runtime.config.occupancy.stale_after_seconds = 60.0
+        runtime._occupancy_grid.integrate_depth(
+            np.full((8, 8), 2.0, dtype=np.float32), None, 60.0, sample_stride=1,
+        )
+        runtime.update_occupancy_resolution(4)
+        assert runtime.occupancy_snapshot()["voxels"]  # fresh fallback still served
+
+        runtime._occupancy_previous_grid_since = time.monotonic() - 61.0
+        snapshot = runtime.occupancy_snapshot()
+
+        assert snapshot["voxels"] == []
+        assert runtime._occupancy_previous_grid is None
+
+    def test_no_fallback_when_there_was_never_a_previous_grid(self, tmp_path) -> None:
+        runtime, _ = _runtime(tmp_path)
+
+        snapshot = runtime.occupancy_snapshot()
+
+        assert snapshot["voxels"] == []
+        assert snapshot["voxel_size_meters"] == pytest.approx(runtime.config.occupancy.voxel_size_meters)

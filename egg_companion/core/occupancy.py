@@ -276,7 +276,17 @@ class VoxelGrid:
                 # yaw. Rotation is linear about the shared origin, so the
                 # ray-marched intermediate points below can just scale this
                 # already-rotated point by t rather than re-rotating each step.
-                x_cam = (col - cx) * z_cam / fx
+                #
+                # x_cam is (cx - col), not (col - cx): confirmed on real
+                # hardware that each camera's own reconstruction was
+                # mirrored left-right internally (an object to the left in
+                # the actual frame back-projected to the right of that
+                # camera's boresight, and vice versa) even though the
+                # cross-camera yaw arrangement -- and therefore the array's
+                # overall left-to-right order -- was already correct. This
+                # flips only the per-camera-local left/right sense before
+                # the yaw rotation below, leaving that arrangement untouched.
+                x_cam = (cx - col) * z_cam / fx
                 y_cam = -(row - cy) * z_cam / fy
                 x = x_cam * cos_yaw + z_cam * sin_yaw
                 y = y_cam

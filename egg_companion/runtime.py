@@ -373,6 +373,14 @@ class CompanionRuntime:
         self._occupancy_base_stride = config.occupancy.sample_stride
         self._occupancy_base_voxel_size_meters = config.occupancy.voxel_size_meters
         self._occupancy_last_update: dict[str, float] = {}
+        # Held onto only across a resolution change (see
+        # update_occupancy_resolution): the fresh grid it starts is empty
+        # until cameras re-integrate over the next several cycles, and
+        # serving that empty grid in the meantime would blank the
+        # dashboard's 3D view for however long a full sweep takes rather
+        # than seamlessly handing off once real replacement data exists.
+        self._occupancy_previous_grid: VoxelGrid | None = None
+        self._occupancy_previous_grid_since = 0.0
         self._record_voice_transition("runtime_initialized")
 
     async def update_voice_config(
@@ -429,7 +437,11 @@ class CompanionRuntime:
         Because existing voxel indices are keyed to the *old* voxel size,
         keeping them around under a new size would decode to the wrong
         world position, so this starts a fresh grid rather than mixing
-        differently-scaled voxels together.
+        differently-scaled voxels together. The old grid isn't discarded
+        outright, though: occupancy_snapshot() keeps serving it (see
+        _occupancy_previous_grid) until the new one has real content of
+        its own, so the dashboard's 3D view doesn't go blank for however
+        long a full multi-camera sweep at the new resolution takes.
 
         Every camera is also marked due again immediately (instead of
         waiting up to occupancy.update_interval_seconds -- several
@@ -448,6 +460,9 @@ class CompanionRuntime:
             self._occupancy_base_voxel_size_meters,
         )
         self.config.occupancy.voxel_size_meters = voxel_size_meters
+        if self._occupancy_grid.occupied_count() > 0:
+            self._occupancy_previous_grid = self._occupancy_grid
+            self._occupancy_previous_grid_since = time.monotonic()
         self._occupancy_grid = VoxelGrid(
             voxel_size_meters=voxel_size_meters,
             max_range_meters=self.config.occupancy.max_range_meters,
@@ -485,15 +500,32 @@ class CompanionRuntime:
             )
             for camera_id in known_camera_ids
         }
+        # A resolution change starts a fresh, empty grid (see
+        # update_occupancy_resolution) -- serve the previous grid instead
+        # of that emptiness until the new one has real content of its
+        # own, so the dashboard's 3D view doesn't blank out for however
+        # long a full multi-camera sweep at the new resolution takes.
+        # Bounded by stale_after_seconds so a resolution change that never
+        # repopulates (occupancy disabled mid-sweep, depth failing, ...)
+        # doesn't serve indefinitely-stale data forever.
+        active_grid = self._occupancy_grid
+        if (
+            active_grid.occupied_count() == 0
+            and self._occupancy_previous_grid is not None
+            and now - self._occupancy_previous_grid_since < self.config.occupancy.stale_after_seconds
+        ):
+            active_grid = self._occupancy_previous_grid
+        else:
+            self._occupancy_previous_grid = None
         return {
             "enabled": self.config.occupancy.enabled,
-            "voxel_size_meters": self.config.occupancy.voxel_size_meters,
+            "voxel_size_meters": active_grid.voxel_size,
             "max_range_meters": self.config.occupancy.max_range_meters,
             "sample_stride": self.config.occupancy.sample_stride,
             "camera_yaw_degrees": yaw_by_camera,
-            "voxels": self._occupancy_grid.occupied_voxels(),
-            "occupied_count": self._occupancy_grid.occupied_count(),
-            "free_count": self._occupancy_grid.free_count(),
+            "voxels": active_grid.occupied_voxels(),
+            "occupied_count": active_grid.occupied_count(),
+            "free_count": active_grid.free_count(),
             "cameras": {
                 camera_id: {
                     "age_seconds": round(now - last_update, 1),

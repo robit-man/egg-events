@@ -32,6 +32,16 @@ def _flat_depth(height: int, width: int, value: float) -> np.ndarray:
     return np.full((height, width), value, dtype=np.float32)
 
 
+def _center_pixel_depth(height: int, width: int, value: float) -> np.ndarray:
+    """A depth map valid at exactly the center pixel, everything else
+    zero/invalid -- a literal single ray straight down the camera's own
+    boresight, unambiguous regardless of the camera-local left/right
+    sign convention (the center column always projects to x=0)."""
+    depth = np.zeros((height, width), dtype=np.float32)
+    depth[height // 2, width // 2] = value
+    return depth
+
+
 class TestIntegrateDepth:
     def test_flat_surface_marks_occupied_voxel_at_expected_depth(self) -> None:
         grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
@@ -74,20 +84,20 @@ class TestIntegrateDepth:
         while still being able to flip given enough accumulated evidence
         (see the eventually-clears test below)."""
         grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
-        # First pass: something at z=1 (close), marking that voxel occupied.
+        # First pass: a single ray at z=1 (close), marking that voxel occupied.
         grid.integrate_depth(
-            _flat_depth(8, 8, value=1.0), confidence=None,
-            horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=4,
+            _center_pixel_depth(8, 8, value=1.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=1, ray_steps=4,
         )
         occupied_index = (0, 0, 1)
         assert grid.is_occupied(occupied_index) is True
 
-        # Second pass: something farther away (z=5) whose ray passes
-        # through the same near voxel -- a single contrary observation
-        # must not erase strong occupied evidence.
+        # Second pass: the same single ray now reads farther away (z=5)
+        # and passes through the same near voxel on its way there -- one
+        # contrary observation must not erase strong occupied evidence.
         grid.integrate_depth(
-            _flat_depth(8, 8, value=5.0), confidence=None,
-            horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=20,
+            _center_pixel_depth(8, 8, value=5.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=1, ray_steps=20,
         )
         assert grid.is_occupied(occupied_index) is True
 
@@ -97,16 +107,16 @@ class TestIntegrateDepth:
         flip its classification -- e.g. an object that moves away."""
         grid = VoxelGrid(voxel_size_meters=1.0, max_range_meters=10.0, max_voxels=10_000)
         grid.integrate_depth(
-            _flat_depth(8, 8, value=1.0), confidence=None,
-            horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=4,
+            _center_pixel_depth(8, 8, value=1.0), confidence=None,
+            horizontal_fov_degrees=90.0, sample_stride=1, ray_steps=4,
         )
         occupied_index = (0, 0, 1)
         assert grid.is_occupied(occupied_index) is True
 
         for _ in range(10):
             grid.integrate_depth(
-                _flat_depth(8, 8, value=5.0), confidence=None,
-                horizontal_fov_degrees=90.0, sample_stride=2, ray_steps=20,
+                _center_pixel_depth(8, 8, value=5.0), confidence=None,
+                horizontal_fov_degrees=90.0, sample_stride=1, ray_steps=20,
             )
         assert grid.is_occupied(occupied_index) is False
 
@@ -185,6 +195,48 @@ class TestIntegrateDepth:
         grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
         depth_3d = np.zeros((4, 4, 3), dtype=np.float32)
         assert grid.integrate_depth(depth_3d, None, 90.0) == 0
+
+
+class TestIntegrateDepthLeftRightOrientation:
+    """Regression test for a real mirroring bug found on hardware: each
+    camera's own reconstruction was flipped left-right internally (a
+    surface visible on the left side of the actual captured frame was
+    back-projected to the right of that camera's own boresight, and vice
+    versa) even though the cross-camera yaw arrangement -- and therefore
+    the array's overall left-to-right order -- was already correct.
+    x_cam must be derived as (cx - col), not (col - cx)."""
+
+    def test_a_surface_only_in_the_right_half_of_the_frame_projects_to_negative_x(
+        self,
+    ) -> None:
+        # ray_steps=1 (no ray-marched free-space voxels) and a non-round
+        # depth value keep this to only the actual surface (hit) points,
+        # comfortably clear of voxel-boundary floating-point edge cases --
+        # ray-marched points approaching the shared origin legitimately
+        # pass near x=0 for any column, which isn't what's being tested
+        # here (the surface reconstruction's own left/right sense).
+        grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        depth = np.zeros((8, 8), dtype=np.float32)
+        depth[:, 5:] = 1.7  # surface only in the frame's right-hand columns
+        grid.integrate_depth(
+            depth, confidence=None, horizontal_fov_degrees=90.0,
+            sample_stride=1, ray_steps=1,
+        )
+        assert grid._voxels
+        assert all(index[0] < 0 for index in grid._voxels)
+
+    def test_a_surface_only_in_the_left_half_of_the_frame_projects_to_positive_x(
+        self,
+    ) -> None:
+        grid = VoxelGrid(voxel_size_meters=0.5, max_range_meters=10.0, max_voxels=10_000)
+        depth = np.zeros((8, 8), dtype=np.float32)
+        depth[:, :3] = 1.7  # surface only in the frame's left-hand columns
+        grid.integrate_depth(
+            depth, confidence=None, horizontal_fov_degrees=90.0,
+            sample_stride=1, ray_steps=1,
+        )
+        assert grid._voxels
+        assert all(index[0] > 0 for index in grid._voxels)
 
 
 class TestLogOddsHelpers:

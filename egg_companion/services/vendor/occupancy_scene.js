@@ -171,9 +171,17 @@ function initCanvasFallback(container) {
 
   function applyPayload(payload) {
     if (!payload || !payload.enabled) { rawVoxels = []; voxels = []; return; }
-    rawVoxels = payload.voxels || [];
-    voxelSizeMeters = payload.voxel_size_meters || 0.1;
-    rebucket();
+    const incoming = payload.voxels || [];
+    // Only replace the displayed reconstruction once real data exists
+    // (or there was nothing on screen to preserve anyway) -- an empty
+    // incoming list otherwise keeps rendering the last real one instead
+    // of blanking out, e.g. while a resolution change's fresh grid is
+    // still repopulating.
+    if (incoming.length || !rawVoxels.length) {
+      rawVoxels = incoming;
+      voxelSizeMeters = payload.voxel_size_meters || 0.1;
+      rebucket();
+    }
     if (!framed && rawVoxels.length) {
       const n = rawVoxels.length;
       target = {
@@ -294,27 +302,34 @@ if (container) {
   }
 
   function renderVoxels(voxels, voxelSize) {
-    if (voxelMesh) { scene.remove(voxelMesh); voxelMesh.geometry.dispose(); voxelMesh = null; }
+    // Keep whatever's already rendered rather than clearing it -- an
+    // empty incoming list here (e.g. mid-repopulation right after a
+    // resolution change) would otherwise blank the scene for however
+    // long the next real batch takes to arrive.
     if (!voxels.length) return;
     // voxelSize is already the fully-resolved cell size (native size *
     // voxelScaleMultiplier, applied by the caller before rebucketing) --
     // do not multiply by voxelScaleMultiplier again here.
     const size = Math.max(voxelSize, 0.01);
-    voxelMesh = new THREE.InstancedMesh(voxelGeometry, voxelMaterial, voxels.length);
-    voxelMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(voxels.length * 3), 3);
+    const nextMesh = new THREE.InstancedMesh(voxelGeometry, voxelMaterial, voxels.length);
+    nextMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(voxels.length * 3), 3);
     voxels.forEach((voxel, index) => {
       tmpMatrix.makeScale(size * 0.92, size * 0.92, size * 0.92);
       // Mirrored X (see the 2D fallback's point() for why) so the array
       // reads left-to-right on screen in both render paths consistently.
       tmpMatrix.setPosition(-voxel.x, voxel.y, voxel.z);
-      voxelMesh.setMatrixAt(index, tmpMatrix);
+      nextMesh.setMatrixAt(index, tmpMatrix);
       const [r, g, b] = voxel.color || [0x66, 0x7e, 0xa8];
       tmpColor.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
-      voxelMesh.setColorAt(index, tmpColor);
+      nextMesh.setColorAt(index, tmpColor);
     });
-    voxelMesh.instanceMatrix.needsUpdate = true;
-    if (voxelMesh.instanceColor) voxelMesh.instanceColor.needsUpdate = true;
-    scene.add(voxelMesh);
+    nextMesh.instanceMatrix.needsUpdate = true;
+    if (nextMesh.instanceColor) nextMesh.instanceColor.needsUpdate = true;
+    // Add the replacement before removing the old one, not after -- so
+    // there is never a rendered frame with neither present.
+    scene.add(nextMesh);
+    if (voxelMesh) { scene.remove(voxelMesh); voxelMesh.geometry.dispose(); }
+    voxelMesh = nextMesh;
   }
 
   function renderRangeWireframe(maxRange) {
