@@ -145,7 +145,11 @@ function initCanvasFallback(container) {
       if (!povDrag) return;
       const dx = event.clientX - povDrag.x, dy = event.clientY - povDrag.y;
       povYaw = povDrag.yaw - dx * 0.006;
-      povPitch = Math.max(-1.5, Math.min(1.5, povDrag.pitch - dy * 0.006));
+      // Pitch is sign-flipped relative to orbit mode's vertical drag
+      // (+dy, not -dy) -- looking around from inside the reconstruction
+      // reads naturally as "drag down to look down", the opposite feel
+      // from orbiting a target from outside it.
+      povPitch = Math.max(-1.5, Math.min(1.5, povDrag.pitch + dy * 0.006));
       return;
     }
     if (!drag) return;
@@ -409,7 +413,9 @@ if (container) {
     if (!povLocked || !povDrag) return;
     const dx = event.clientX - povDrag.x, dy = event.clientY - povDrag.y;
     povYaw = povDrag.yaw - dx * 0.005;
-    povPitch = Math.max(-1.5, Math.min(1.5, povDrag.pitch - dy * 0.005));
+    // Sign-flipped vs orbit mode's vertical drag -- see the 2D fallback's
+    // onPovPointerMove-equivalent handler for why.
+    povPitch = Math.max(-1.5, Math.min(1.5, povDrag.pitch + dy * 0.005));
     applyPovLook();
   }
   function onPovPointerUp() { povDrag = null; }
