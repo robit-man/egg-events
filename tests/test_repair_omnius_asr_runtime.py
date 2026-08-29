@@ -103,3 +103,53 @@ const result = { language: result.language };
     assert "repaired-1" in first.stdout
     assert "already-compatible" in second.stdout
     assert 'join135(MODULE_DIR, "scripts", name10)' in source
+
+
+def test_repair_bounds_direct_ollama_chat_and_preserves_namespaced_models(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "index.js"
+    target.write_text(
+        '''async function directChatBackend(opts) {
+  const isVllm = false;
+  const cleanModel = model.replace(/^[a-z]+\\//, "");
+  const ef = extraFields || {};
+  const ollamaOpts = {};
+    if (typeof ef["max_tokens"] === "number")
+      ollamaOpts["num_predict"] = ef["max_tokens"];
+    if (typeof ef["seed"] === "number") ollamaOpts["seed"] = ef["seed"];
+  const reqBody = JSON.stringify({
+      think: false,
+      ...hasTools ? { tools: ef["tools"] } : {},
+  });
+}
+const extraFields = {
+              ...chatBody["max_tokens"] !== void 0 ? { max_tokens: chatBody["max_tokens"] } : {},
+              ...chatBody["response_format"] !== void 0 ? { response_format: chatBody["response_format"] } : {},
+};
+''',
+        encoding="utf-8",
+    )
+    script = Path(__file__).parents[1] / "scripts" / "repair_omnius_asr_runtime.py"
+
+    first = subprocess.run(
+        [sys.executable, str(script), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    second = subprocess.run(
+        [sys.executable, str(script), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    source = target.read_text(encoding="utf-8")
+    assert "repaired-5" in first.stdout
+    assert "already-compatible" in second.stdout
+    assert 'const cleanModel = isVllm ? model.replace' in source
+    assert '{ num_ctx: chatBody["num_ctx"] }' in source
+    assert 'ollamaOpts["num_ctx"] = ef["num_ctx"]' in source
+    assert '{ keep_alive: chatBody["keep_alive"] }' in source
+    assert '{ keep_alive: ef["keep_alive"] }' in source

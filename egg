@@ -5,6 +5,27 @@ cd "$root_dir"
 if [[ -z "${EGG_OMNIUS_TOKEN:-}" && -r "$HOME/.omnius/api.key" ]]; then
   export EGG_OMNIUS_TOKEN="$(tr -d '\r\n' < "$HOME/.omnius/api.key")"
 fi
+required_language_model="robit/ornith-1.5:9b"
+required_vision_model="$required_language_model"
+
+ensure_ollama_model() {
+  local model="$1"
+  if ! command -v ollama >/dev/null 2>&1; then
+    return 1
+  fi
+  if ollama show "$model" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Ollama model $model is missing; pulling it before Egg starts." >&2
+  ollama pull "$model"
+}
+
+if command -v ollama >/dev/null 2>&1; then
+  ensure_ollama_model "$required_language_model" || \
+    echo "Could not pull $required_language_model; cognition will remain degraded." >&2
+  ensure_ollama_model "$required_vision_model" || \
+    echo "Could not pull $required_vision_model; explicit VLM work will remain degraded." >&2
+fi
 if [[ "${1:-}" == "bootstrap" ]]; then exec "$root_dir/scripts/bootstrap-jetson.sh"; fi
 gpu_runtime_status="unknown"
 for gpu_status_path in /sys/devices/platform/17000000.gpu/power/runtime_status /sys/devices/platform/gpu.0/power/runtime_status; do
@@ -31,7 +52,7 @@ fi
 if [[ ! -s "$root_dir/models/sam2.1_t.pt" || ! -s "$root_dir/models/face_recognition_sface_2021dec.onnx" || ! -s "$root_dir/models/yoloe-11s-seg-pf.pt" || ! -s "$root_dir/models/yolo11n-pose.pt" ]]; then
   needs_bootstrap=1
 fi
-if ! command -v ollama >/dev/null 2>&1 || ! ollama show robit/ornith-vision:9b >/dev/null 2>&1; then
+if ! command -v ollama >/dev/null 2>&1 || ! ollama show "$required_vision_model" >/dev/null 2>&1; then
   needs_bootstrap=1
 fi
 if ! docker image inspect dustynv/whisper:r36.2.0 >/dev/null 2>&1; then

@@ -58,8 +58,9 @@ class VisionEngine:
             raise RuntimeError(f"pose model is unavailable: {pose_path}")
         self._pose_model = YOLO(str(pose_path))
         self._sam = SAM(config.sam_model)
+        self._clip_device = config.clip_device or config.device
         self._clip_model, _, self._clip_preprocess = open_clip.create_model_and_transforms(
-            config.clip_model, pretrained=config.clip_pretrained, device=config.device
+            config.clip_model, pretrained=config.clip_pretrained, device=self._clip_device
         )
         self._clip_tokenizer = open_clip.get_tokenizer(config.clip_model)
         import cv2
@@ -279,12 +280,14 @@ class VisionEngine:
 
         rgb_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         with self._inference_lock, self._torch.no_grad():
-            features = self._clip_model.encode_image(self._clip_preprocess(rgb_image).unsqueeze(0).to(self.config.device))
+            features = self._clip_model.encode_image(
+                self._clip_preprocess(rgb_image).unsqueeze(0).to(self._clip_device)
+            )
             features = features / features.norm(dim=-1, keepdim=True)
         return features[0].detach().cpu().numpy().astype(np.float32)
 
     def embed_text(self, text: str) -> np.ndarray:
-        tokens = self._clip_tokenizer([text]).to(self.config.device)
+        tokens = self._clip_tokenizer([text]).to(self._clip_device)
         with self._inference_lock, self._torch.no_grad():
             features = self._clip_model.encode_text(tokens)
             features = features / features.norm(dim=-1, keepdim=True)
@@ -386,9 +389,11 @@ class VisionEngine:
             "a human face",
             "background scenery",
         ]
-        tokens = self._clip_tokenizer(labels).to(self.config.device)
+        tokens = self._clip_tokenizer(labels).to(self._clip_device)
         with self._inference_lock, self._torch.no_grad():
-            image_features = self._clip_model.encode_image(self._clip_preprocess(image).unsqueeze(0).to(self.config.device))
+            image_features = self._clip_model.encode_image(
+                self._clip_preprocess(image).unsqueeze(0).to(self._clip_device)
+            )
             text_features = self._clip_model.encode_text(tokens)
             similarity = (image_features / image_features.norm(dim=-1, keepdim=True)) @ (
                 text_features / text_features.norm(dim=-1, keepdim=True)
@@ -415,11 +420,11 @@ class VisionEngine:
             return None
         images = [Image.fromarray(cv2.cvtColor(candidate, cv2.COLOR_BGR2RGB)) for candidate in candidates.values()]
         prompt_tokens = self._clip_tokenizer(["an upright photograph", "a sideways or upside down photograph"]).to(
-            self.config.device
+            self._clip_device
         )
         with self._inference_lock, self._torch.no_grad():
             image_features = self._clip_model.encode_image(
-                self._torch.stack([self._clip_preprocess(image) for image in images]).to(self.config.device)
+                self._torch.stack([self._clip_preprocess(image) for image in images]).to(self._clip_device)
             )
             text_features = self._clip_model.encode_text(prompt_tokens)
             similarity = (image_features / image_features.norm(dim=-1, keepdim=True)) @ (
@@ -481,11 +486,11 @@ class VisionEngine:
         images = [
             Image.fromarray(cv2.cvtColor(face, cv2.COLOR_BGR2RGB)) for face in faces
         ]
-        prompt_tokens = self._clip_tokenizer(labels).to(self.config.device)
+        prompt_tokens = self._clip_tokenizer(labels).to(self._clip_device)
         with self._inference_lock, self._torch.no_grad():
             image_features = self._clip_model.encode_image(
                 self._torch.stack([self._clip_preprocess(image) for image in images]).to(
-                    self.config.device
+                    self._clip_device
                 )
             )
             text_features = self._clip_model.encode_text(prompt_tokens)
@@ -527,9 +532,11 @@ class VisionEngine:
         from PIL import Image
 
         image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        prompt_tokens = self._clip_tokenizer(self.config.semantic_prompts).to(self.config.device)
+        prompt_tokens = self._clip_tokenizer(self.config.semantic_prompts).to(self._clip_device)
         with self._torch.no_grad():
-            image_features = self._clip_model.encode_image(self._clip_preprocess(image).unsqueeze(0).to(self.config.device))
+            image_features = self._clip_model.encode_image(
+                self._clip_preprocess(image).unsqueeze(0).to(self._clip_device)
+            )
             text_features = self._clip_model.encode_text(prompt_tokens)
             similarity = (image_features / image_features.norm(dim=-1, keepdim=True)) @ (
                 text_features / text_features.norm(dim=-1, keepdim=True)

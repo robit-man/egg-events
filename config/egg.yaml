@@ -2,18 +2,29 @@
 cameras:
   - id: camera-video1
     source: /dev/video1
+    fps: 2
     rotation_degrees: 90
+    capture_width: 1280
+    capture_height: 720
   - id: camera-video2
     source: /dev/video2
+    fps: 2
     rotation_degrees: 90
+    capture_width: 1280
+    capture_height: 720
   - id: camera-video3
     source: /dev/video3
+    fps: 2
     rotation_degrees: 90
+    capture_width: 1280
+    capture_height: 720
 camera_discovery:
   enabled: true
   source_glob: /dev/video*
-  fps: 8
+  fps: 2
   rotation_degrees: 90
+  capture_width: 1280
+  capture_height: 720
 
 vision:
   # YOLOE provides open-vocabulary instance segmentation, not rectangle-only detection.
@@ -22,17 +33,24 @@ vision:
   clip_model: ViT-B-32
   clip_pretrained: laion2b_s34b_b79k
   device: cuda
+  # Keep background CLIP recall off the unified GPU used by Ollama and speech.
+  clip_device: cpu
+  # Pose and generic scene semantics add little to a verbal-first runtime and
+  # remain available for profiles that explicitly opt back in.
+  pose_enabled: false
+  semantic_enabled: false
   confidence_threshold: 0.45
   sam_model: models/sam2.1_t.pt
   sam_image_size: 640
   sface_model: models/face_recognition_sface_2021dec.onnx
-  # Capture stays smooth while GPU inference is rate-limited per camera.
-  analysis_fps: 2
-  pose_fps: 0.75
-  semantic_fps: 0.25
-  dashboard_fps: 8
-  dashboard_max_width: 960
-  max_instances: 24
+  # Verbal-first profile: across four cameras this is roughly one mask pass
+  # every 50 seconds, leaving long uninterrupted windows for speech inference.
+  analysis_fps: 0.005
+  pose_fps: 0.0025
+  semantic_fps: 0.001
+  dashboard_fps: 0.5
+  dashboard_max_width: 640
+  max_instances: 6
   minimum_detector_classes: 1000
 
 audio:
@@ -58,7 +76,7 @@ audio:
   barge_in_enabled: true
   playback_resume_rewind_ms: 80
   playback_timeout_seconds: 30
-  waveform_fps: 30
+  waveform_fps: 20
   waveform_samples: 256
 
 transcription:
@@ -82,17 +100,17 @@ transcription:
   vad_min_contiguous_ms: 180
   vad_min_voiced_rms: 0.02
   vad_pre_roll_ms: 300
-  vad_hangover_ms: 600
-  # Brief answers still close near 600 ms; longer/pause-resumed speech gains a
+  vad_hangover_ms: 400
+  # Brief answers still close near 400 ms; longer/pause-resumed speech gains a
   # bounded adaptive trailing-silence allowance.
-  vad_hangover_max_ms: 1800
-  vad_hangover_growth_ms: 1600
+  vad_hangover_max_ms: 1000
+  vad_hangover_growth_ms: 1200
   vad_continuation_growth: 1
 
 # Grounded environmental-audio labels run behind the live ASR path. The queue
 # coalesces under load so YAMNet/TensorFlow can never delay a spoken turn.
 audio_comprehension:
-  enabled: true
+  enabled: false
   queue_size: 1
   minimum_interval_seconds: 15
   minimum_confidence: 0.12
@@ -103,17 +121,22 @@ omnius:
   base_url: http://127.0.0.1:11435
   # JetPack-matched CUDA Whisper container. Omnius still owns conversation and TTS.
   asr_base_url: http://127.0.0.1:11436
-  model: omnius-qwen35-9b:latest
-  vision_model: robit/ornith-vision:9b
+  model: robit/ornith-1.5:9b
+  # Ornith 1.5 is multimodal; sharing it avoids chat/VLM model eviction.
+  vision_model: robit/ornith-1.5:9b
   vision_base_url: http://127.0.0.1:11434
   voice_model: supertonic
   voice_name: F4
   bearer_token_env: EGG_OMNIUS_TOKEN
   timeout_seconds: 30
+  chat_num_ctx: 4096
+  chat_keep_alive: 30m
   reasoning_enabled: false
   # The realtime model owns tool selection. This is required for visual
   # references to route to ASR-boundary camera evidence without phrase lists.
-  dialogue_router_enabled: true
+  # Avoid a serial routing generation before every spoken answer. Explicit
+  # dashboard inspections and other on-demand VLM paths remain available.
+  dialogue_router_enabled: false
   visual_snapshot_max_age_seconds: 2.5
   visual_snapshot_max_cameras: 4
   # One labeled local contact sheet avoids four independent VLM image-prefill passes.
@@ -124,7 +147,7 @@ attention:
   track_ttl_seconds: 10
   min_priority: 0.35
   greeting_cooldown_seconds: 45
-  proactive_speech_enabled: true
+  proactive_speech_enabled: false
   # Stable face calibration is bounded and independent of generic chatter.
   identity_question_enabled: true
   identity_question_min_sightings: 1
@@ -138,8 +161,8 @@ attention:
 # back to full rate the instant something new appears or is heard.
 activity:
   enabled: true
-  idle_floor: 0.15
-  decay_seconds: 20
+  idle_floor: 0.05
+  decay_seconds: 8
   novelty_threshold: 0.12
 
 identity:
@@ -167,17 +190,17 @@ identity:
   track_mask_iou_threshold: 0.30
   track_mask_containment_threshold: 0.70
   track_mask_max_gap_seconds: 8
-  temporal_vlm_comparison_enabled: true
+  temporal_vlm_comparison_enabled: false
   temporal_vlm_queue_size: 2
   temporal_vlm_cooldown_seconds: 15
-  sample_interval_seconds: 15
+  sample_interval_seconds: 60
   # Retain a compact, pose-diverse gallery instead of destroying all historical
   # angles when the live centroid and latest thumbnail are refreshed.
   gallery_max_samples: 8
   gallery_diversity_similarity: 0.985
 
 dreams:
-  enabled: true
+  enabled: false
   # Pinned, local AdaFace IR18 package. Runtime inference never fetches a model.
   model_path: models/cvlface_adaface_ir18_webface4m
   model_id: minchul/cvlface_adaface_ir18_webface4m
@@ -220,42 +243,44 @@ object_learning:
   enabled: true
   storage_dir: data/object-library
   similarity_threshold: 0.86
-  auto_label_enabled: true
-  adjudication_queue_size: 12
+  # Preserve user-directed learning while disabling background VLM labeling.
+  auto_label_enabled: false
+  adjudication_queue_size: 2
   auto_label_confidence_threshold: 0.68
   auto_label_min_confidence: 0.70
-  auto_label_cooldown_seconds: 6
-  recall_interval_seconds: 0.75
+  auto_label_cooldown_seconds: 60
+  recall_interval_seconds: 5
   recall_cache_seconds: 12
   auto_label_max_retries: 2
   auto_label_failure_backoff_seconds: 3
   vlm_max_image_size: 512
   stable_candidate_frames: 3
   speech_priority_seconds: 8
-  review_sweep_interval_seconds: 120
-  review_stale_after_seconds: 1800
+  review_sweep_interval_seconds: 3600
+  review_stale_after_seconds: 86400
   confidence_audit_enabled: false
-  confidence_audit_batch_size: 8
+  confidence_audit_batch_size: 1
   duplicate_proposal_similarity: 0.94
-  duplicate_adjudication_batch_size: 1
+  duplicate_adjudication_batch_size: 0
 
 ocr:
   enabled: true
   # V2: local and Omnius are independent proposers — VLM negative ≠ OCR negative.
   # Local provides fast provisional result; Omnius refines per policy.
   local_multipass_enabled: true
-  omnius_refinement_enabled: true
-  full_frame_interval_seconds: 20
-  text_object_interval_seconds: 8
-  queue_size: 8
-  max_image_size: 1280
+  omnius_refinement_enabled: false
+  vlm_text_detection_enabled: false
+  full_frame_interval_seconds: 300
+  text_object_interval_seconds: 120
+  queue_size: 1
+  max_image_size: 960
   min_text_characters: 2
   max_fragments: 8
-  max_region_refinements: 2
-  vlm_text_check_interval: 5.0
+  max_region_refinements: 0
+  vlm_text_check_interval: 30.0
   ledger_db_path: "data/ocr-jobs.sqlite3"
   refinement:
-    enabled: true
+    enabled: false
     local_confidence_threshold: 0.72
     min_text_length_for_refinement: 6
     max_refinements_per_minute: 20
@@ -264,7 +289,7 @@ ocr:
     window_seconds: 300
     hash_size: 8
   backfill:
-    enabled: true
+    enabled: false
     scan_interval_seconds: 60
     batch_size: 4
 
@@ -305,7 +330,7 @@ cognitive_attention:
   uncertainty_question_budget_per_hour: 0
 
 default_mode:
-  enabled: true
+  enabled: false
   idle_seconds: 45
   interval_min_seconds: 60
   interval_max_seconds: 180
@@ -322,7 +347,7 @@ default_mode:
   narrative_max_entries: 96
 
 social_cognition:
-  enabled: true
+  enabled: false
   queue_size: 8
   history_turns: 24
   profile_context_characters: 1800
@@ -349,4 +374,6 @@ runtime:
   log_level: INFO
 
 occupancy:
-  enabled: true
+  # Depth Anything loads a roughly 4 GB subprocess per camera cycle. Keep the
+  # point cloud on-demand/off in the verbal-first deployment.
+  enabled: false

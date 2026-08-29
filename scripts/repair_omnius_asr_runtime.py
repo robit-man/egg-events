@@ -110,6 +110,55 @@ HTTP_LANGUAGE_RESPONSE_BAD = "          language: null,\n          engineId: res
 HTTP_LANGUAGE_RESPONSE_GOOD = (
     "          language: result.language ?? null,\n          engineId: result.engineId,"
 )
+DIRECT_CHAT_MODEL_BAD = '  const cleanModel = model.replace(/^[a-z]+\\//, "");'
+DIRECT_CHAT_MODEL_GOOD = (
+    '  const cleanModel = isVllm ? model.replace(/^[a-z]+\\//, "") : model;'
+)
+CHAT_NUM_CTX_PASS_BAD = (
+    '              ...chatBody["max_tokens"] !== void 0 ? '
+    '{ max_tokens: chatBody["max_tokens"] } : {},\n'
+    '              ...chatBody["response_format"] !== void 0'
+)
+CHAT_NUM_CTX_PASS_GOOD = (
+    '              ...chatBody["max_tokens"] !== void 0 ? '
+    '{ max_tokens: chatBody["max_tokens"] } : {},\n'
+    '              ...chatBody["num_ctx"] !== void 0 ? '
+    '{ num_ctx: chatBody["num_ctx"] } : {},\n'
+    '              ...chatBody["response_format"] !== void 0'
+)
+OLLAMA_NUM_CTX_BAD = (
+    '    if (typeof ef["max_tokens"] === "number")\n'
+    '      ollamaOpts["num_predict"] = ef["max_tokens"];\n'
+    '    if (typeof ef["seed"] === "number")'
+)
+OLLAMA_NUM_CTX_GOOD = (
+    '    if (typeof ef["max_tokens"] === "number")\n'
+    '      ollamaOpts["num_predict"] = ef["max_tokens"];\n'
+    '    if (typeof ef["num_ctx"] === "number")\n'
+    '      ollamaOpts["num_ctx"] = ef["num_ctx"];\n'
+    '    if (typeof ef["seed"] === "number")'
+)
+CHAT_KEEP_ALIVE_PASS_BAD = (
+    '              ...chatBody["num_ctx"] !== void 0 ? '
+    '{ num_ctx: chatBody["num_ctx"] } : {},\n'
+    '              ...chatBody["response_format"] !== void 0'
+)
+CHAT_KEEP_ALIVE_PASS_GOOD = (
+    '              ...chatBody["num_ctx"] !== void 0 ? '
+    '{ num_ctx: chatBody["num_ctx"] } : {},\n'
+    '              ...chatBody["keep_alive"] !== void 0 ? '
+    '{ keep_alive: chatBody["keep_alive"] } : {},\n'
+    '              ...chatBody["response_format"] !== void 0'
+)
+OLLAMA_KEEP_ALIVE_BAD = (
+    '      think: false,\n'
+    '      ...hasTools ? { tools: ef["tools"] } : {},'
+)
+OLLAMA_KEEP_ALIVE_GOOD = (
+    '      think: false,\n'
+    '      ...ef["keep_alive"] !== void 0 ? { keep_alive: ef["keep_alive"] } : {},\n'
+    '      ...hasTools ? { tools: ef["tools"] } : {},'
+)
 NEMO_DEPENDENCY_BAD = (
     "    except ImportError:\n"
     '        emit_status("Installing nemo_toolkit[asr] (large — may take a few minutes)...")'
@@ -239,6 +288,11 @@ def repair(path: Path) -> str:
         (TRANSCRIBE_CLI_OPTIONS_BAD, TRANSCRIBE_CLI_OPTIONS_GOOD),
         (TRANSCRIBE_CLI_RESULT_BAD, TRANSCRIBE_CLI_RESULT_GOOD),
         (HTTP_LANGUAGE_RESPONSE_BAD, HTTP_LANGUAGE_RESPONSE_GOOD),
+        (DIRECT_CHAT_MODEL_BAD, DIRECT_CHAT_MODEL_GOOD),
+        (CHAT_NUM_CTX_PASS_BAD, CHAT_NUM_CTX_PASS_GOOD),
+        (OLLAMA_NUM_CTX_BAD, OLLAMA_NUM_CTX_GOOD),
+        (CHAT_KEEP_ALIVE_PASS_BAD, CHAT_KEEP_ALIVE_PASS_GOOD),
+        (OLLAMA_KEEP_ALIVE_BAD, OLLAMA_KEEP_ALIVE_GOOD),
     ):
         count = repaired.count(broken)
         occurrences += count
@@ -262,7 +316,17 @@ def repair(path: Path) -> str:
                 and "language: result.language" in source
             )
         )
-        if cuda_compatible and script_compatible and language_compatible:
+        chat_compatible = (
+            "async function directChatBackend" not in source
+            or (
+                DIRECT_CHAT_MODEL_GOOD in source
+                and '{ num_ctx: chatBody["num_ctx"] }' in source
+                and 'ollamaOpts["num_ctx"] = ef["num_ctx"]' in source
+                and '{ keep_alive: chatBody["keep_alive"] }' in source
+                and '{ keep_alive: ef["keep_alive"] }' in source
+            )
+        )
+        if cuda_compatible and script_compatible and language_compatible and chat_compatible:
             return "already-compatible"
         raise RuntimeError(f"expected Omnius ASR probe was not found in {path}")
     mode = path.stat().st_mode

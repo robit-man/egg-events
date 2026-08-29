@@ -69,6 +69,12 @@ class VisionConfig(BaseModel):
     clip_model: str = "ViT-B-32"
     clip_pretrained: str = "laion2b_s34b_b79k"
     device: str = "cuda"
+    # CLIP is background semantic/recall work. It can live on CPU while the
+    # detector stays on CUDA, preserving GPU headroom for realtime language,
+    # speech, and explicitly requested VLM work.
+    clip_device: str | None = None
+    pose_enabled: bool = True
+    semantic_enabled: bool = True
     confidence_threshold: float = Field(default=0.45, ge=0, le=1)
     sam_model: str = "models/sam2.1_t.pt"
     sam_image_size: int = Field(default=640, ge=320, le=1280)
@@ -152,13 +158,20 @@ class AudioComprehensionConfig(BaseModel):
 class OmniusConfig(BaseModel):
     base_url: HttpUrl = "http://127.0.0.1:11435"
     asr_base_url: HttpUrl | None = None
-    model: str
-    vision_model: str = "robit/ornith-vision:9b"
+    model: str = "robit/ornith-1.5:9b"
+    vision_model: str = "robit/ornith-1.5:9b"
     vision_base_url: HttpUrl = "http://127.0.0.1:11434"
     voice_model: str
     voice_name: str | None = None
     bearer_token_env: str | None = None
     timeout_seconds: float = Field(default=20, gt=0, le=120)
+    # Omnius forwards this bounded Ollama context for realtime chat. Without
+    # an explicit value, namespaced Ornith manifests request their full 262K
+    # training window and consume memory needed by ASR/TTS/VLM runtimes.
+    chat_num_ctx: int = Field(default=4096, ge=2048, le=32768)
+    # Retain the single multimodal model between spoken turns so visual work
+    # and replies do not repeatedly pay a multi-second load/eviction penalty.
+    chat_keep_alive: str = "30m"
     # Spoken turns use Omnius's direct realtime backend and explicitly disable
     # hidden reasoning. The separate LLM router is optional because it adds a
     # full serial generation before every reply.
@@ -332,6 +345,7 @@ class OcrConfig(BaseModel):
     enabled: bool = True
     local_multipass_enabled: bool = True
     omnius_refinement_enabled: bool = True
+    vlm_text_detection_enabled: bool = True
     full_frame_interval_seconds: float = Field(default=20, ge=2, le=3600)
     text_object_interval_seconds: float = Field(default=8, ge=1, le=3600)
     queue_size: int = Field(default=8, ge=1, le=64)

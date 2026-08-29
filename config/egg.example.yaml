@@ -3,13 +3,19 @@
 cameras:
   - id: front
     source: /dev/video0
-    fps: 8
+    fps: 2
+    capture_width: 1280
+    capture_height: 720
   - id: left
     source: /dev/video2
-    fps: 8
+    fps: 2
+    capture_width: 1280
+    capture_height: 720
   - id: right
     source: /dev/video4
-    fps: 8
+    fps: 2
+    capture_width: 1280
+    capture_height: 720
 
 vision:
   detector_model: models/yoloe-11s-seg-pf.pt
@@ -17,7 +23,16 @@ vision:
   clip_model: ViT-B-32
   clip_pretrained: laion2b_s34b_b79k
   device: cuda
+  clip_device: cpu
+  pose_enabled: false
+  semantic_enabled: false
   confidence_threshold: 0.45
+  analysis_fps: 0.005
+  pose_fps: 0.0025
+  semantic_fps: 0.001
+  dashboard_fps: 0.5
+  dashboard_max_width: 640
+  max_instances: 6
 
 audio:
   input_device: default
@@ -49,7 +64,7 @@ transcription:
   vad_continuation_growth: 1
 
 audio_comprehension:
-  enabled: true
+  enabled: false
   queue_size: 1
   minimum_interval_seconds: 15
   minimum_confidence: 0.12
@@ -60,12 +75,14 @@ omnius:
   base_url: http://127.0.0.1:11435
   # Optional dedicated OpenAI/Whisper-compatible ASR service.
   asr_base_url: http://127.0.0.1:11436
-  model: omnius-qwen35-4b:latest
-  vision_model: robit/ornith-vision:9b
+  model: robit/ornith-1.5:9b
+  vision_model: robit/ornith-1.5:9b
   vision_base_url: http://127.0.0.1:11434
   voice_model: supertonic
+  chat_num_ctx: 4096
+  chat_keep_alive: 30m
   reasoning_enabled: false
-  dialogue_router_enabled: true
+  dialogue_router_enabled: false
   visual_snapshot_max_age_seconds: 2.5
   visual_snapshot_max_cameras: 4
   visual_contact_sheet_size: 768
@@ -117,7 +134,7 @@ identity:
   track_mask_iou_threshold: 0.30
   track_mask_containment_threshold: 0.70
   track_mask_max_gap_seconds: 8
-  temporal_vlm_comparison_enabled: true
+  temporal_vlm_comparison_enabled: false
   temporal_vlm_queue_size: 2
   temporal_vlm_cooldown_seconds: 15
   sample_interval_seconds: 15
@@ -125,7 +142,7 @@ identity:
   gallery_diversity_similarity: 0.985
 
 dreams:
-  enabled: true
+  enabled: false
   model_path: models/cvlface_adaface_ir18_webface4m
   model_id: minchul/cvlface_adaface_ir18_webface4m
   model_revision: 0dd53f188fa27968b0a1326970ebf4aeb37ce2ca
@@ -162,7 +179,7 @@ object_learning:
   enabled: true
   storage_dir: data/object-library
   similarity_threshold: 0.86
-  auto_label_enabled: true
+  auto_label_enabled: false
   adjudication_queue_size: 12
   auto_label_confidence_threshold: 0.68
   auto_label_min_confidence: 0.70
@@ -185,13 +202,14 @@ ocr:
   enabled: true
   local_multipass_enabled: true
   omnius_refinement_enabled: false
-  full_frame_interval_seconds: 20
-  text_object_interval_seconds: 8
-  queue_size: 8
-  max_image_size: 1280
+  vlm_text_detection_enabled: false
+  full_frame_interval_seconds: 300
+  text_object_interval_seconds: 120
+  queue_size: 1
+  max_image_size: 960
   min_text_characters: 2
   max_fragments: 8
-  max_region_refinements: 2
+  max_region_refinements: 0
 
 memory:
   enabled: true
@@ -233,7 +251,7 @@ cognitive_attention:
   uncertainty_question_budget_per_hour: 0
 
 default_mode:
-  enabled: true
+  enabled: false
   idle_seconds: 45
   interval_min_seconds: 60
   interval_max_seconds: 180
@@ -250,7 +268,7 @@ default_mode:
   narrative_max_entries: 96
 
 social_cognition:
-  enabled: true
+  enabled: false
   queue_size: 8
   history_turns: 24
   profile_context_characters: 1800

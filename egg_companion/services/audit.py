@@ -203,6 +203,7 @@ async def audit_hardware(config: EggConfig) -> list[AuditCheck]:
             else []
         ),
         await _command_check("gpu-pm-guard", ["systemctl", "is-active", "egg-gpu-pm-guard.service"]),
+        await _command_check("language-model", ["ollama", "show", config.omnius.model]),
         await _command_check("ornith-model", ["ollama", "show", config.omnius.vision_model]),
         *[
             _module_check(module)

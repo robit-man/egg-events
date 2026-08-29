@@ -137,14 +137,17 @@ EOF
   sudo systemctl restart egg-gpu-pm-guard.service
 }
 
-ensure_ornith_vision() {
+ensure_ollama_models() {
   if ! command -v ollama >/dev/null 2>&1; then
-    echo "Ollama is required for Ornith Vision object classification." >&2
+    echo "Ollama is required for Ornith cognition and vision." >&2
     return 1
   fi
-  if ! ollama show robit/ornith-vision:9b >/dev/null 2>&1; then
-    ollama pull robit/ornith-vision:9b
-  fi
+  local model
+  for model in robit/ornith-1.5:9b; do
+    if ! ollama show "$model" >/dev/null 2>&1; then
+      ollama pull "$model"
+    fi
+  done
 }
 
 ensure_gpu_pm_guard
@@ -203,7 +206,7 @@ if [[ ! -s "$pose_model" ]]; then
     https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt
 fi
 "$venv_python" "$workspace_dir/scripts/install_dream_identity_model.py"
-ensure_ornith_vision
+ensure_ollama_models
 EGG_RESPEAKER_PYTHON="$venv_python" "$workspace_dir/scripts/configure-respeaker-aec.sh"
 "$venv_python" -m egg_companion --config "$workspace_dir/config/egg.yaml" audit
 ensure_companion_service

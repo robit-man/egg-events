@@ -139,6 +139,37 @@ def test_audio_classification_parser_accepts_structured_omnius_10628_data() -> N
     }
 
 
+def test_pause_daemon_listen_uses_voice_stop_without_disabling_tts(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            assert url.endswith("/v1/voice/stop")
+            assert "json" not in kwargs
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(voice_model="supertonic"))
+
+    asyncio.run(client.pause_daemon_listen())
+
+
 def test_audio_classifier_health_accepts_structured_503_readiness(monkeypatch) -> None:
     class Response:
         status = 503

@@ -139,6 +139,8 @@ class OmniusClient:
             "stream": False,
             "temperature": 0,
             "max_tokens": 8,
+            "num_ctx": self.config.chat_num_ctx,
+            "keep_alive": self.config.chat_keep_alive,
             "tools": False,
         }
         async with self._model_gate:
@@ -346,6 +348,28 @@ class OmniusClient:
             state = await self.voice_state()
         if state.get("voiceReady") is not True:
             raise RuntimeError(f"Omnius voice did not become ready: {state}")
+
+    async def pause_daemon_listen(self) -> None:
+        """Pause Omnius's microphone ASR while preserving its TTS renderer.
+
+        Egg owns capture/VAD and can use a dedicated ASR service. In that
+        topology the daemon listener is a second always-on transcription loop
+        over the same room audio, so it consumes inference capacity without
+        contributing to Egg's conversation path.
+        """
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{str(self.config.base_url).rstrip('/')}/v1/voice/stop",
+                headers=self._headers(),
+            ) as response:
+                if response.status in {404, 405, 501}:
+                    return
+                if response.status >= 400:
+                    detail = (await response.text())[:500]
+                    raise RuntimeError(
+                        f"Omnius daemon listen pause HTTP {response.status}: {detail}"
+                    )
 
     async def companion_reply(
         self,
@@ -2177,7 +2201,7 @@ class OmniusClient:
             "format": "json",
             "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 300},
-            "keep_alive": "5m",
+            "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._background_gate:
@@ -2269,7 +2293,7 @@ class OmniusClient:
             # can finish with an empty content field before it emits the JSON.
             "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 180},
-            "keep_alive": "5m",
+            "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._background_gate:
@@ -2328,7 +2352,7 @@ class OmniusClient:
             "format": "json",
             "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 240},
-            "keep_alive": "5m",
+            "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._background_gate:
@@ -2404,7 +2428,7 @@ class OmniusClient:
             "format": "json",
             "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 260},
-            "keep_alive": "5m",
+            "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._background_gate:
@@ -2514,7 +2538,7 @@ class OmniusClient:
             "format": "json",
             "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 260},
-            "keep_alive": "5m",
+            "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._background_gate:
@@ -2625,7 +2649,7 @@ class OmniusClient:
             "format": "json",
             "think": False,
             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 180},
-            "keep_alive": "5m",
+            "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with self._conversational_gate:
@@ -2925,6 +2949,8 @@ class OmniusClient:
             "think": self.config.reasoning_enabled,
             "realtime": True,
             "max_tokens": bounded_tokens,
+            "num_ctx": self.config.chat_num_ctx,
+            "keep_alive": self.config.chat_keep_alive,
             "realtime_options": {
                 "max_history_messages": 4,
                 "max_tokens": bounded_tokens,
@@ -2966,6 +2992,8 @@ class OmniusClient:
             "stream": False,
             "temperature": 0.2,
             "max_tokens": bounded_max_tokens,
+            "num_ctx": self.config.chat_num_ctx,
+            "keep_alive": self.config.chat_keep_alive,
             "tools": False,
             "think": False,
             "realtime": False,
@@ -3027,6 +3055,8 @@ class OmniusClient:
             "messages": chat_messages,
             "stream": False,
             "max_tokens": 80,
+            "num_ctx": self.config.chat_num_ctx,
+            "keep_alive": self.config.chat_keep_alive,
             "temperature": 0.6,
             "tools": False,
             "think": self.config.reasoning_enabled,

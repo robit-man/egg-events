@@ -973,10 +973,20 @@ class CompanionRuntime:
         await self._omnius.ensure_voice_ready()
         await self._omnius.configure_supertonic_voice(self.config.omnius.voice_name)
         await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
+        if (
+            self.config.omnius.asr_base_url is not None
+            and self.config.omnius.asr_base_url != self.config.omnius.base_url
+        ):
+            await self._omnius.pause_daemon_listen()
         while True:
             await asyncio.sleep(60)
             await self._omnius.health()
             await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
+            if (
+                self.config.omnius.asr_base_url is not None
+                and self.config.omnius.asr_base_url != self.config.omnius.base_url
+            ):
+                await self._omnius.pause_daemon_listen()
 
     async def _maintain_vision(self) -> None:
         if self._vision is None:
@@ -1126,8 +1136,13 @@ class CompanionRuntime:
                             self._observations.put_nowait(observation)
                         analysis_task = None
                     if vision is not None and analysis_task is None and now >= next_analysis_at:
-                        include_pose = now >= next_pose_at
-                        include_semantics = now >= next_semantic_at
+                        include_pose = (
+                            self.config.vision.pose_enabled and now >= next_pose_at
+                        )
+                        include_semantics = (
+                            self.config.vision.semantic_enabled
+                            and now >= next_semantic_at
+                        )
                         if include_pose:
                             next_pose_at = now + 1 / self._activity.scaled_fps(
                                 self.config.vision.pose_fps, now
@@ -1502,14 +1517,22 @@ class CompanionRuntime:
                 {
                     "name": "Pose",
                     "unit": "fps",
-                    "base_rate": round(vision.pose_fps, 3),
-                    "effective_rate": round(self._activity.scaled_fps(vision.pose_fps, now), 3),
+                    "base_rate": round(vision.pose_fps, 3) if vision.pose_enabled else 0,
+                    "effective_rate": (
+                        round(self._activity.scaled_fps(vision.pose_fps, now), 3)
+                        if vision.pose_enabled
+                        else 0
+                    ),
                 },
                 {
                     "name": "Semantics",
                     "unit": "fps",
-                    "base_rate": round(vision.semantic_fps, 3),
-                    "effective_rate": round(self._activity.scaled_fps(vision.semantic_fps, now), 3),
+                    "base_rate": round(vision.semantic_fps, 3) if vision.semantic_enabled else 0,
+                    "effective_rate": (
+                        round(self._activity.scaled_fps(vision.semantic_fps, now), 3)
+                        if vision.semantic_enabled
+                        else 0
+                    ),
                 },
                 {
                     "name": "OCR full-frame",
@@ -2583,7 +2606,8 @@ class CompanionRuntime:
 
     async def _narrative_semantic_scheduler(self) -> None:
         """Run model-authored, tool-using narrative synthesis only while quiet."""
-        if self._memory is None:
+        if self._memory is None or not self.config.default_mode.enabled:
+            self.telemetry.record_narrative_semantics({"state": "disabled"})
             await asyncio.Event().wait()
         self.telemetry.record_narrative_semantics({"state": "starting"})
         await asyncio.sleep(10.0)
@@ -3024,7 +3048,7 @@ class CompanionRuntime:
     async def _system_prompt_scheduler(self) -> None:
         """Periodically self-assess and rebuild the dynamic system prompt from cognitive
         documents, day-over-day recaps, and interaction outcome evidence."""
-        if self._memory is None:
+        if self._memory is None or not self.config.default_mode.enabled:
             self.telemetry.record_default_mode({"state": "system-prompt:disabled"})
             await asyncio.Event().wait()
         interval_seconds = max(120, min(
@@ -3369,7 +3393,8 @@ class CompanionRuntime:
         # Runs every vlm_text_check_interval seconds. VLM negative does NOT
         # prevent the frame path from running — they are independent.
         vlm_should_run = (
-            now - self._last_ocr_candidate_at.get(vlm_key, 0.0)
+            self.config.ocr.vlm_text_detection_enabled
+            and now - self._last_ocr_candidate_at.get(vlm_key, 0.0)
             >= self.config.ocr.vlm_text_check_interval
         )
         if vlm_should_run and self._ocr_readiness.can_use_omnius:
@@ -4146,7 +4171,7 @@ class CompanionRuntime:
     async def _backfill_world_model(self) -> None:
         """Retroactively populate world model from existing evidence on startup."""
         if self._memory is None:
-            return
+            await asyncio.Event().wait()
         await asyncio.sleep(2.0)  # let other components initialize first
         try:
             result = await asyncio.to_thread(
@@ -4158,6 +4183,10 @@ class CompanionRuntime:
                 logger.info("World model backfill: %s", result)
         except Exception as error:
             logger.debug("World model backfill failed: %s", error)
+        # This is a one-shot startup migration, but component supervisors expect
+        # long-lived coroutines. Stay parked after completion instead of being
+        # treated as a crash and relaunched every second forever.
+        await asyncio.Event().wait()
 
     async def _update_occupancy_maps(self) -> None:
         """Fused voxel occupancy from on-demand monocular metric depth.
@@ -5335,6 +5364,10 @@ class CompanionRuntime:
 
     async def _sweep_object_reviews(self) -> None:
         learning = self.config.object_learning
+        if not learning.confidence_audit_enabled:
+            self.telemetry.set_review_queue_depth(0)
+            await self._sweep_object_duplicate_adjudication()
+            return
         capacity = self._activity.background_capacity(time.monotonic())
         due = await asyncio.to_thread(self.objects.profiles_due_for_review, learning.review_stale_after_seconds)
         self.telemetry.set_review_queue_depth(len(due))
