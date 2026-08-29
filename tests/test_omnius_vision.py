@@ -462,15 +462,62 @@ def test_dialogue_router_can_select_live_vision_without_phrase_rules() -> None:
     asyncio.run(scenario())
 
 
+def test_realtime_tool_contract_executes_polite_capability_requests_semantically() -> None:
+    async def scenario() -> None:
+        client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+        captured: list[dict[str, str]] = []
+
+        async def realtime_chat(messages, *, allow_tool_requests) -> str:
+            assert allow_tool_requests
+            captured.extend(messages)
+            return "[[TOOL:WEB_SEARCH]]"
+
+        client._realtime_chat = realtime_chat  # type: ignore[method-assign]
+        reply = await client.conversation_reply(
+            "Can you look up the news?", "No current news evidence is present.", []
+        )
+
+        assert reply == "[[TOOL:WEB_SEARCH]]"
+        contract = next(
+            item["content"]
+            for item in captured
+            if item["role"] == "system" and "polite request to perform it now" in item["content"]
+        )
+        assert "polite request to perform it now" in contract
+        assert "instead of answering only that you can" in contract
+        assert "explicitly asks only about capabilities" in contract
+        assert "semantic decisions from complete context" in contract
+
+    asyncio.run(scenario())
+
+
 def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     assert OmniusClient.parse_realtime_tool_request("[[TOOL:VISION]]") == "vision"
     assert OmniusClient.parse_realtime_tool_request(" [[ tool: web_search ]] ") == "web_search"
+    assert OmniusClient.parse_realtime_tool_handoff(
+        "[[TOOL:WEB_SEARCH|top current news headlines]]"
+    ) == ("web_search", "top current news headlines")
     assert OmniusClient.parse_realtime_tool_request("[[TOOL:SHELL]]") == "shell"
     assert OmniusClient.parse_realtime_tool_request("I could use the shell") is None
     assert OmniusClient.parse_realtime_tool_request("I need local evidence. [[TOOL:SHELL]]") == "shell"
+    assert OmniusClient.parse_realtime_tool_handoff(
+        "[[TOOL:SHELL|systemctl status egg]]"
+    ) == ("shell", "systemctl status egg")
     assert OmniusClient.parse_realtime_tool_request(
         "[[TOOL:SHELL]] [[TOOL:WEB_SEARCH]]"
     ) is None
+
+
+def test_web_search_urls_are_parsed_only_from_typed_result_fields() -> None:
+    evidence = (
+        "1. First\n   URL: https://example.com/one\n\n"
+        "Natural language mentioning https://ignored.example/ is not a URL field.\n\n"
+        "2. Second\n   URL: https://example.com/two\n"
+    )
+    assert OmniusClient.web_search_result_urls(evidence) == [
+        "https://example.com/one",
+        "https://example.com/two",
+    ]
 
 
 def test_read_only_shell_policy_is_structural_not_intent_routing() -> None:

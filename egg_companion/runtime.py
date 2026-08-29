@@ -5933,7 +5933,9 @@ class CompanionRuntime:
         )
         if not self._conversation_turns.can_publish(turn.revision):
             return
-        tool_intent = self._omnius.parse_realtime_tool_request(reply)
+        tool_handoff = self._omnius.parse_realtime_tool_handoff(reply)
+        tool_intent = tool_handoff[0] if tool_handoff is not None else None
+        tool_query = tool_handoff[1] if tool_handoff is not None else None
         if tool_intent == "vision":
             visual_reply = await self._visual_tool_reply(
                 turn,
@@ -5960,7 +5962,7 @@ class CompanionRuntime:
                 )
         elif tool_intent == "web_search":
             context = await self._context_with_web_search(
-                turn.utterance_id, transcript[:300], context
+                turn.utterance_id, tool_query or transcript[:300], context
             )
             if not self._conversation_turns.can_publish(turn.revision):
                 return
@@ -5972,7 +5974,10 @@ class CompanionRuntime:
             )
         elif tool_intent == "shell":
             context = await self._context_with_read_only_shell(
-                turn.utterance_id, transcript[:500], context
+                turn.utterance_id,
+                transcript[:500],
+                context,
+                preplanned_command=tool_query,
             )
             if not self._conversation_turns.can_publish(turn.revision):
                 return
@@ -6176,7 +6181,7 @@ class CompanionRuntime:
         started = time.monotonic()
         self._record_turn_tool_start(context_id, "web_search", query)
         try:
-            evidence = await self._omnius.web_search(query)
+            evidence = await self._omnius.web_search_with_pages(query)
             self._record_turn_tool_call(
                 context_id,
                 "web_search",
@@ -6205,25 +6210,33 @@ class CompanionRuntime:
             )
 
     async def _context_with_read_only_shell(
-        self, context_id: str, request: str, context: str
+        self,
+        context_id: str,
+        request: str,
+        context: str,
+        *,
+        preplanned_command: str | None = None,
     ) -> str:
         started = time.monotonic()
         self._record_turn_tool_start(context_id, "shell", request)
         command = None
         try:
-            plan = await self._omnius.plan_read_only_shell_command(request, context)
-            if (
-                plan is None
-                or plan.get("read_only") is not True
-                or not isinstance(plan.get("command"), str)
-            ):
-                reason = (
-                    str(plan.get("reason"))
-                    if isinstance(plan, dict) and plan.get("reason")
-                    else "request did not resolve to one read-only diagnostic command"
-                )
-                raise ValueError(reason)
-            command = str(plan["command"])
+            if preplanned_command:
+                command = " ".join(preplanned_command.split())[:500]
+            else:
+                plan = await self._omnius.plan_read_only_shell_command(request, context)
+                if (
+                    plan is None
+                    or plan.get("read_only") is not True
+                    or not isinstance(plan.get("command"), str)
+                ):
+                    reason = (
+                        str(plan.get("reason"))
+                        if isinstance(plan, dict) and plan.get("reason")
+                        else "request did not resolve to one read-only diagnostic command"
+                    )
+                    raise ValueError(reason)
+                command = str(plan["command"])
             allowed, policy_reason = self._omnius.validate_read_only_shell_command(
                 command
             )

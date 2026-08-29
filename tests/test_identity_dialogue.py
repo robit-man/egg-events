@@ -336,12 +336,12 @@ def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> N
         async def conversation(utterance, context, history, *, allow_tool_requests=True):
             contexts.append((context, allow_tool_requests))
             if allow_tool_requests:
-                return "[[TOOL:WEB_SEARCH]]"
+                return "[[TOOL:WEB_SEARCH|current test launch news]]"
             assert "WEB SEARCH TOOL EVIDENCE" in context
             return "The retrieved headline says the test launch succeeded."
 
         async def web_search(query: str):
-            assert query == "Tell me what happened online."
+            assert query == "current test launch news"
             return "Test launch succeeded — https://example.test/news"
 
         async def speak(text: str, expected_revision: int | None = None) -> bool:
@@ -349,7 +349,7 @@ def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> N
             return True
 
         runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
-        runtime._omnius.web_search = web_search  # type: ignore[method-assign]
+        runtime._omnius.web_search_with_pages = web_search  # type: ignore[method-assign]
         runtime._speak = speak  # type: ignore[method-assign]
         turn = runtime._conversation_turns.finalize_audio_turn(
             "Tell me what happened online.",
@@ -375,16 +375,12 @@ def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() ->
         async def conversation(utterance, context, history, *, allow_tool_requests=True):
             contexts.append((context, allow_tool_requests))
             if allow_tool_requests:
-                return "[[TOOL:SHELL]]"
+                return "[[TOOL:SHELL|git status --short]]"
             assert "READ-ONLY SHELL TOOL EVIDENCE" in context
             return "The working tree is clean."
 
         async def plan(request: str, context: str):
-            return {
-                "command": "git status --short",
-                "read_only": True,
-                "reason": "This inspects repository state.",
-            }
+            raise AssertionError("native shell command should not require a second model plan")
 
         async def run(command: str, working_dir: str):
             assert command == "git status --short"
