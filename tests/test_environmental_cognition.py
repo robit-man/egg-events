@@ -551,3 +551,32 @@ def test_preempted_candidate_yields_immediately_to_newer_room_event() -> None:
         assert state["stale"] == 1
 
     asyncio.run(scenario())
+
+
+def test_background_timeout_releases_candidate_without_runtime_error() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_runtime_config())
+        stimulus = _runtime_stimulus(runtime)
+        attempted = asyncio.Event()
+
+        async def ponder(_stimulus, _salience):
+            attempted.set()
+            raise asyncio.TimeoutError
+
+        runtime._ponder_environmental_stimulus = ponder  # type: ignore[method-assign]
+        runtime._environmental_stimuli.put_nowait(stimulus)
+        worker = asyncio.create_task(runtime._process_environmental_cognition())
+        try:
+            await asyncio.wait_for(attempted.wait(), timeout=1)
+            await asyncio.sleep(0)
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+        snapshot = runtime.telemetry.snapshot(runtime.config)
+        state = snapshot["environmental_cognition"]
+        assert state["timed_out"] == 1
+        assert state["errors"] == 0
+        assert not snapshot["runtime_errors"]
+
+    asyncio.run(scenario())

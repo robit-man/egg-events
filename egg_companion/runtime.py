@@ -1651,6 +1651,21 @@ class CompanionRuntime:
                         )
                         break
                     continue
+                except asyncio.TimeoutError:
+                    self.telemetry.record_environmental_cognition(
+                        "timed_out",
+                        stimulus_id=stimulus.stimulus_id,
+                        camera_id=stimulus.camera_id,
+                        salience=stimulus.decayed_salience(
+                            time.monotonic(),
+                            self.config.environmental_cognition.salience_half_life_seconds,
+                        ),
+                        detail=(
+                            "background inference exceeded its bounded request window; "
+                            "the event was released to preserve foreground capacity"
+                        ),
+                    )
+                    break
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
