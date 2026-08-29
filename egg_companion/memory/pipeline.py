@@ -34,6 +34,11 @@ class MemoryPipeline:
         self.default_mode = DefaultModeNetwork(
             store, default_mode_config
         )
+        self._environmental_reflection_characters = getattr(
+            getattr(config, "environmental_cognition", None),
+            "reflection_characters",
+            900,
+        )
         self.store.refresh_model_narrative_documents()
         self.accepted_events = 0
         self.closed_episodes = 0
@@ -411,6 +416,67 @@ class MemoryPipeline:
         # World model integration: create WorldDelta and apply to world state
         # This happens AFTER memory persistence so raw evidence survives if world model fails
         self._apply_world_delta(event, confidences)
+        if event.event_type == "environmental_reflection":
+            self._update_environmental_working_set(event)
+
+    def _update_environmental_working_set(self, event: PerceptualEvent) -> None:
+        """Fold inspectable event-grounded thoughts into later recall/dream context."""
+
+        reflection = event.payload.get("environmental_reflection")
+        if not isinstance(reflection, dict):
+            return
+        summary = " ".join(str(reflection.get("reflection") or "").split())
+        if not summary:
+            return
+        connections = [
+            " ".join(str(item).split())
+            for item in reflection.get("connections", [])
+            if isinstance(item, str) and item.strip()
+        ][:6]
+        questions = [
+            " ".join(str(item).split())
+            for item in reflection.get("open_questions", [])
+            if isinstance(item, str) and item.strip()
+        ][:6]
+        entry = f"[{event.occurred_at.isoformat()}] {summary}"
+        if connections:
+            entry += " Connections: " + "; ".join(connections)
+        if questions:
+            entry += " Open questions: " + "; ".join(questions)
+
+        document_id = "cognitive-document:environmental-working-set"
+        existing = self.store.entity_metadata(document_id)
+        metadata = existing.get("metadata") if isinstance(existing, dict) else {}
+        prior_content = (
+            str(metadata.get("content") or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        lines = [entry, *prior_content.splitlines()]
+        content = "\n".join(dict.fromkeys(line for line in lines if line.strip()))
+        content = content[: int(self._environmental_reflection_characters)]
+        prior_sources = (
+            list(metadata.get("source_entity_ids", []))
+            if isinstance(metadata, dict)
+            and isinstance(metadata.get("source_entity_ids"), list)
+            else []
+        )
+        source_ids = list(
+            dict.fromkeys(
+                [
+                    *event.entity_ids,
+                    *prior_sources,
+                ]
+            )
+        )[:100]
+        self.store.upsert_cognitive_document(
+            "environmental-working-set",
+            "Environmental working set",
+            content,
+            float(reflection.get("confidence") or 0.0),
+            source_ids,
+            event.occurred_at,
+        )
 
     def knowledge_graph_snapshot(self, node_limit: int = 1500) -> dict[str, object]:
         return self.store.knowledge_graph_snapshot(node_limit)

@@ -49,6 +49,11 @@ from egg_companion.config import EggConfig
 from egg_companion.core.activity import ActivityGovernor
 from egg_companion.core.attention import AttentionManager
 from egg_companion.core.cognition import CognitiveAttentionController, InteractionPolicy
+from egg_companion.core.environmental_cognition import (
+    AdaptiveVisualNovelty,
+    EnvironmentalNoveltyTracker,
+    EnvironmentalStimulus,
+)
 from egg_companion.core.occupancy import (
     VoxelGrid,
     resolve_camera_yaw_degrees,
@@ -195,6 +200,12 @@ class CompanionRuntime:
             max_targets=config.attention.max_targets,
         )
         self._activity = ActivityGovernor(config.activity)
+        self._environmental_novelty = EnvironmentalNoveltyTracker(
+            config.environmental_cognition
+        )
+        self._raw_visual_novelty = AdaptiveVisualNovelty(
+            config.environmental_cognition
+        )
         self._cognitive_attention = CognitiveAttentionController(
             config.cognitive_attention, config.attention.proactive_speech_enabled
         )
@@ -226,6 +237,9 @@ class CompanionRuntime:
                 config.object_learning.model_copy(update={"enabled": False})
             )
         self._observations: asyncio.Queue[Observation] = asyncio.Queue(config.runtime.event_queue_size)
+        self._environmental_stimuli: asyncio.Queue[EnvironmentalStimulus] = (
+            asyncio.Queue(config.environmental_cognition.queue_size)
+        )
         self._speech_segments: asyncio.Queue[_SpeechSegment] = asyncio.Queue(
             config.runtime.speech_queue_size
         )
@@ -309,6 +323,9 @@ class CompanionRuntime:
         self._turn_visual_snapshots: dict[str, _TurnVisualSnapshot] = {}
         self._turn_acoustic_context: dict[str, dict[str, object]] = {}
         self._background_visual_tasks: set[asyncio.Future] = set()
+        self._environmental_foreground_idle = asyncio.Event()
+        self._environmental_foreground_idle.set()
+        self._latest_environmental_assessment: dict[str, object] | None = None
         self._last_object_candidate_at = 0.0
         self._last_vlm_at = 0.0
         self._object_recall_lock = threading.Lock()
@@ -889,6 +906,7 @@ class CompanionRuntime:
             ("vision-readiness", self._maintain_vision),
             ("omnius-readiness", self._maintain_omnius),
             ("attention", self._attend),
+            ("environmental-cognition", self._process_environmental_cognition),
             ("audio-waveform", self._stream_waveform),
             ("speech-recognition", self._process_speech),
             ("conversation-reasoning", self._reason_about_transcript),
@@ -1101,6 +1119,30 @@ class CompanionRuntime:
                         self.telemetry.set_rotation(camera.config.id, angle)
                         logger.info("camera %s orientation locked to %s degrees", camera.config.id, angle)
                     frame = self._rotate_frame(frame, angle)
+                    if self.config.environmental_cognition.enabled:
+                        raw_novelty, wake_perception, learned_threshold = (
+                            self._raw_visual_novelty.observe(
+                                camera.config.id, frame, now
+                            )
+                        )
+                        if wake_perception:
+                            # This tiny pixel-domain sentinel supplies no label or
+                            # intent. It only makes the next sparse full perception
+                            # pass due now, so a changed room does not wait for the
+                            # long verbal-first YOLO interval.
+                            next_analysis_at = min(next_analysis_at, now)
+                            self._activity.note_visual(
+                                raw_novelty, False, now, camera.config.id
+                            )
+                            self.telemetry.record_environmental_cognition(
+                                "pixel_novelty",
+                                camera_id=camera.config.id,
+                                salience=raw_novelty,
+                                detail=(
+                                    "content-agnostic frame surprise woke sparse perception; "
+                                    f"adaptive_threshold={learned_threshold:.4f}"
+                                ),
+                            )
                     self._latest_frame = frame.copy()
                     self._latest_frames[camera.config.id] = (frame.copy(), now)
                     if analysis_task is not None and analysis_task.done():
@@ -1483,14 +1525,510 @@ class CompanionRuntime:
             observation = await self._observations.get()
             tick = self._brain.perceive(observation)
             self.telemetry.record_brain_tick(tick)
+            now = time.monotonic()
             self._activity.note_visual(
                 tick.novelty,
                 bool(observation.detections),
-                time.monotonic(),
+                now,
                 observation.camera_id,
             )
+            if self.config.environmental_cognition.enabled:
+                stimulus = self._environmental_novelty.observe(
+                    observation,
+                    tick.decisions,
+                    tick.novelty,
+                    now,
+                )
+                if stimulus is not None:
+                    self._queue_environmental_stimulus(stimulus)
             for target, decision in tick.decisions:
                 await self._handle_target(target, decision, observation)
+
+    def _queue_environmental_stimulus(
+        self, stimulus: EnvironmentalStimulus
+    ) -> None:
+        if self._environmental_stimuli.full():
+            displaced = self._environmental_stimuli.get_nowait()
+            self.telemetry.record_environmental_cognition(
+                "coalesced",
+                stimulus_id=displaced.stimulus_id,
+                camera_id=displaced.camera_id,
+                salience=displaced.salience,
+                detail="older unprocessed perceptual change superseded by fresher evidence",
+            )
+        self._environmental_stimuli.put_nowait(stimulus)
+        self.telemetry.record_environmental_cognition(
+            "queued",
+            stimulus_id=stimulus.stimulus_id,
+            camera_id=stimulus.camera_id,
+            salience=stimulus.salience,
+            detail=", ".join(stimulus.causes),
+        )
+
+    def _environmental_foreground_is_idle(self) -> bool:
+        return not (
+            self._speaking
+            or self._speaker.is_playing
+            or self._conversation_turns.pending_ingress > 0
+            or self._active_reasoning_task is not None
+            or not self._speech_segments.empty()
+            or not self._utterances.empty()
+        )
+
+    async def _wait_for_environmental_foreground(
+        self, stimulus: EnvironmentalStimulus
+    ) -> float | None:
+        settings = self.config.environmental_cognition
+        while True:
+            salience = stimulus.decayed_salience(
+                time.monotonic(), settings.salience_half_life_seconds
+            )
+            if salience < settings.minimum_salience:
+                self.telemetry.record_environmental_cognition(
+                    "faded",
+                    stimulus_id=stimulus.stimulus_id,
+                    camera_id=stimulus.camera_id,
+                    salience=salience,
+                    detail="novelty decayed before background inference obtained the floor",
+                )
+                return None
+            if self._environmental_foreground_is_idle():
+                return salience
+            self._environmental_foreground_idle.clear()
+            # Close the check/set race without polling: foreground transitions
+            # set this event when ingress, reasoning, and playback are all idle.
+            if self._environmental_foreground_is_idle():
+                self._environmental_foreground_idle.set()
+                continue
+            self.telemetry.record_environmental_cognition(
+                "yielded",
+                stimulus_id=stimulus.stimulus_id,
+                camera_id=stimulus.camera_id,
+                salience=salience,
+                detail="live human speech owns inference",
+            )
+            await self._environmental_foreground_idle.wait()
+
+    async def _process_environmental_cognition(self) -> None:
+        if not self.config.environmental_cognition.enabled:
+            self.telemetry.record_environmental_cognition(
+                "disabled", detail="environmental cognition disabled by configuration"
+            )
+            await asyncio.Event().wait()
+        while True:
+            stimulus = await self._environmental_stimuli.get()
+            while True:
+                salience = await self._wait_for_environmental_foreground(stimulus)
+                if salience is None:
+                    break
+                try:
+                    await self._ponder_environmental_stimulus(stimulus, salience)
+                    break
+                except _BackgroundVisionPreempted:
+                    self.telemetry.record_environmental_cognition(
+                        "preempted",
+                        stimulus_id=stimulus.stimulus_id,
+                        camera_id=stimulus.camera_id,
+                        salience=stimulus.decayed_salience(
+                            time.monotonic(),
+                            self.config.environmental_cognition.salience_half_life_seconds,
+                        ),
+                        detail="human speech cancelled background environmental inference",
+                    )
+                    if not self._environmental_stimuli.empty():
+                        self.telemetry.record_environmental_cognition(
+                            "stale",
+                            stimulus_id=stimulus.stimulus_id,
+                            camera_id=stimulus.camera_id,
+                            salience=stimulus.decayed_salience(
+                                time.monotonic(),
+                                self.config.environmental_cognition.salience_half_life_seconds,
+                            ),
+                            detail=(
+                                "preempted perceptual evidence was superseded by a newer "
+                                "room event"
+                            ),
+                        )
+                        break
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception(
+                        "event-driven environmental cognition failed for %s",
+                        stimulus.stimulus_id,
+                    )
+                    self.telemetry.record_environmental_cognition(
+                        "error",
+                        stimulus_id=stimulus.stimulus_id,
+                        camera_id=stimulus.camera_id,
+                        salience=salience,
+                        detail=f"{type(error).__name__}: {error}",
+                    )
+                    self.telemetry.record_runtime_error(
+                        "environmental-cognition", error
+                    )
+                    break
+
+    async def _ponder_environmental_stimulus(
+        self, stimulus: EnvironmentalStimulus, salience: float
+    ) -> None:
+        started = time.monotonic()
+        self.telemetry.record_environmental_cognition(
+            "grounding",
+            stimulus_id=stimulus.stimulus_id,
+            camera_id=stimulus.camera_id,
+            salience=salience,
+            detail=", ".join(stimulus.causes),
+        )
+        snapshot = self._capture_turn_visual_snapshot(
+            stimulus.stimulus_id, time.monotonic()
+        )
+        self._turn_visual_snapshots.pop(stimulus.stimulus_id, None)
+        if not snapshot.frames:
+            self.telemetry.record_environmental_cognition(
+                "stale",
+                stimulus_id=stimulus.stimulus_id,
+                camera_id=stimulus.camera_id,
+                salience=salience,
+                detail="no camera pixels were fresh enough for grounded consideration",
+            )
+            return
+        encoded_frames = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    self._encode_visual_question_frame, visual.frame
+                )
+                for visual in snapshot.frames
+            )
+        )
+        visual_inputs = [
+            (visual.camera_id, encoded, visual.captured_at.isoformat())
+            for visual, encoded in zip(
+                snapshot.frames, encoded_frames, strict=True
+            )
+        ]
+        signal = self._environmental_signal(stimulus, salience)
+        assessment = await self._run_background_visual(
+            self._omnius.assess_environmental_change(
+                visual_inputs,
+                signal,
+                self._latest_environmental_assessment,
+            )
+        )
+        if assessment is None:
+            raise RuntimeError("Ornith returned invalid environmental assessment JSON")
+        self._latest_environmental_assessment = {
+            **assessment,
+            "stimulus_id": stimulus.stimulus_id,
+            "assessed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.telemetry.record_environmental_cognition(
+            "grounded",
+            stimulus_id=stimulus.stimulus_id,
+            camera_id=stimulus.camera_id,
+            salience=stimulus.decayed_salience(
+                time.monotonic(),
+                self.config.environmental_cognition.salience_half_life_seconds,
+            ),
+            detail=str(
+                assessment.get("meaningful_change")
+                or assessment.get("scene_summary")
+                or "no meaningful visual change"
+            ),
+            assessment=assessment,
+        )
+        if (
+            stimulus.sequence < self._environmental_novelty.sequence
+            and not self._environmental_stimuli.empty()
+        ):
+            self.telemetry.record_environmental_cognition(
+                "stale",
+                stimulus_id=stimulus.stimulus_id,
+                camera_id=stimulus.camera_id,
+                salience=salience,
+                detail="newer perceptual evidence arrived during visual grounding",
+                assessment=assessment,
+            )
+            return
+
+        current_salience = stimulus.decayed_salience(
+            time.monotonic(),
+            self.config.environmental_cognition.salience_half_life_seconds,
+        )
+        if current_salience < self.config.environmental_cognition.minimum_salience:
+            self.telemetry.record_environmental_cognition(
+                "faded",
+                stimulus_id=stimulus.stimulus_id,
+                camera_id=stimulus.camera_id,
+                salience=current_salience,
+                detail="novelty faded after visual grounding; no deliberation spent",
+                assessment=assessment,
+            )
+            return
+        memory_query = str(
+            assessment.get("memory_query")
+            or assessment.get("scene_summary")
+            or "current environment"
+        )
+        memory_context = await self._cognitive_context(memory_query, snapshot)
+        retrieval = self._memory.retrieval_snapshot() if self._memory is not None else []
+        signal = self._environmental_signal(stimulus, current_salience)
+        deliberation = await self._run_background_visual(
+            self._omnius.deliberate_environmental_response(
+                assessment,
+                signal,
+                memory_context,
+                self._conversation_turns.prompt_history(),
+            )
+        )
+        if deliberation is None:
+            raise RuntimeError("Ornith returned invalid environmental deliberation JSON")
+        asyncio.create_task(
+            self._queue_environmental_reflection_memory(
+                stimulus,
+                snapshot,
+                encoded_frames,
+                assessment,
+                deliberation,
+                retrieval,
+            ),
+            name=f"environmental-memory:{stimulus.stimulus_id}",
+        )
+        self.telemetry.record_environmental_cognition(
+            "reflection_queued",
+            stimulus_id=stimulus.stimulus_id,
+            camera_id=stimulus.camera_id,
+            salience=current_salience,
+            detail=str(deliberation.get("reflection") or "")[:900],
+            assessment=assessment,
+            deliberation=deliberation,
+        )
+
+        action = str(deliberation["action"])
+        utterance = deliberation.get("utterance")
+        spoken = False
+        suppression: str | None = None
+        if action in {"speak", "ask"}:
+            if not self.config.environmental_cognition.outward_speech_enabled:
+                suppression = "outward environmental speech disabled"
+            elif assessment.get("people_visible") is not True:
+                suppression = "model found no visibly addressable person"
+            elif not self._fresh_person_present():
+                suppression = "person evidence was no longer current"
+            elif (
+                stimulus.sequence < self._environmental_novelty.sequence
+                or not self._environmental_stimuli.empty()
+            ):
+                suppression = "newer room evidence superseded the deliberation"
+            elif not self._environmental_foreground_is_idle():
+                suppression = "live conversation acquired the floor"
+            elif (
+                self._active_identity_question() is not None
+                or self._active_curiosity_question() is not None
+                or self.telemetry.pending_observation() is not None
+            ):
+                suppression = "an existing grounded question already owns the floor"
+            elif not isinstance(utterance, str) or not utterance.strip():
+                suppression = "model selected outward action without a valid utterance"
+            else:
+                spoken = await self._speak(
+                    utterance,
+                    expected_revision=self._conversation_turns.revision,
+                )
+                if not spoken:
+                    suppression = "speech was superseded or blocked by action policy"
+
+        detail = str(deliberation.get("reason") or action)
+        if suppression:
+            detail = f"{detail}; suppressed: {suppression}"
+        stage = (
+            "spoken"
+            if spoken
+            else "suppressed"
+            if suppression
+            else "silent"
+            if action == "silence"
+            else action
+        )
+        self.telemetry.record_environmental_cognition(
+            stage,
+            stimulus_id=stimulus.stimulus_id,
+            camera_id=stimulus.camera_id,
+            salience=stimulus.decayed_salience(
+                time.monotonic(),
+                self.config.environmental_cognition.salience_half_life_seconds,
+            ),
+            detail=detail,
+            assessment=assessment,
+            deliberation=deliberation,
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+        if action in {"speak", "ask"}:
+            reason = (
+                "model-authored event-grounded environmental outreach"
+                if spoken
+                else f"environmental outreach suppressed: {suppression}"
+            )
+            self.telemetry.record_interaction(
+                spoken, reason, "", str(utterance or "")
+            )
+            self._queue_interaction_memory(
+                "",
+                str(utterance or ""),
+                spoken,
+                reason,
+                context_id=stimulus.stimulus_id,
+            )
+
+    @staticmethod
+    def _environmental_signal(
+        stimulus: EnvironmentalStimulus, salience: float
+    ) -> dict[str, object]:
+        return {
+            "stimulus_id": stimulus.stimulus_id,
+            "sequence": stimulus.sequence,
+            "camera_id": stimulus.camera_id,
+            "observed_at": stimulus.observed_at.isoformat(),
+            "salience_now": round(salience, 6),
+            "salience_at_observation": stimulus.salience,
+            "raw_salience": stimulus.raw_salience,
+            "habituation": stimulus.habituation,
+            "structural_causes": list(stimulus.causes),
+            "previous_person_count": stimulus.previous_person_count,
+            "current_person_count": stimulus.current_person_count,
+            "previous_person_ids": list(stimulus.previous_person_ids),
+            "current_person_ids": list(stimulus.current_person_ids),
+            "entity_ids": list(stimulus.entity_ids),
+            "semantic_labels": list(stimulus.semantic_labels),
+            "attention_components": dict(stimulus.attention_components),
+        }
+
+    def _fresh_person_present(self) -> bool:
+        now = datetime.now(timezone.utc)
+        maximum_age = (
+            self.config.environmental_cognition.current_evidence_max_age_seconds
+        )
+        return any(
+            detection.label == "person"
+            for observation in self._latest_observations.values()
+            if (now - observation.timestamp).total_seconds() <= maximum_age
+            for detection in observation.detections
+        )
+
+    async def _queue_environmental_reflection_memory(
+        self,
+        stimulus: EnvironmentalStimulus,
+        snapshot: _TurnVisualSnapshot,
+        encoded_frames: list[bytes],
+        assessment: dict[str, object],
+        deliberation: dict[str, object],
+        retrieval: list[dict[str, object]],
+    ) -> None:
+        if self._memory is None:
+            return
+        reflection_id = "reflection:environmental:" + hashlib.sha256(
+            stimulus.stimulus_id.encode()
+        ).hexdigest()[:24]
+        evidence: list[EvidenceRef] = []
+        for visual, encoded in zip(snapshot.frames, encoded_frames, strict=True):
+            media_key = None
+            checksum = hashlib.sha256(encoded).hexdigest()
+            if self.config.memory.retain_raw_media:
+                try:
+                    media_key, checksum = await asyncio.to_thread(
+                        self._memory.persist_media,
+                        (
+                            f"environmental-cognition/{snapshot.boundary_at:%Y/%m/%d}/"
+                            f"{hashlib.sha256(stimulus.stimulus_id.encode()).hexdigest()[:16]}-"
+                            f"{visual.camera_id}.jpg"
+                        ),
+                        encoded,
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "environmental grounding frame could not be retained: %s",
+                        error,
+                    )
+            evidence.append(
+                EvidenceRef(
+                    str(uuid4()),
+                    "vision",
+                    visual.captured_at,
+                    "ornith-environmental-reflection",
+                    visual.camera_id,
+                    media_key=media_key,
+                    quality=float(assessment.get("confidence") or 0.0),
+                    metadata={
+                        "stimulus": self._environmental_signal(
+                            stimulus,
+                            stimulus.decayed_salience(
+                                time.monotonic(),
+                                self.config.environmental_cognition.salience_half_life_seconds,
+                            ),
+                        ),
+                        "assessment": dict(assessment),
+                        "deliberation": dict(deliberation),
+                        "retrieval_influences": retrieval[:12],
+                        "model_id": self.config.omnius.model,
+                        "vision_model_id": self.config.omnius.vision_model,
+                        "inspectable_reflection_not_chain_of_thought": True,
+                        "_media_checksum": checksum,
+                    },
+                )
+            )
+        source_ids = tuple(dict.fromkeys(stimulus.entity_ids))
+        relations = [
+            {
+                "source_id": reflection_id,
+                "relation": "reflects_on",
+                "target_id": entity_id,
+                "confidence": float(deliberation.get("confidence") or 0.0),
+                "metadata": {
+                    "stimulus_id": stimulus.stimulus_id,
+                    "revisable": True,
+                },
+            }
+            for entity_id in source_ids
+        ]
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "environmental_reflection",
+                snapshot.boundary_at,
+                "ornith-environmental-cognition",
+                tuple(evidence),
+                (reflection_id, *source_ids),
+                payload={
+                    "labels": ["environmental reflection"],
+                    "entities": [
+                        {
+                            "id": reflection_id,
+                            "type": "reflection",
+                            "label": str(deliberation["reflection"])[:300],
+                            "confidence": float(
+                                deliberation.get("confidence") or 0.0
+                            ),
+                            "reflection_kind": "event-grounded-environmental",
+                            "summary": str(deliberation["reflection"]),
+                            "connections": list(
+                                deliberation.get("connections", [])
+                            ),
+                            "open_questions": list(
+                                deliberation.get("open_questions", [])
+                            ),
+                            "assessment": dict(assessment),
+                            "action": deliberation.get("action"),
+                            "revisable": True,
+                        }
+                    ],
+                    "relations": relations,
+                    "skip_pairwise_co_observation": True,
+                    "stimulus_id": stimulus.stimulus_id,
+                    "environmental_reflection": dict(deliberation),
+                },
+            )
+        )
 
     async def _report_activity(self) -> None:
         """Surface the ActivityGovernor's alertness and the effective
@@ -1703,6 +2241,7 @@ class CompanionRuntime:
         # prevents a dream pass from adding its full generation time to a live
         # turn. The schedulers retain their source ledger and retry when quiet.
         self._last_valid_speech_at = started_at
+        self._environmental_foreground_idle.clear()
         for task in tuple(self._background_visual_tasks):
             if not task.done():
                 task.cancel()
@@ -1784,7 +2323,11 @@ class CompanionRuntime:
             return await task
         except asyncio.CancelledError:
             parent = asyncio.current_task()
-            if parent is not None and parent.cancelling():
+            cancelling = getattr(parent, "cancelling", None)
+            parent_is_cancelling = bool(cancelling()) if callable(cancelling) else bool(
+                getattr(parent, "_must_cancel", False)
+            )
+            if parent_is_cancelling:
                 raise
             raise _BackgroundVisionPreempted from None
         finally:
@@ -7791,6 +8334,12 @@ class CompanionRuntime:
         self.telemetry.record_voice_transition(
             self._conversation_turns.snapshot(), reason
         )
+        idle_event = getattr(self, "_environmental_foreground_idle", None)
+        if idle_event is not None:
+            if self._environmental_foreground_is_idle():
+                idle_event.set()
+            else:
+                idle_event.clear()
 
     def _encode_frame(self, frame: np.ndarray) -> bytes:
         import cv2

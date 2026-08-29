@@ -225,6 +225,30 @@ class ActivityConfig(BaseModel):
     novelty_threshold: float = Field(default=0.12, ge=0, le=1)
 
 
+class EnvironmentalCognitionConfig(BaseModel):
+    """Event-driven visual grounding, reflection, and optional social outreach.
+
+    Numeric bounds here govern inference cost and evidence freshness. They do
+    not map scene labels, gestures, phrases, or identities to an action; Ornith
+    decides whether an admitted perceptual change warrants silence, reflection,
+    a statement, or a question.
+    """
+
+    enabled: bool = True
+    outward_speech_enabled: bool = True
+    queue_size: int = Field(default=1, ge=1, le=8)
+    minimum_salience: float = Field(default=0.18, ge=0, le=1)
+    salience_half_life_seconds: float = Field(default=45.0, gt=0, le=3600)
+    habituation_half_life_seconds: float = Field(default=600.0, gt=0, le=86400)
+    current_evidence_max_age_seconds: float = Field(default=30.0, gt=0, le=300)
+    raw_frame_width: int = Field(default=64, ge=24, le=320)
+    raw_novelty_minimum: float = Field(default=0.045, ge=0.001, le=1)
+    raw_surprise_sigma: float = Field(default=3.0, ge=0.5, le=10)
+    raw_reference_blend: float = Field(default=0.08, gt=0, le=1)
+    raw_probe_min_interval_seconds: float = Field(default=4.0, ge=0, le=300)
+    reflection_characters: int = Field(default=900, ge=200, le=4000)
+
+
 class IdentityConfig(BaseModel):
     enabled: bool = True
     storage_dir: str = "data/identity-library"
@@ -561,6 +585,9 @@ class EggConfig(BaseModel):
     system_service: SystemServiceConfig | None = None
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
+    environmental_cognition: EnvironmentalCognitionConfig = Field(
+        default_factory=EnvironmentalCognitionConfig
+    )
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     dreams: DreamsConfig = Field(default_factory=DreamsConfig)
     object_learning: ObjectLearningConfig = Field(default_factory=ObjectLearningConfig)

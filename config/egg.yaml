@@ -165,6 +165,27 @@ activity:
   decay_seconds: 8
   novelty_threshold: 0.12
 
+# Event-driven environmental cognition. A tiny grayscale frame sentinel wakes
+# the otherwise sparse YOLO pass when the pixel distribution changes. The
+# resulting structural person/scene change is grounded by Ornith, combined
+# with memory/world context, and then Ornith independently chooses silence,
+# private reflection, a natural statement, or a grounded question. There is no
+# fixed-time outreach and no scene-label/gesture-to-speech rule.
+environmental_cognition:
+  enabled: true
+  outward_speech_enabled: true
+  queue_size: 1
+  minimum_salience: 0.18
+  salience_half_life_seconds: 45
+  habituation_half_life_seconds: 600
+  current_evidence_max_age_seconds: 30
+  raw_frame_width: 64
+  raw_novelty_minimum: 0.045
+  raw_surprise_sigma: 3
+  raw_reference_blend: 0.08
+  raw_probe_min_interval_seconds: 4
+  reflection_characters: 900
+
 identity:
   enabled: true
   storage_dir: data/identity-library

@@ -582,6 +582,9 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             {
                 "attention": snapshot["attention_decisions"],
                 "interactions": snapshot["interaction_decisions"],
+                "environmental_cognition": snapshot.get(
+                    "environmental_cognition", {}
+                ),
                 "retrieval": snapshot.get("retrieval_hits", []),
                 "consolidation": snapshot["consolidation"],
                 "memory": snapshot["memory"],

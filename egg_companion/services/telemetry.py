@@ -156,6 +156,23 @@ class RuntimeTelemetry:
             "last_source": None,
             "modalities": [],
         }
+        self._environmental_cognition: dict[str, object] = {
+            "state": "idle",
+            "queued": 0,
+            "coalesced": 0,
+            "grounded": 0,
+            "reflected": 0,
+            "silent": 0,
+            "spoken": 0,
+            "suppressed": 0,
+            "preempted": 0,
+            "faded": 0,
+            "stale": 0,
+            "errors": 0,
+            "pixel_wakeups": 0,
+            "last": None,
+            "recent": [],
+        }
 
     def set_rotation(self, camera_id: str, angle: int) -> None:
         with self._lock:
@@ -336,6 +353,61 @@ class RuntimeTelemetry:
                 **dict(state),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+
+    def record_environmental_cognition(
+        self,
+        stage: str,
+        *,
+        stimulus_id: str | None = None,
+        camera_id: str | None = None,
+        salience: float | None = None,
+        detail: str | None = None,
+        assessment: dict[str, object] | None = None,
+        deliberation: dict[str, object] | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        counter = {
+            "queued": "queued",
+            "coalesced": "coalesced",
+            "grounded": "grounded",
+            "reflect": "reflected",
+            "reflection_queued": "reflected",
+            "silent": "silent",
+            "spoken": "spoken",
+            "suppressed": "suppressed",
+            "preempted": "preempted",
+            "faded": "faded",
+            "stale": "stale",
+            "error": "errors",
+            "pixel_novelty": "pixel_wakeups",
+        }.get(stage)
+        now = datetime.now(timezone.utc).isoformat()
+        entry: dict[str, object] = {
+            "state": stage,
+            "stimulus_id": stimulus_id,
+            "camera_id": camera_id,
+            "updated_at": now,
+        }
+        if salience is not None:
+            entry["salience"] = round(max(0.0, min(1.0, salience)), 4)
+        if detail is not None:
+            entry["detail"] = str(detail)[:1200]
+        if assessment is not None:
+            entry["assessment"] = dict(assessment)
+        if deliberation is not None:
+            entry["deliberation"] = dict(deliberation)
+        if duration_ms is not None:
+            entry["duration_ms"] = round(duration_ms, 1)
+        with self._lock:
+            if counter:
+                self._environmental_cognition[counter] = int(
+                    self._environmental_cognition.get(counter) or 0
+                ) + 1
+            self._environmental_cognition["state"] = stage
+            self._environmental_cognition["last"] = entry
+            recent = list(self._environmental_cognition["recent"])
+            recent.append(entry)
+            self._environmental_cognition["recent"] = recent[-24:]
 
     def record_runtime_error(self, component: str, detail: str | BaseException) -> None:
         if isinstance(detail, BaseException):
@@ -834,6 +906,18 @@ class RuntimeTelemetry:
                 "narrative_semantics": dict(self._narrative_semantics),
                 "gpu": dict(self._gpu),
                 "activity": dict(self._activity),
+                "environmental_cognition": {
+                    **self._environmental_cognition,
+                    "last": (
+                        dict(self._environmental_cognition["last"])
+                        if isinstance(self._environmental_cognition["last"], dict)
+                        else None
+                    ),
+                    "recent": [
+                        dict(item)
+                        for item in self._environmental_cognition["recent"]
+                    ],
+                },
                 "attention_decisions": list(self._attention_decisions),
                 "interaction_decisions": list(self._interaction_decisions),
                 "tool_calls": list(self._tool_calls),

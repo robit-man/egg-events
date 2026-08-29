@@ -192,10 +192,11 @@ class ContextAssembler:
             ),
         )
         priorities = {
-            "reflective-working-set": 0,
-            "communication-strategy": 1,
-            "world-model": 2,
-            "my-story": 3,
+            "environmental-working-set": 0,
+            "reflective-working-set": 1,
+            "communication-strategy": 2,
+            "world-model": 3,
+            "my-story": 4,
         }
         documents = sorted(
             self.store.cognitive_documents(),

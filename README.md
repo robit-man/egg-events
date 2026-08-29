@@ -25,6 +25,30 @@ Real-hardware companion runtime for a Jetson AGX with camera array, ReSpeaker di
 
 `egg_companion/core/activity.py`'s `ActivityGovernor` tracks one system-wide alertness scale from the same signals already flowing through the runtime: per-tick novelty and detection presence from `CognitiveArchitecture.perceive` (`_attend`), and ReSpeaker VAD speech detection (`_stream_waveform`). While the room holds novelty, a visible detection, or speech, alertness stays at `1.0` and vision analysis/pose/semantics (`vision.analysis_fps`/`pose_fps`/`semantic_fps`) and full-frame OCR (`ocr.full_frame_interval_seconds`) run at their configured rate. After `activity.decay_seconds` of a genuinely empty, silent scene, alertness decays exponentially toward `activity.idle_floor`, throttling that same inference down proportionally — the quiet-room analogue of reduced visual/auditory vigilance. Any new novelty, presence, or speech resets alertness to full immediately; there is no cooldown on recovery. Set `activity.enabled: false` to keep every rate at its static configured value. Current alertness is visible on the dashboard telemetry snapshot under `activity`.
 
+`egg_companion/core/environmental_cognition.py` adds a separate event-driven
+environmental loop. A continuously sampled 64-pixel-wide grayscale sentinel
+learns each camera's ordinary pixel change and wakes one bounded full perception
+pass when the live distribution becomes surprising. It does not classify the
+frame or map motion to behavior. Perception then compares person, entity, scene,
+and prediction-error constellations structurally. Repeated transitions habituate,
+their novelty recovers gradually when absent, and every queued stimulus loses
+salience continuously while waiting. There is no cron or fixed-time outreach.
+
+An admitted event freezes fresh views from every available camera. Ornith first
+grounds what visibly changed and may conclude that nothing meaningful changed.
+Only then does memory retrieval place recent episodes, visible entities, the
+reconciled world state, social/observation policy, prior environmental thoughts,
+and reflective documents in front of Ornith. A second strict model contract
+chooses `silence`, `reflect`, `speak`, or `ask`; no detector label or code path can
+turn the event directly into speech. Every valid pass retains only a concise,
+inspectable, revisable reflection—not private chain-of-thought—and folds it into
+the `environmental-working-set` document for later dialogue and dream/narrative
+consolidation. Outward speech additionally requires fresh visible-person evidence,
+an unchanged scene revision, a free conversation floor, and normal action policy.
+Human speech immediately cancels either background model pass, preserving ASR,
+reply, and TTS priority. The complete event/decay/grounding/decision ledger is
+available under `telemetry.environmental_cognition` and on the Cognition page.
+
 ## Safety and privacy boundary
 
 The companion maintains an on-device profile gallery from validated face crops and masked objects. Identity and object evidence, embeddings, aliases, confidence, and provenance remain under `data/`; continuous video and rejected audio are not retained. Set `identity.enabled: false` or `object_learning.enabled: false` to disable collection. The loopback dashboard supports inspect, correction, metadata-only export, and cascade deletion, and never serializes raw embedding blobs.
