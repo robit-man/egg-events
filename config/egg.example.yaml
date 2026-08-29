@@ -80,6 +80,7 @@ omnius:
   vision_base_url: http://127.0.0.1:11434
   voice_model: supertonic
   chat_num_ctx: 4096
+  chat_history_messages: 12
   chat_keep_alive: 30m
   reasoning_enabled: false
   dialogue_router_enabled: false

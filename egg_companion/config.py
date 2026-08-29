@@ -169,6 +169,9 @@ class OmniusConfig(BaseModel):
     # an explicit value, namespaced Ornith manifests request their full 262K
     # training window and consume memory needed by ASR/TTS/VLM runtimes.
     chat_num_ctx: int = Field(default=4096, ge=2048, le=32768)
+    # Keep enough alternating heard/agent messages for natural follow-ups while
+    # leaving most of the bounded prompt window to grounded cognitive context.
+    chat_history_messages: int = Field(default=12, ge=4, le=24)
     # Retain the single multimodal model between spoken turns so visual work
     # and replies do not repeatedly pay a multi-second load/eviction penalty.
     chat_keep_alive: str = "30m"

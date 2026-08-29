@@ -130,12 +130,12 @@ omnius:
   bearer_token_env: EGG_OMNIUS_TOKEN
   timeout_seconds: 30
   chat_num_ctx: 4096
+  chat_history_messages: 12
   chat_keep_alive: 30m
   reasoning_enabled: false
-  # The realtime model owns tool selection. This is required for visual
-  # references to route to ASR-boundary camera evidence without phrase lists.
-  # Avoid a serial routing generation before every spoken answer. Explicit
-  # dashboard inspections and other on-demand VLM paths remain available.
+  # Avoid a serial routing generation before every spoken answer. The realtime
+  # model emits typed intent signals when camera, web, or read-only shell
+  # evidence is required; normal replies remain a single generation.
   dialogue_router_enabled: false
   visual_snapshot_max_age_seconds: 2.5
   visual_snapshot_max_cameras: 4
@@ -304,7 +304,7 @@ memory:
   retrieval_limit: 12
   graph_max_hops: 2
   graph_max_nodes: 80
-  context_max_characters: 3000
+  context_max_characters: 5000
   consolidation_interval_seconds: 300
   consolidation_batch_size: 20
 

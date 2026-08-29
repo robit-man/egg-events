@@ -462,6 +462,27 @@ def test_dialogue_router_can_select_live_vision_without_phrase_rules() -> None:
     asyncio.run(scenario())
 
 
+def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
+    assert OmniusClient.parse_realtime_tool_request("[[TOOL:VISION]]") == "vision"
+    assert OmniusClient.parse_realtime_tool_request(" [[ tool: web_search ]] ") == "web_search"
+    assert OmniusClient.parse_realtime_tool_request("[[TOOL:SHELL]]") == "shell"
+    assert OmniusClient.parse_realtime_tool_request("I could use the shell") is None
+    assert OmniusClient.parse_realtime_tool_request("I need local evidence. [[TOOL:SHELL]]") == "shell"
+    assert OmniusClient.parse_realtime_tool_request(
+        "[[TOOL:SHELL]] [[TOOL:WEB_SEARCH]]"
+    ) is None
+
+
+def test_read_only_shell_policy_is_structural_not_intent_routing() -> None:
+    assert OmniusClient.validate_read_only_shell_command("git status --short")[0]
+    assert OmniusClient.validate_read_only_shell_command(
+        "systemctl --user status egg-companion.service"
+    )[0]
+    assert not OmniusClient.validate_read_only_shell_command("git reset --hard")[0]
+    assert not OmniusClient.validate_read_only_shell_command("ls | head")[0]
+    assert not OmniusClient.validate_read_only_shell_command("cat /etc/shadow")[0]
+
+
 def test_visual_question_packs_all_frozen_views_into_one_labeled_contact_sheet(
     monkeypatch,
 ) -> None:

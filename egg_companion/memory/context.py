@@ -108,39 +108,65 @@ class ContextAssembler:
                 )
             records.append(record)
 
+        maximum = self.config.context_max_characters
         reflective_context = self.reflective_context(
-            min(self.reflective_context_characters, max(400, self.config.context_max_characters // 3))
+            min(self.reflective_context_characters, max(200, maximum // 7))
         )
-        world_state = self._build_world_state_section()
-        header = (
-            "CURRENT SENSORY CONTEXT (live, may be uncertain):\n"
-            f"{live_scene}\n\n"
-            "COGNITIVE CONTROL STATE (bounded attention/default-mode metadata; scores guide "
-            "focus but are not facts):\n"
-            f"{json.dumps(cognitive_state or {}, ensure_ascii=True, separators=(',', ':'))}\n\n"
+        world_state = self._build_world_state_section(
+            max_characters=max(250, min(1000, maximum // 5))
         )
+
+        def bounded(value: str, limit: int) -> str:
+            if len(value) <= limit:
+                return value
+            return value[: max(0, limit - 14)] + "...[TRUNCATED]"
+
+        sections = [
+            (
+                "CURRENT SENSORY CONTEXT (live, may be uncertain):\n"
+                + bounded(str(live_scene), max(180, min(600, maximum // 8)))
+            ),
+            (
+                "COGNITIVE CONTROL STATE (bounded attention/default-mode metadata; scores guide "
+                "focus but are not facts):\n"
+                + bounded(
+                    json.dumps(
+                        cognitive_state or {}, ensure_ascii=True, separators=(",", ":")
+                    ),
+                    max(180, min(600, maximum // 8)),
+                )
+            ),
+        ]
         if world_state:
-            header += (
-                "CURRENT RECONCILED WORLD STATE (derived from evidence; "
-                "use as grounded context for reasoning):\n"
-                f"{world_state}\n\n"
+            sections.append(
+                "CURRENT RECONCILED WORLD STATE (derived from evidence; use as grounded "
+                "context for reasoning):\n" + world_state
             )
-        header += (
-            "REFLECTIVE WORKING MODEL (derived, revisable, not raw chain-of-thought; "
-            "use it as strategy and context, never as stronger evidence than its sources):\n"
-            f"{reflective_context}\n\n"
+        sections.append(
+            "REFLECTIVE WORKING MODEL (derived, revisable, not raw chain-of-thought; use it "
+            "as strategy and context, never as stronger evidence than its sources):\n"
+            + bounded(reflective_context, max(200, min(700, maximum // 7)))
+        )
+
+        # A context window is useful only if retrieval results actually reach
+        # the model. Reserve a fixed share before serializing verbose control,
+        # world-state, and reflective headers; previously those headers could
+        # consume the entire deployment's 3k budget and silently erase recall.
+        retrieval_label = (
             "RETRIEVED LOCAL MEMORY (use only explicit claims/evidence; relevance is not truth; "
             "omit unsupported details and state uncertainty):\n"
         )
+        retrieval_reserve = max(450, min(1400, maximum // 3))
+        header_budget = max(0, maximum - retrieval_reserve - len(retrieval_label) - 2)
+        header = "\n\n".join(sections)
+        header = bounded(header, header_budget) if header_budget else ""
+        prefix = (header + "\n\n" if header else "") + retrieval_label
         body = json.dumps(records, ensure_ascii=True, separators=(",", ":"))
-        maximum = self.config.context_max_characters
-        if len(header) >= maximum:
-            return header[:maximum]
-        if len(header) + len(body) > maximum:
-            body = body[: max(0, maximum - len(header) - 18)] + "...[TRUNCATED]"
-        return header + body
+        if len(prefix) + len(body) > maximum:
+            body = bounded(body, max(0, maximum - len(prefix)))
+        return (prefix + body)[:maximum]
 
-    def _build_world_state_section(self) -> str:
+    def _build_world_state_section(self, max_characters: int = 1000) -> str:
         """Build a compact representation of the current world state."""
         if self._world_context is None:
             return ""
@@ -148,7 +174,9 @@ class ContextAssembler:
             from egg_companion.world.context import CognitiveContext
             if not isinstance(self._world_context, CognitiveContext):
                 return ""
-            window = self._world_context.build_window(max_characters=1500, max_entities=8)
+            window = self._world_context.build_window(
+                max_characters=max_characters, max_entities=8
+            )
             if not window.entities:
                 return ""
             return self._world_context.serialize_for_llm(window)

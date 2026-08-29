@@ -273,6 +273,146 @@ def test_visual_turn_uses_frames_frozen_at_utterance_boundary() -> None:
     asyncio.run(scenario())
 
 
+def test_realtime_model_intent_signal_routes_live_vision_without_heuristics() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_config())
+        frozen = np.full((64, 64, 3), 40, dtype=np.uint8)
+        boundary = time.monotonic()
+        runtime._latest_frames = {"front": (frozen, boundary)}
+        runtime._capture_turn_visual_snapshot("heard-semantic-vision", boundary)
+        replies = []
+        spoken = []
+
+        async def conversation(*args, allow_tool_requests=True, **kwargs):
+            replies.append(allow_tool_requests)
+            return "[[TOOL:VISION]]"
+
+        async def answer(frames, utterance: str, scene: str):
+            assert "Recent ordered conversation" in scene
+            return {
+                "answer": "A dark object is visible in front of me.",
+                "grounded": True,
+                "confidence": 0.9,
+                "supporting_camera_ids": ["front"],
+                "observations": ["A dark object is visible."],
+                "uncertainty": None,
+            }
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        async def forbidden_router(*args, **kwargs):
+            raise AssertionError("the serial dialogue router must remain disabled")
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._omnius.answer_visual_question_analysis = answer  # type: ignore[method-assign]
+        runtime._omnius.reason_about_utterance = forbidden_router  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "Could you inspect the thing I mean?",
+            utterance_id="heard-semantic-vision",
+            started_at=boundary - 0.5,
+            ended_at=boundary,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert replies == [True]
+        assert spoken == ["A dark object is visible in front of me."]
+
+    import time
+    import numpy as np
+
+    asyncio.run(scenario())
+
+
+def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_config())
+        contexts = []
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            contexts.append((context, allow_tool_requests))
+            if allow_tool_requests:
+                return "[[TOOL:WEB_SEARCH]]"
+            assert "WEB SEARCH TOOL EVIDENCE" in context
+            return "The retrieved headline says the test launch succeeded."
+
+        async def web_search(query: str):
+            assert query == "Tell me what happened online."
+            return "Test launch succeeded — https://example.test/news"
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._omnius.web_search = web_search  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "Tell me what happened online.",
+            utterance_id="heard-semantic-web",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert [allow for _, allow in contexts] == [True, False]
+        assert spoken == ["The retrieved headline says the test launch succeeded."]
+
+    asyncio.run(scenario())
+
+
+def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_config())
+        contexts = []
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            contexts.append((context, allow_tool_requests))
+            if allow_tool_requests:
+                return "[[TOOL:SHELL]]"
+            assert "READ-ONLY SHELL TOOL EVIDENCE" in context
+            return "The working tree is clean."
+
+        async def plan(request: str, context: str):
+            return {
+                "command": "git status --short",
+                "read_only": True,
+                "reason": "This inspects repository state.",
+            }
+
+        async def run(command: str, working_dir: str):
+            assert command == "git status --short"
+            return "working tree clean"
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._omnius.plan_read_only_shell_command = plan  # type: ignore[method-assign]
+        runtime._omnius.run_read_only_shell = run  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "Inspect the repository status.",
+            utterance_id="heard-semantic-shell",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert [allow for _, allow in contexts] == [True, False]
+        assert spoken == ["The working tree is clean."]
+
+    asyncio.run(scenario())
+
+
 def test_model_authored_question_requires_and_addresses_named_visible_person() -> None:
     async def scenario() -> None:
         config = _config()

@@ -38,9 +38,14 @@ ensure_local_services() {
 ensure_companion_service() {
   local unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir"
+  mkdir -p "$unit_dir/omnius-daemon.service.d"
   ln -sfn "$workspace_dir/deploy/egg-whisper.service" "$unit_dir/egg-whisper.service"
   ln -sfn "$workspace_dir/deploy/egg-runtime-update.service" "$unit_dir/egg-runtime-update.service"
   ln -sfn "$workspace_dir/deploy/egg-runtime-update.timer" "$unit_dir/egg-runtime-update.timer"
+  ln -sfn "$workspace_dir/config/systemd/omnius-daemon-audio-cuda.conf" \
+    "$unit_dir/omnius-daemon.service.d/egg-audio-cuda.conf"
+  ln -sfn "$workspace_dir/config/systemd/omnius-daemon-egg-cuda-asr.conf" \
+    "$unit_dir/omnius-daemon.service.d/egg-cuda-asr.conf"
   cat > "$unit_dir/egg-companion.service" <<EOF
 [Unit]
 Description=Egg embodied companion runtime and dashboard
@@ -151,6 +156,7 @@ ensure_ollama_models() {
     if ! ollama show "$model" >/dev/null 2>&1; then
       ollama pull "$model"
     fi
+    ollama cp "$model" "${model#*/}"
   done
 }
 

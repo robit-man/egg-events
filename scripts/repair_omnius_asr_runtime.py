@@ -341,9 +341,23 @@ def repair(path: Path) -> str:
 
 
 def default_targets() -> list[Path]:
-    return sorted(
+    targets = list(
         Path.home().glob(".nvm/versions/node/*/lib/node_modules/omnius/dist/index.js")
     )
+    if not targets:
+        return []
+
+    def node_version(path: Path) -> tuple[int, ...]:
+        version = next(
+            (part for part in path.parts if re.fullmatch(r"v\d+(?:\.\d+)+", part)),
+            "v0",
+        )
+        return tuple(int(item) for item in version[1:].split("."))
+
+    # NVM leaves older global installations behind. Only the newest Node tree
+    # can own the active launcher; patching stale bundles can fail a valid
+    # daemon start after Omnius changes its generated code shape.
+    return [max(targets, key=node_version)]
 
 
 def main() -> int:

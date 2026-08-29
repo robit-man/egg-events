@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import shlex
 import tempfile
 import time
 import wave
@@ -402,6 +403,8 @@ class OmniusClient:
         utterance: str,
         context: str,
         history: list[dict[str, object]] | None = None,
+        *,
+        allow_tool_requests: bool = True,
     ) -> str:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": self._system_prompt},
@@ -414,7 +417,7 @@ class OmniusClient:
             },
             {"role": "system", "content": context},
         ]
-        for turn in (history or [])[-8:]:
+        for turn in (history or [])[-self.config.chat_history_messages:]:
             role = "assistant" if turn.get("role") == "agent" else "user"
             text = str(turn.get("text") or "")
             status = str(turn.get("status") or "")
@@ -439,9 +442,41 @@ class OmniusClient:
                 "answer Egg's own prior question, or treat an interrupted agent utterance as "
                 "fully heard. If it is not directed to Egg or does not merit an audible "
                 "interruption, reply exactly [[SILENT]]."
+                + (
+                    " If a grounded answer requires evidence that is not already supplied, choose "
+                    "one intent from meaning and reply with exactly one signal: [[TOOL:VISION]] "
+                    "for current camera pixels, [[TOOL:WEB_SEARCH]] for current or online external "
+                    "information, or [[TOOL:SHELL]] for local shell, service, process, hardware, "
+                    "repository, file, or log inspection. Do not guess, describe a command, or use "
+                    "keyword matching. Emit at most one signal."
+                    if allow_tool_requests
+                    else " Tool execution has already been attempted for this turn; answer from "
+                    "the supplied tool evidence or status and do not emit a tool signal."
+                )
             ),
         })
         return await self._chat(messages=messages, remember=False, include_memory=False)
+
+    @staticmethod
+    def parse_realtime_tool_request(content: object) -> str | None:
+        """Parse the model's explicit semantic handoff without inferring intent.
+
+        Some models preface a requested control signal with a short explanation
+        despite being told to return the signal alone.  Accept one unambiguous,
+        well-formed signal anywhere in the model output; never derive a tool
+        choice from natural-language words or phrases.
+        """
+
+        if not isinstance(content, str):
+            return None
+        normalized = "".join(content.strip().upper().split())
+        signals = {
+            "[[TOOL:VISION]]": "vision",
+            "[[TOOL:WEB_SEARCH]]": "web_search",
+            "[[TOOL:SHELL]]": "shell",
+        }
+        selected = [tool for signal, tool in signals.items() if signal in normalized]
+        return selected[0] if len(selected) == 1 else None
 
     async def classify_interruption(
         self,
@@ -476,14 +511,18 @@ class OmniusClient:
             f"Utterance: {utterance!r}\nContext: {context[:1200]}\n"
             "Return only JSON: {\"directed\":boolean,\"act\":\"question\"|\"correction\"|"
             "\"person_naming\"|\"object_naming\"|\"command\"|\"acknowledgement\"|"
-            "\"conversation\",\"confidence\":number,\"tool\":\"none\"|\"vision\"|\"web_search\","
+            "\"conversation\",\"confidence\":number,\"tool\":\"none\"|\"vision\"|\"web_search\"|\"shell\","
             "\"tool_query\":string|null}. Select vision when an accurate reply depends on the "
             "speaker's presently visible scene, gesture, held or indicated item, spatial relation, "
             "display, or readable text. Select web_search for an explicit request to search or "
             "for current external information that cannot be grounded in the embodied context. "
-            "Otherwise select none. tool must be exactly none, vision, or web_search. For vision, "
+            "Select shell only for an explicit request to inspect local runtime, service, process, "
+            "hardware, repository, file, or log state, or to run a named command. Shell tool_query "
+            "must remain a natural-language task, not a command. Otherwise select none. tool must "
+            "be exactly none, vision, web_search, or shell. For vision, "
             "make tool_query the concise visual question without answering it. For web_search, make "
-            "tool_query a concise standalone search query."
+            "tool_query a concise standalone search query. For shell, preserve the user's requested "
+            "scope precisely and do not add actions."
         )
         try:
             parsed = json.loads(raw)
@@ -501,9 +540,9 @@ class OmniusClient:
             return None
         tool = parsed.get("tool", "none")
         tool_query = parsed.get("tool_query")
-        if tool not in {"none", "vision", "web_search"}:
+        if tool not in {"none", "vision", "web_search", "shell"}:
             return None
-        if tool in {"vision", "web_search"}:
+        if tool in {"vision", "web_search", "shell"}:
             if not isinstance(tool_query, str) or not tool_query.strip():
                 tool_query = utterance if tool == "vision" else None
             if not isinstance(tool_query, str) or not tool_query.strip():
@@ -1624,6 +1663,127 @@ class OmniusClient:
             raise RuntimeError("Omnius web_search returned no evidence")
         return output.strip()[:10000]
 
+    async def plan_read_only_shell_command(
+        self, request: str, context: str
+    ) -> dict[str, object] | None:
+        """Translate explicit spoken diagnostics into one bounded shell command.
+
+        This parser never executes anything. The returned command still has to
+        pass :meth:`validate_read_only_shell_command` before it can reach
+        Omnius's policy-gated shell tool.
+        """
+
+        raw = await self._structured_chat(
+            "Translate the explicit spoken request into at most one non-interactive, read-only "
+            "diagnostic shell command. Do not use sudo, a shell interpreter, command substitution, "
+            "pipes, redirects, compound commands, environment assignments, network clients, or any "
+            "operation that writes, installs, deletes, kills, restarts, or changes configuration. "
+            "Egg and Omnius run as the per-user systemd units egg-companion.service and "
+            "omnius-daemon.service, so inspections of either service must use systemctl --user "
+            "with the corresponding exact unit name. "
+            "If the request cannot be fulfilled under those constraints, set command to null.\n"
+            f"Spoken request: {request!r}\n"
+            f"Relevant local context: {context[:1200]}\n"
+            "Return only JSON: {\"command\":string|null,\"read_only\":boolean,"
+            "\"reason\":string}."
+        )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        command = parsed.get("command")
+        read_only = parsed.get("read_only")
+        reason = parsed.get("reason")
+        if (
+            not isinstance(read_only, bool)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 300
+            or (command is not None and not isinstance(command, str))
+        ):
+            return None
+        normalized = " ".join(command.split()) if isinstance(command, str) else None
+        if normalized is not None and (not normalized or len(normalized) > 500):
+            return None
+        return {
+            "command": normalized,
+            "read_only": read_only,
+            "reason": " ".join(reason.split()),
+        }
+
+    @staticmethod
+    def validate_read_only_shell_command(command: str) -> tuple[bool, str]:
+        """Admit a small, auditable diagnostic subset of Omnius's shell tool."""
+
+        normalized = command.strip()
+        if not normalized or len(normalized) > 500:
+            return False, "empty or oversized command"
+        if any(marker in normalized for marker in ("\n", "\r", ";", "&&", "||", "|", ">", "<", "`", "$(", "${")):
+            return False, "shell composition and expansion are not allowed"
+        try:
+            tokens = shlex.split(normalized, posix=True)
+        except ValueError:
+            return False, "invalid shell quoting"
+        if not tokens or len(tokens) > 40:
+            return False, "invalid command length"
+        executable = tokens[0]
+        allowed = {
+            "pwd", "ls", "rg", "grep", "find", "head", "tail", "sort", "uniq",
+            "wc", "jq", "stat", "du", "df", "free", "uptime", "uname", "hostname",
+            "id", "whoami", "ps", "pgrep", "ss", "lsof", "journalctl", "systemctl",
+            "git", "ollama", "nvidia-smi", "tegrastats",
+        }
+        if executable not in allowed:
+            return False, f"{executable!r} is outside the read-only diagnostic allowlist"
+        lowered = [token.casefold() for token in tokens]
+        sensitive_fragments = (
+            "/etc/shadow", "/etc/gshadow", ".ssh/", "id_rsa", "id_ed25519",
+            ".aws/credentials", ".env", "/environ",
+        )
+        if any(fragment in token for token in lowered for fragment in sensitive_fragments):
+            return False, "sensitive credential or process-environment access is not allowed"
+        if executable == "find" and any(
+            token in {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"}
+            for token in lowered[1:]
+        ):
+            return False, "mutating find actions are not allowed"
+        if executable == "git":
+            if len(tokens) < 2 or lowered[1] not in {
+                "status", "diff", "log", "show", "branch", "rev-parse", "describe",
+            }:
+                return False, "only read-only git subcommands are allowed"
+            if any(token in {"-d", "-D", "--delete", "-f", "--force"} for token in tokens[2:]):
+                return False, "mutating git flags are not allowed"
+        if executable == "systemctl":
+            verbs = {
+                token for token in lowered[1:] if token in {
+                    "status", "show", "is-active", "is-failed", "list-units",
+                    "list-unit-files",
+                }
+            }
+            if len(verbs) != 1:
+                return False, "only read-only systemctl operations are allowed"
+        if executable == "ollama" and (
+            len(tokens) < 2 or lowered[1] not in {"list", "ps", "show"}
+        ):
+            return False, "only read-only ollama operations are allowed"
+        return True, "read-only diagnostic command"
+
+    async def run_read_only_shell(self, command: str, working_dir: str) -> str:
+        allowed, reason = self.validate_read_only_shell_command(command)
+        if not allowed:
+            raise ValueError(reason)
+        result = await self._call_tool(
+            "shell",
+            {"command": command, "timeout": 15000},
+            timeout_seconds=min(self.config.timeout_seconds, 20),
+            working_dir=working_dir,
+        )
+        output = result.get("output")
+        if not isinstance(output, str) or not output.strip():
+            raise RuntimeError("Omnius shell returned no diagnostic output")
+        return output.strip()[:10000]
+
     async def analyze_audio_scene(
         self, wav_audio: bytes, *, top_k: int = 5
     ) -> dict[str, object]:
@@ -1722,6 +1882,7 @@ class OmniusClient:
         args: dict[str, object],
         *,
         timeout_seconds: float,
+        working_dir: str | None = None,
     ) -> dict[str, object]:
         server_timeout_ms = max(
             1000, min(120000, int(round(timeout_seconds * 1000)))
@@ -1731,9 +1892,15 @@ class OmniusClient:
         # or cold YAMNet pass is not killed while Egg is still waiting.
         timeout = aiohttp.ClientTimeout(total=timeout_seconds + 5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            request: dict[str, object] = {
+                "args": args,
+                "timeout_ms": server_timeout_ms,
+            }
+            if working_dir:
+                request["working_dir"] = working_dir
             async with session.post(
                 f"{str(self.config.base_url).rstrip('/')}/v1/tools/{name}/call",
-                json={"args": args, "timeout_ms": server_timeout_ms},
+                json=request,
                 headers=self._headers(),
             ) as response:
                 if response.status >= 400:
@@ -2640,7 +2807,9 @@ class OmniusClient:
                         '{"answer":string,"grounded":boolean,"confidence":number,'
                         '"supporting_camera_ids":[string],"observations":[string],"uncertainty":string|null}.\n'
                         f"Speaker utterance: {utterance!r}\nFrame ledger: {json.dumps(frame_ledger)}\n"
-                        f"Contemporaneous detector context (hypotheses, not truth): {scene[:1200]}"
+                        "Contemporaneous embodied, world-model, memory, and conversation context "
+                        "(textual hypotheses, not pixel truth): "
+                        f"{scene[:3000]}"
                     ),
                     "images": [base64.b64encode(visual_payload).decode("ascii")],
                 }
@@ -3061,7 +3230,10 @@ class OmniusClient:
             "tools": False,
             "think": self.config.reasoning_enabled,
             "realtime": True,
-            "realtime_options": {"max_history_messages": 8, "max_tokens": 80},
+            "realtime_options": {
+                "max_history_messages": self.config.chat_history_messages,
+                "max_tokens": 80,
+            },
         }
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:

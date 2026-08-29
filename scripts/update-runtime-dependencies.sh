@@ -107,18 +107,17 @@ ollama_model="${EGG_AUTO_PULL_OLLAMA_MODEL:-robit/ornith-1.5:9b}"
 if command -v ollama >/dev/null 2>&1; then
   log "Refreshing Ollama model tag $ollama_model"
   ollama pull "$ollama_model"
+  # Omnius releases may temporarily interpret the first slash-delimited
+  # segment as a provider name before Egg's compatibility repair is loaded.
+  # Keep a manifest-only basename alias so cognition remains available during
+  # that transition; the canonical configured/default model stays namespaced.
+  ollama_compat_model="${EGG_OLLAMA_COMPAT_MODEL:-${ollama_model#*/}}"
+  if [[ "$ollama_compat_model" != "$ollama_model" ]]; then
+    log "Refreshing Omnius compatibility alias $ollama_compat_model"
+    ollama cp "$ollama_model" "$ollama_compat_model"
+  fi
 else
   log "Ollama is unavailable; model refresh skipped."
-fi
-
-rejected_file="$update_cache_dir/omnius-rejected-version"
-if [[ -r "$rejected_file" && "$(<"$rejected_file")" == "$latest_version" ]]; then
-  log "Skipping previously rejected Omnius $latest_version until a newer release appears."
-  exit 0
-fi
-if [[ "$current_version" == "$latest_version" ]]; then
-  log "Runtime dependencies are current."
-  exit 0
 fi
 
 omnius_dist="$($npm_bin root --global)/omnius/dist/index.js"
@@ -126,6 +125,13 @@ repair_omnius() {
   python3 "$workspace_dir/scripts/repair_omnius_audio_runtime.py"
   python3 "$workspace_dir/scripts/repair_omnius_asr_runtime.py" "$omnius_dist"
 }
+
+# Omnius can update its bundle independently when updateMode=auto. Validate
+# and repair the active bundle even when npm already reports the latest tag.
+repair_output="$(repair_omnius)"
+printf '%s\n' "$repair_output"
+repair_changed=0
+grep -q 'repaired-' <<<"$repair_output" && repair_changed=1
 
 wait_for_url() {
   local url="$1"
@@ -139,6 +145,27 @@ wait_for_url() {
   done
   return 1
 }
+
+rejected_file="$update_cache_dir/omnius-rejected-version"
+if [[ -r "$rejected_file" && "$(<"$rejected_file")" == "$latest_version" ]]; then
+  log "Skipping previously rejected Omnius $latest_version until a newer release appears."
+  exit 0
+fi
+if [[ "$current_version" == "$latest_version" ]]; then
+  if (( repair_changed )); then
+    log "Restarting services to load repaired Omnius runtime."
+    if (( omnius_was_active )); then
+      systemctl --user restart omnius-daemon.service
+      wait_for_url http://127.0.0.1:11435/health/ready 45
+    fi
+    if (( egg_was_active )); then
+      systemctl --user restart egg-companion.service
+      wait_for_url http://127.0.0.1:8788/api/state 45
+    fi
+  fi
+  log "Runtime dependencies are current."
+  exit 0
+fi
 
 restore_services() {
   if (( omnius_was_active )); then

@@ -73,3 +73,20 @@ def test_context_is_bounded_grounded_and_excludes_revised_claims(tmp_path) -> No
     assert "wrong label" not in context
     assert "vector_blob" not in context
     assert "relevance is not truth" in context
+
+
+def test_retrieved_memory_keeps_reserved_prompt_space_after_large_control_state(
+    tmp_path,
+) -> None:
+    store = populated_store(tmp_path)
+    context = ContextAssembler(store).build(
+        "Which mug did Ada hold?",
+        "a current room observation",
+        ("person-001",),
+        np.array([1.0, 0.0]),
+        cognitive_state={"verbose_runtime_state": "x" * 10_000},
+    )
+
+    assert len(context) <= store.config.context_max_characters
+    assert "RETRIEVED LOCAL MEMORY" in context
+    assert "ceramic mug" in context
