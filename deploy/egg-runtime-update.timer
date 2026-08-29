@@ -1,0 +1,12 @@
+[Unit]
+Description=Regularly check for Egg runtime dependency updates
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+Unit=egg-runtime-update.service
+
+[Install]
+WantedBy=timers.target

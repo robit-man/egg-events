@@ -39,6 +39,8 @@ ensure_companion_service() {
   local unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir"
   ln -sfn "$workspace_dir/deploy/egg-whisper.service" "$unit_dir/egg-whisper.service"
+  ln -sfn "$workspace_dir/deploy/egg-runtime-update.service" "$unit_dir/egg-runtime-update.service"
+  ln -sfn "$workspace_dir/deploy/egg-runtime-update.timer" "$unit_dir/egg-runtime-update.timer"
   cat > "$unit_dir/egg-companion.service" <<EOF
 [Unit]
 Description=Egg embodied companion runtime and dashboard
@@ -71,10 +73,12 @@ ExecStart=$workspace_dir/scripts/postboot-verify.sh
 WantedBy=default.target
 EOF
   chmod +x "$workspace_dir/scripts/postboot-verify.sh"
+  chmod +x "$workspace_dir/scripts/update-runtime-dependencies.sh"
   systemctl --user daemon-reload
   systemctl --user enable egg-companion.service
   systemctl --user enable egg-whisper.service
   systemctl --user enable egg-postboot-verify.service
+  systemctl --user enable --now egg-runtime-update.timer
   sudo loginctl enable-linger "$USER"
 }
 

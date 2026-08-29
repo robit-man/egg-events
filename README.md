@@ -184,6 +184,8 @@ person into a dated encounter timeline across every coalesced source profile.
 
 The bootstrap installs `egg-gpu-pm-guard.service` before display-manager and Ollama. The guard accepts the kernel's normal `auto` policy as well as `on`; the audit always probes CUDA directly and only treats explicit PM error/unsupported states as failures. Ollama is limited to one loaded model, one parallel request, and a `4096` token context so ASR, cognition, and vision cannot exhaust unified memory.
 
+Bootstrap also enables `egg-runtime-update.timer`. Every six hours, with a randomized delay, it checks npm for a newer Omnius release and refreshes the tagged Ornith model. An Omnius update runs only while the conversational floor is idle, reapplies Egg's Jetson compatibility repairs, and must pass both Omnius and Egg readiness checks. A failed release is rolled back and rejected until a newer version appears. JetPack CUDA Torch and the pinned Whisper container are deliberately excluded from unattended upgrades because generic dependency resolution can replace their working NVIDIA builds.
+
 ## Integration points
 
 - Camera sources: `egg_companion/adapters/camera.py`

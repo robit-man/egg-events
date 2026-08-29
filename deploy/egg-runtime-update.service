@@ -1,0 +1,14 @@
+[Unit]
+Description=Update and validate Egg runtime dependencies
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/egg_events
+ExecStart=%h/Documents/egg_events/scripts/update-runtime-dependencies.sh
+TimeoutStartSec=20min
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=idle
+
