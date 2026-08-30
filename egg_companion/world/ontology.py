@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -328,6 +327,12 @@ _DEFAULT_PROPERTY_TYPES = [
     PropertyType(id="displays_text", value_type=ValueType.STRING, cardinality="one",
                  volatility="dynamic", stale_after=30.0, decay_model="linear",
                  description="Dynamic text on screens, monitors, clocks; valid briefly"),
+    PropertyType(id="semantic_tags", value_type=ValueType.JSON, cardinality="one",
+                 volatility="dynamic", stale_after=60.0, decay_model="linear",
+                 description="Small revisable set of pixel-grounded visual tags"),
+    PropertyType(id="scene_summary", value_type=ValueType.STRING, cardinality="one",
+                 volatility="dynamic", stale_after=60.0, decay_model="linear",
+                 description="Revisable VLM summary of one camera view"),
 ]
 
 _DEFAULT_RELATION_TYPES = [

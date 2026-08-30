@@ -527,6 +527,63 @@ class TestObservationNormalizer:
             assert "authority" in a
             assert 0 < a["authority"] <= 1.0
 
+    def test_vlm_observation_preserves_camera_behavior_tags_and_inference_kind(
+        self, world_stores
+    ):
+        from types import SimpleNamespace
+
+        event = SimpleNamespace(
+            event_type="vlm_observation",
+            occurred_at="2026-08-29T12:00:00+00:00",
+            source_id="ornith_vlm:front",
+            entity_ids=("camera_view:front", "appearance:1", "object:cup"),
+            payload={
+                "epistemic_kind": "inference",
+                "complete_camera_frame": False,
+                "scene_summary": "A person is lifting a cup in the front camera.",
+                "detections": [
+                    {
+                        "entity_id": "appearance:1",
+                        "label": "person",
+                        "confidence": 0.83,
+                        "behavior": "lifting a cup",
+                        "tags": ["standing", "holding object"],
+                    },
+                    {
+                        "entity_id": "object:cup",
+                        "label": "cup",
+                        "confidence": 0.78,
+                        "tags": ["handheld"],
+                    },
+                ],
+                "relations": [
+                    {
+                        "source_id": "appearance:1",
+                        "relation": "holds",
+                        "target_id": "object:cup",
+                        "confidence": 0.74,
+                    }
+                ],
+            },
+        )
+
+        delta = world_stores["normalizer"].normalize_event(
+            event, evidence_ids=("vlm-evidence",)
+        )
+
+        assert delta.camera_frames == []
+        by_property = {item["property_id"]: item for item in delta.assertions}
+        assert by_property["behavior"]["value"].raw == "lifting a cup"
+        assert by_property["behavior"]["epistemic_kind"] == "inference"
+        assert by_property["semantic_tags"]["epistemic_kind"] == "inference"
+        assert by_property["scene_summary"]["subject_id"] == "camera_view:front"
+        assert any(
+            item["relation_type_id"] == "holds"
+            and item["source_entity_id"] == "appearance:1"
+            and item["target_entity_id"] == "object:cup"
+            for item in delta.relation_assertions
+        )
+
 
 class TestEventStore:
     def test_record_and_retrieve(self, world_stores):

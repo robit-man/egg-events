@@ -188,7 +188,7 @@ def test_adaptive_raw_frame_novelty_wakes_sparse_perception_only_on_change() -> 
 
 def test_environmental_model_contracts_allow_silence_or_speech_without_fallback() -> None:
     assessment = OmniusClient.parse_environmental_assessment(
-        """{"grounded":true,"confidence":0.8,"scene_summary":"A person is near the table.","people_visible":true,"person_continuity":"One visible person remains in view.","meaningful_change":"The person entered the camera view.","change_magnitude":0.8,"addressability":"They are visible but not necessarily addressing Egg.","observations":["One person is visible."],"uncertainties":["Their intent is unknown."],"memory_query":"recent interactions connected with the visible person and table"}"""
+        """{"grounded":true,"confidence":0.8,"scene_summary":"A person is near the table.","people_visible":true,"person_continuity":"One visible person remains in view.","meaningful_change":"The person entered the camera view.","change_magnitude":0.8,"addressability":"They are visible but not necessarily addressing Egg.","prior_query_answer":null,"camera_observations":[{"camera_id":"camera-1","scene_summary":"One person is near a table.","scene_tags":["person","table"],"subjects":[{"local_id":"person-1","prior_local_id":null,"detector_support":[],"kind":"person","label":"person","visible_behavior":"standing near a table","behavior_confidence":0.7,"confidence":0.8,"tags":["standing"],"evidence":"A full person silhouette is visible beside the table."}],"relations":[],"uncertainties":["The person's intent is not visible."]}],"overall_uncertainties":["The person's intent is unknown."],"memory_query":"recent interactions connected with the visible person and table","next_visual_query":"Whether the person remains by the table"}"""
     )
     silent = OmniusClient.parse_environmental_deliberation(
         """{"action":"silence","utterance":null,"reflection":"A person entered, but there is no evidence that interruption would help.","confidence":0.8,"reason":"Presence alone does not warrant speech.","connections":[],"open_questions":["Whether the person will address Egg."]}"""
@@ -336,9 +336,33 @@ def _grounded_assessment() -> dict[str, object]:
         "meaningful_change": "A person entered the view.",
         "change_magnitude": 0.8,
         "addressability": "The person is visible; whether they welcome speech is uncertain.",
-        "observations": ["One person is visible."],
-        "uncertainties": ["Their intent is not visible."],
+        "prior_query_answer": None,
+        "camera_observations": [
+            {
+                "camera_id": "camera-1",
+                "scene_summary": "One person is visible near a table.",
+                "scene_tags": ["person", "table"],
+                "subjects": [
+                    {
+                        "local_id": "person-1",
+                        "prior_local_id": None,
+                        "detector_support": [],
+                        "kind": "person",
+                        "label": "person",
+                        "visible_behavior": "standing near a table",
+                        "behavior_confidence": 0.7,
+                        "confidence": 0.8,
+                        "tags": ["standing"],
+                        "evidence": "A person silhouette is visible beside the table.",
+                    }
+                ],
+                "relations": [],
+                "uncertainties": ["Their intent is not visible."],
+            }
+        ],
+        "overall_uncertainties": ["Their intent is not visible."],
         "memory_query": "recent interactions connected with the visible person and table",
+        "next_visual_query": "whether the person remains near the table",
     }
 
 
@@ -459,6 +483,95 @@ def test_runtime_queue_coalesces_to_freshest_environmental_evidence() -> None:
     assert runtime._environmental_stimuli.get_nowait().stimulus_id == second.stimulus_id
     state = runtime.telemetry.snapshot(runtime.config)["environmental_cognition"]
     assert state["coalesced"] == 1
+
+
+def test_environmental_subject_ids_require_explicit_detector_or_visual_continuity() -> None:
+    runtime = CompanionRuntime(_runtime_config())
+    stimulus = _runtime_stimulus(runtime)
+    snapshot = runtime._capture_turn_visual_snapshot(
+        stimulus.stimulus_id, time.monotonic()
+    )
+    ledger = runtime._environmental_detector_ledger(snapshot)
+    assessment = _grounded_assessment()
+    assessment["camera_observations"][0]["subjects"][0]["detector_support"] = [
+        "detector:camera-1:0"
+    ]
+
+    first = runtime._materialize_environmental_assessment(
+        assessment, stimulus, None, ledger
+    )
+    first_subject = first["camera_observations"][0]["subjects"][0]
+    assert first_subject["entity_id"] == "person-1"
+    assert first_subject["entity_source"] == "same_frame_detector_support"
+
+    followup = _grounded_assessment()
+    followup_subject = followup["camera_observations"][0]["subjects"][0]
+    followup_subject["local_id"] = "person-current"
+    followup_subject["prior_local_id"] = "person-1"
+    continued = runtime._materialize_environmental_assessment(
+        followup, stimulus, first, []
+    )
+    continued_subject = continued["camera_observations"][0]["subjects"][0]
+    assert continued_subject["entity_id"] == "person-1"
+    assert continued_subject["entity_source"] == "model_visual_continuity"
+
+
+def test_camera_addressed_vlm_grounding_reaches_memory_and_world_model(tmp_path) -> None:
+    async def scenario() -> None:
+        payload = _runtime_config().model_dump()
+        payload["memory"].update(
+            {
+                "enabled": True,
+                "storage_dir": str(tmp_path / "memory"),
+                "retain_raw_media": False,
+            }
+        )
+        payload["identity"]["storage_dir"] = str(tmp_path / "identity")
+        payload["object_learning"]["storage_dir"] = str(tmp_path / "objects")
+        runtime = CompanionRuntime(EggConfig.model_validate(payload))
+        assert runtime._memory is not None
+        stimulus = _runtime_stimulus(runtime)
+        snapshot = runtime._capture_turn_visual_snapshot(
+            stimulus.stimulus_id, time.monotonic()
+        )
+        ledger = runtime._environmental_detector_ledger(snapshot)
+        assessment = _grounded_assessment()
+        assessment["camera_observations"][0]["subjects"][0]["detector_support"] = [
+            "detector:camera-1:0"
+        ]
+        assessment = runtime._materialize_environmental_assessment(
+            assessment, stimulus, None, ledger
+        )
+        encoded = [
+            runtime._encode_visual_question_frame(item.frame)
+            for item in snapshot.frames
+        ]
+
+        await runtime._queue_environmental_grounding_memory(
+            stimulus, snapshot, encoded, assessment
+        )
+        event = runtime._memory_events.get_nowait()
+        assert event.event_type == "vlm_observation"
+        assert event.source_id == "ornith_vlm:camera-1"
+        assert event.payload["complete_camera_frame"] is False
+        runtime._memory._persist_event(event)
+
+        assert runtime._memory.store.entity_detail("camera_view:camera-1") is not None
+        assert runtime._memory.store.entity_detail("person-1") is not None
+        assert runtime._memory._world_query is not None
+        assert (
+            runtime._memory._world_query.property_value("person-1", "behavior")
+            == "standing near a table"
+        )
+        assert (
+            runtime._memory._world_query.property_value(
+                "camera_view:camera-1", "scene_summary"
+            )
+            == "One person is visible near a table."
+        )
+        runtime._memory.close(datetime.now(timezone.utc))
+
+    asyncio.run(scenario())
 
 
 def test_human_speech_preempts_environmental_model_work_without_polling() -> None:

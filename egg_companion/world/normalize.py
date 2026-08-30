@@ -61,7 +61,7 @@ class ObservationNormalizer:
         payload = getattr(event, "payload", {})
         entity_ids = getattr(event, "entity_ids", ())
 
-        if event_type in ("vision", "object", "identity"):
+        if event_type in ("vision", "object", "identity", "vlm_observation"):
             return self._normalize_visual_event(
                 payload, source_id, source_type, occurred_at,
                 evidence_ids=evidence_ids, confidences=confidences,
@@ -100,6 +100,9 @@ class ObservationNormalizer:
             return delta
 
         camera_id = source_id.split(":")[-1] if ":" in source_id else source_id
+        epistemic_kind = str(payload.get("epistemic_kind") or EpistemicKind.OBSERVATION.value)
+        if epistemic_kind not in {item.value for item in EpistemicKind}:
+            epistemic_kind = EpistemicKind.INFERENCE.value
         visible_entity_ids: set[str] = set()
 
         for detection in detections:
@@ -128,14 +131,14 @@ class ObservationNormalizer:
             authority = self._authority.evaluate(
                 property_type=f"{self._entity_type_from_label(label)}.label",
                 source_type=source_type,
-                epistemic_kind=EpistemicKind.OBSERVATION.value,
+                epistemic_kind=epistemic_kind,
             )
 
             delta.assertions.append({
                 "subject_id": entity_id,
                 "property_id": "label",
                 "value": TypedValue(raw=label, value_type=ValueType.STRING),
-                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "epistemic_kind": epistemic_kind,
                 "source_id": source_id,
                 "evidence_ids": evidence_ids,
                 "confidence": confidence,
@@ -149,13 +152,13 @@ class ObservationNormalizer:
                 bbox_authority = self._authority.evaluate(
                     property_type="*.bbox",
                     source_type=source_type,
-                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                    epistemic_kind=epistemic_kind,
                 )
                 delta.assertions.append({
                     "subject_id": entity_id,
                     "property_id": "bbox",
                     "value": TypedValue(raw=bbox, value_type=ValueType.GEOMETRY),
-                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "epistemic_kind": epistemic_kind,
                     "source_id": source_id,
                     "evidence_ids": evidence_ids,
                     "confidence": confidence,
@@ -167,13 +170,13 @@ class ObservationNormalizer:
                 behavior_authority = self._authority.evaluate(
                     property_type="*.behavior",
                     source_type=source_type,
-                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                    epistemic_kind=epistemic_kind,
                 )
                 delta.assertions.append({
                     "subject_id": entity_id,
                     "property_id": "behavior",
                     "value": TypedValue(raw=behavior, value_type=ValueType.STRING),
-                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "epistemic_kind": epistemic_kind,
                     "source_id": source_id,
                     "evidence_ids": evidence_ids,
                     "confidence": confidence,
@@ -185,14 +188,14 @@ class ObservationNormalizer:
                 gaze_authority = self._authority.evaluate(
                     property_type="*.gaze_state",
                     source_type=source_type,
-                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                    epistemic_kind=epistemic_kind,
                 )
                 gaze_confidence = gaze.get("confidence")
                 delta.assertions.append({
                     "subject_id": entity_id,
                     "property_id": "gaze_state",
                     "value": TypedValue(raw=gaze["state"], value_type=ValueType.STRING),
-                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "epistemic_kind": epistemic_kind,
                     "source_id": source_id,
                     "evidence_ids": evidence_ids,
                     "confidence": (
@@ -211,7 +214,7 @@ class ObservationNormalizer:
                 loc_authority = self._authority.evaluate(
                     property_type="*.current_location",
                     source_type=source_type,
-                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                    epistemic_kind=epistemic_kind,
                 )
                 delta.assertions.append({
                     "subject_id": entity_id,
@@ -221,7 +224,7 @@ class ObservationNormalizer:
                              "position": [round(center_x, 4), round(center_y, 4)]},
                         value_type=ValueType.GEOMETRY,
                     ),
-                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "epistemic_kind": epistemic_kind,
                     "source_id": source_id,
                     "evidence_ids": evidence_ids,
                     "confidence": confidence * 0.8,
@@ -233,7 +236,7 @@ class ObservationNormalizer:
                 "subject_id": entity_id,
                 "property_id": "last_seen",
                 "value": TypedValue(raw=observed_at, value_type=ValueType.DATETIME),
-                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "epistemic_kind": epistemic_kind,
                 "source_id": source_id,
                 "evidence_ids": evidence_ids,
                 "confidence": confidence,
@@ -248,7 +251,7 @@ class ObservationNormalizer:
                     raw=ObservabilityState.OBSERVED_PRESENT.value,
                     value_type=ValueType.ENUM,
                 ),
-                "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                "epistemic_kind": epistemic_kind,
                 "source_id": source_id,
                 "evidence_ids": evidence_ids,
                 "confidence": confidence,
@@ -265,7 +268,106 @@ class ObservationNormalizer:
                 "authority": self._authority.evaluate(
                     property_type="*.visible_from",
                     source_type=source_type,
-                    epistemic_kind=EpistemicKind.OBSERVATION.value,
+                    epistemic_kind=epistemic_kind,
+                ),
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
+                "valid_from": observed_at,
+            })
+
+            tags = detection.get("tags")
+            if isinstance(tags, (list, tuple)):
+                normalized_tags = [
+                    " ".join(item.split())[:100]
+                    for item in tags[:3]
+                    if isinstance(item, str) and item.strip()
+                ]
+                if normalized_tags:
+                    delta.assertions.append({
+                        "subject_id": entity_id,
+                        "property_id": "semantic_tags",
+                        "value": TypedValue(raw=normalized_tags, value_type=ValueType.JSON),
+                        "epistemic_kind": epistemic_kind,
+                        "source_id": source_id,
+                        "evidence_ids": evidence_ids,
+                        "confidence": confidence,
+                        "authority": self._authority.evaluate(
+                            property_type="*.semantic_tags",
+                            source_type=source_type,
+                            epistemic_kind=epistemic_kind,
+                        ),
+                        "valid_from": observed_at,
+                    })
+
+        camera_entity_id = f"camera_view:{camera_id}"
+        scene_summary = payload.get("scene_summary")
+        if isinstance(scene_summary, str) and scene_summary.strip():
+            summary_confidence = max(
+                (float(item.get("confidence", 0.0)) for item in detections if isinstance(item, dict)),
+                default=confidences.get(camera_entity_id, 0.6),
+            )
+            delta.assertions.extend((
+                {
+                    "subject_id": camera_entity_id,
+                    "property_id": "camera_id",
+                    "value": TypedValue(raw=camera_id, value_type=ValueType.STRING),
+                    "epistemic_kind": EpistemicKind.OBSERVATION.value,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": 1.0,
+                    "authority": 1.0,
+                    "valid_from": observed_at,
+                },
+                {
+                    "subject_id": camera_entity_id,
+                    "property_id": "scene_summary",
+                    "value": TypedValue(
+                        raw=" ".join(scene_summary.split())[:500],
+                        value_type=ValueType.STRING,
+                    ),
+                    "epistemic_kind": epistemic_kind,
+                    "source_id": source_id,
+                    "evidence_ids": evidence_ids,
+                    "confidence": summary_confidence,
+                    "authority": self._authority.evaluate(
+                        property_type="camera_view.scene_summary",
+                        source_type=source_type,
+                        epistemic_kind=epistemic_kind,
+                    ),
+                    "valid_from": observed_at,
+                },
+            ))
+
+        allowed_relations = {"holds", "near", "inside", "on_top_of", "visible_from"}
+        for relation in payload.get("relations", ()):
+            if not isinstance(relation, dict):
+                continue
+            relation_type = relation.get("relation")
+            source_entity_id = relation.get("source_id")
+            target_entity_id = relation.get("target_id")
+            if (
+                relation_type not in allowed_relations
+                or not isinstance(source_entity_id, str)
+                or not isinstance(target_entity_id, str)
+                or source_entity_id not in entity_ids
+                or target_entity_id not in entity_ids
+            ):
+                continue
+            try:
+                relation_confidence = max(
+                    0.0, min(1.0, float(relation.get("confidence") or 0.0))
+                )
+            except (TypeError, ValueError):
+                continue
+            delta.relation_assertions.append({
+                "source_entity_id": source_entity_id,
+                "relation_type_id": relation_type,
+                "target_entity_id": target_entity_id,
+                "confidence": relation_confidence,
+                "authority": self._authority.evaluate(
+                    property_type=f"*.{relation_type}",
+                    source_type=source_type,
+                    epistemic_kind=epistemic_kind,
                 ),
                 "source_id": source_id,
                 "evidence_ids": evidence_ids,
@@ -285,13 +387,14 @@ class ObservationNormalizer:
         # "never visible to begin with".  That diff requires querying prior
         # world state, which only the Reconciler has access to; see
         # Reconciler._emit_absence_transitions.
-        delta.camera_frames.append({
-            "camera_id": f"camera_view:{camera_id}",
-            "visible_entity_ids": sorted(visible_entity_ids),
-            "source_id": source_id,
-            "evidence_ids": evidence_ids,
-            "valid_from": observed_at,
-        })
+        if payload.get("complete_camera_frame", True) is True:
+            delta.camera_frames.append({
+                "camera_id": camera_entity_id,
+                "visible_entity_ids": sorted(visible_entity_ids),
+                "source_id": source_id,
+                "evidence_ids": evidence_ids,
+                "valid_from": observed_at,
+            })
 
         return delta
 

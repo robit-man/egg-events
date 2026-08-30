@@ -506,6 +506,27 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     assert OmniusClient.parse_realtime_tool_request(
         "[[TOOL:SHELL]] [[TOOL:WEB_SEARCH]]"
     ) is None
+    marker = OmniusClient._realtime_tool_marker(
+        "ocr",
+        {
+            "question": "Read the status display.",
+            "camera_ids": ["front"],
+            "region_ids": ["display-1"],
+        },
+    )
+    assert OmniusClient.parse_realtime_tool_call(marker) == {
+        "tool": "ocr",
+        "arguments": {
+            "question": "Read the status display.",
+            "camera_ids": ["front"],
+            "region_ids": ["display-1"],
+        },
+    }
+    assert OmniusClient.parse_realtime_tool_request(marker) == "ocr"
+    assert any(
+        item["function"]["name"] == "read_current_camera_text"
+        for item in OmniusClient._realtime_tool_definitions()
+    )
 
 
 def test_web_search_urls_are_parsed_only_from_typed_result_fields() -> None:
@@ -556,7 +577,14 @@ def test_visual_question_packs_all_frozen_views_into_one_labeled_contact_sheet(
                             "grounded": True,
                             "confidence": 0.9,
                             "supporting_camera_ids": ["front"],
-                            "observations": ["The front tile contains the object."],
+                            "camera_observations": [
+                                {
+                                    "camera_id": "front",
+                                    "observations": ["The front tile contains the object."],
+                                },
+                                {"camera_id": "side", "observations": []},
+                            ],
+                            "text_candidates": [],
                             "uncertainty": None,
                         }
                     )

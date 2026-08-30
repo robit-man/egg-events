@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from egg_companion.adapters.omnius import OmniusClient
 from egg_companion.config import EggConfig
 from egg_companion.models import AttentionTarget, BoundingBox, Detection, Observation
 from egg_companion.runtime import CompanionRuntime, _PendingIdentityQuestion
@@ -204,13 +205,13 @@ def test_name_binding_uses_exact_profile_and_acknowledges_with_name() -> None:
 
 
 def test_web_search_requires_model_authored_tool_route() -> None:
-    assert CompanionRuntime._web_search_query(
-        "Please search the web for the latest Jetson release", None
+    assert OmniusClient.parse_realtime_tool_call(
+        "Please search the web for the latest Jetson release"
     ) is None
-    assert CompanionRuntime._web_search_query("How are you?", None) is None
-    assert CompanionRuntime._web_search_query(
-        "anything", {"tool": "web_search", "tool_query": "current local weather"}
-    ) == "current local weather"
+    assert OmniusClient.parse_realtime_tool_call("How are you?") is None
+    assert OmniusClient.parse_realtime_tool_handoff(
+        "[[TOOL:WEB_SEARCH|current local weather]]"
+    ) == ("web_search", "current local weather")
 
 
 def test_visual_turn_uses_frames_frozen_at_utterance_boundary() -> None:
@@ -236,6 +237,11 @@ def test_visual_turn_uses_frames_frozen_at_utterance_boundary() -> None:
                 "tool_query": utterance,
             }
 
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            if "CURRENT CAMERA TOOL RESULT" not in context:
+                return "[[TOOL:VISION]]"
+            return "You are holding a dark object."
+
         async def answer(frames, utterance: str, scene: str):
             received.extend(frames)
             return {
@@ -252,6 +258,7 @@ def test_visual_turn_uses_frames_frozen_at_utterance_boundary() -> None:
             return True
 
         runtime._omnius.reason_about_utterance = route  # type: ignore[method-assign]
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
         runtime._omnius.answer_visual_question_analysis = answer  # type: ignore[method-assign]
         runtime._speak = speak  # type: ignore[method-assign]
         turn = runtime._conversation_turns.finalize_audio_turn(
@@ -285,7 +292,10 @@ def test_realtime_model_intent_signal_routes_live_vision_without_heuristics() ->
 
         async def conversation(*args, allow_tool_requests=True, **kwargs):
             replies.append(allow_tool_requests)
-            return "[[TOOL:VISION]]"
+            context = args[1]
+            if "CURRENT CAMERA TOOL RESULT" not in context:
+                return "[[TOOL:VISION]]"
+            return "A dark object is visible in front of me."
 
         async def answer(frames, utterance: str, scene: str):
             assert "Recent ordered conversation" in scene
@@ -318,11 +328,124 @@ def test_realtime_model_intent_signal_routes_live_vision_without_heuristics() ->
 
         await runtime._handle_audio_turn(turn)
 
-        assert replies == [True]
+        assert replies == [True, True]
         assert spoken == ["A dark object is visible in front of me."]
 
     import time
     import numpy as np
+
+    asyncio.run(scenario())
+
+
+def test_realtime_model_can_chain_camera_evidence_into_selected_ocr_region() -> None:
+    async def scenario() -> None:
+        import cv2
+        import numpy as np
+        import time
+
+        runtime = CompanionRuntime(_config())
+        frozen = np.full((80, 120, 3), 47, dtype=np.uint8)
+        boundary = time.monotonic()
+        runtime._latest_frames = {"front": (frozen, boundary)}
+        runtime._capture_turn_visual_snapshot("heard-ocr-chain", boundary)
+        calls: list[bool] = []
+        ocr_candidates = []
+        full_frame_ocr_calls = []
+        spoken: list[str] = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            calls.append(allow_tool_requests)
+            if "CURRENT CAMERA TOOL RESULT" not in context:
+                return "[[TOOL:VISION]]"
+            if "ADVANCED CAMERA OCR TOOL RESULT" not in context:
+                return runtime._omnius._realtime_tool_marker(
+                    "ocr",
+                    {
+                        "question": "Read the small status text on the front display.",
+                        "camera_ids": ["front"],
+                        "region_ids": ["front-display"],
+                    },
+                )
+            assert '"text": "READY 42"' in context
+            return "The front display says, ready forty-two."
+
+        async def inspect(frames, utterance: str, scene: str):
+            return {
+                "answer": "A small display is visible, but its text needs OCR.",
+                "grounded": True,
+                "confidence": 0.88,
+                "supporting_camera_ids": ["front"],
+                "camera_observations": [
+                    {
+                        "camera_id": "front",
+                        "observations": ["A small status display is visible."],
+                    }
+                ],
+                "text_candidates": [
+                    {
+                        "region_id": "front-display",
+                        "camera_id": "front",
+                        "bbox": [0.2, 0.2, 0.8, 0.7],
+                        "description": "small status display",
+                        "confidence": 0.9,
+                        "visible_text": None,
+                        "needs_ocr": True,
+                    }
+                ],
+                "uncertainty": "The characters are too small for the VLM.",
+            }
+
+        async def read_regions(candidate, *, explicit_read_request=False):
+            ocr_candidates.append(candidate)
+            decoded = cv2.imdecode(
+                np.frombuffer(candidate.image_png, dtype=np.uint8), cv2.IMREAD_COLOR
+            )
+            assert decoded is not None and round(float(decoded.mean())) == 47
+            assert explicit_read_request
+            assert candidate.camera_id == "front"
+            assert candidate.vlm_text_regions[0]["region_id"] == "front-display"
+            return None
+
+        async def read_full_frame(
+            image_png, *, explicit_read_request=False, vlm_text_positive=False
+        ):
+            full_frame_ocr_calls.append(image_png)
+            assert explicit_read_request and vlm_text_positive
+            return {
+                "text": "READY 42",
+                "confidence": 0.96,
+                "engine": "test-advanced-ocr",
+                "regions": [
+                    {
+                        "region_id": "front-display",
+                        "text": "READY 42",
+                        "confidence": 0.96,
+                    }
+                ],
+            }
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._omnius.answer_visual_question_analysis = inspect  # type: ignore[method-assign]
+        runtime._ocr_vlm_detected_regions = read_regions  # type: ignore[method-assign]
+        runtime._run_advanced_ocr = read_full_frame  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "What does that display say?",
+            utterance_id="heard-ocr-chain",
+            started_at=boundary - 0.4,
+            ended_at=boundary,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert calls == [True, True, True]
+        assert len(ocr_candidates) == 1
+        assert len(full_frame_ocr_calls) == 1
+        assert spoken == ["The front display says, ready forty-two."]
 
     asyncio.run(scenario())
 
@@ -335,7 +458,7 @@ def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> N
 
         async def conversation(utterance, context, history, *, allow_tool_requests=True):
             contexts.append((context, allow_tool_requests))
-            if allow_tool_requests:
+            if "WEB SEARCH TOOL EVIDENCE" not in context:
                 return "[[TOOL:WEB_SEARCH|current test launch news]]"
             assert "WEB SEARCH TOOL EVIDENCE" in context
             return "The retrieved headline says the test launch succeeded."
@@ -360,7 +483,7 @@ def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> N
 
         await runtime._handle_audio_turn(turn)
 
-        assert [allow for _, allow in contexts] == [True, False]
+        assert [allow for _, allow in contexts] == [True, True]
         assert spoken == ["The retrieved headline says the test launch succeeded."]
 
     asyncio.run(scenario())
@@ -374,7 +497,7 @@ def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() ->
 
         async def conversation(utterance, context, history, *, allow_tool_requests=True):
             contexts.append((context, allow_tool_requests))
-            if allow_tool_requests:
+            if "READ-ONLY SHELL TOOL EVIDENCE" not in context:
                 return "[[TOOL:SHELL|git status --short]]"
             assert "READ-ONLY SHELL TOOL EVIDENCE" in context
             return "The working tree is clean."
@@ -403,7 +526,7 @@ def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() ->
 
         await runtime._handle_audio_turn(turn)
 
-        assert [allow for _, allow in contexts] == [True, False]
+        assert [allow for _, allow in contexts] == [True, True]
         assert spoken == ["The working tree is clean."]
 
     asyncio.run(scenario())

@@ -66,7 +66,8 @@ class PerceptualEvent:
     event_id: str
     event_type: Literal[
         "vision", "speech", "audio_comprehension", "object", "identity", "ocr",
-        "user_correction", "attention", "social_reflection"
+        "user_correction", "attention", "social_reflection", "vlm_observation",
+        "environmental_reflection",
     ]
     occurred_at: datetime
     source_id: str
