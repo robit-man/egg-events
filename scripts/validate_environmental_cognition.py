@@ -166,6 +166,44 @@ async def live_contract(args: argparse.Namespace) -> dict[str, object]:
 
         frames = list(await asyncio.gather(*(frame(item) for item in camera_records)))
 
+    detector_ledger: list[dict[str, object]] = []
+    for record, (_camera_id, _payload, captured_at) in zip(camera_records, frames, strict=True):
+        camera_id = str(record["id"])
+        candidates: list[dict[str, object]] = []
+        for index, detection in enumerate(record.get("detections", [])[:12]):
+            if not isinstance(detection, dict):
+                continue
+            identity_id = detection.get("identity_id")
+            object_id = detection.get("object_id")
+            entity_id = identity_id or object_id
+            if identity_id:
+                entity_type = (
+                    "person" if detection.get("identity_persistent") else "appearance_track"
+                )
+            elif object_id:
+                entity_type = "object"
+            else:
+                entity_type = None
+            candidates.append(
+                {
+                    "candidate_id": f"detector:{camera_id}:{index}",
+                    "label": detection.get("label"),
+                    "confidence": detection.get("confidence"),
+                    "bbox": detection.get("bbox"),
+                    "frame_shape": record.get("frame_shape"),
+                    "entity_id": entity_id,
+                    "entity_type": entity_type,
+                    "analyzed_at": record.get("detections_updated_at"),
+                }
+            )
+        detector_ledger.append(
+            {
+                "camera_id": camera_id,
+                "captured_at": captured_at,
+                "candidates": candidates,
+            }
+        )
+
     signal = {
         "stimulus_id": "environmental-harness-live",
         "sequence": 1,
@@ -175,9 +213,18 @@ async def live_contract(args: argparse.Namespace) -> dict[str, object]:
         "note": "Harness admission only; not a semantic conclusion or speech command.",
     }
     started = time.monotonic()
-    assessment = await client.assess_environmental_change(frames, signal, None)
+    assessment = await client.assess_environmental_change(frames, signal, None, detector_ledger)
     if assessment is None:
         raise RuntimeError("live Ornith VLM assessment violated its JSON contract")
+    derived_people_visible = any(
+        subject.get("kind") == "person"
+        for camera in assessment.get("camera_observations", [])
+        if isinstance(camera, dict)
+        for subject in camera.get("subjects", [])
+        if isinstance(subject, dict)
+    )
+    if assessment.get("people_visible") is not derived_people_visible:
+        raise RuntimeError("people_visible was not derived from grounded subjects")
     visual_seconds = time.monotonic() - started
     memory_context = json.dumps(
         {

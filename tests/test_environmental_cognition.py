@@ -187,8 +187,10 @@ def test_adaptive_raw_frame_novelty_wakes_sparse_perception_only_on_change() -> 
 
 
 def test_environmental_model_contracts_allow_silence_or_speech_without_fallback() -> None:
-    assessment = OmniusClient.parse_environmental_assessment(
-        """{"grounded":true,"confidence":0.8,"scene_summary":"A person is near the table.","people_visible":true,"person_continuity":"One visible person remains in view.","meaningful_change":"The person entered the camera view.","change_magnitude":0.8,"addressability":"They are visible but not necessarily addressing Egg.","prior_query_answer":null,"camera_observations":[{"camera_id":"camera-1","scene_summary":"One person is near a table.","scene_tags":["person","table"],"subjects":[{"local_id":"person-1","prior_local_id":null,"detector_support":[],"kind":"person","label":"person","visible_behavior":"standing near a table","behavior_confidence":0.7,"confidence":0.8,"tags":["standing"],"evidence":"A full person silhouette is visible beside the table."}],"relations":[],"uncertainties":["The person's intent is not visible."]}],"overall_uncertainties":["The person's intent is unknown."],"memory_query":"recent interactions connected with the visible person and table","next_visual_query":"Whether the person remains by the table"}"""
+    assessment_json = """{"grounded":true,"confidence":0.8,"scene_summary":"A person is near the table.","people_visible":true,"person_continuity":"One visible person remains in view.","meaningful_change":"The person entered the camera view.","change_magnitude":0.8,"addressability":"They are visible but not necessarily addressing Egg.","prior_query_answer":null,"camera_observations":[{"camera_id":"camera-1","scene_summary":"One person is near a table.","scene_tags":["person","table"],"subjects":[{"local_id":"person-1","prior_local_id":null,"detector_support":[],"kind":"person","label":"person","visible_behavior":"standing near a table","behavior_confidence":0.7,"confidence":0.8,"tags":["standing"],"evidence":"A full person silhouette is visible beside the table."}],"relations":[],"uncertainties":["The person's intent is not visible."]}],"overall_uncertainties":["The person's intent is unknown."],"memory_query":"recent interactions connected with the visible person and table","next_visual_query":"Whether the person remains by the table"}"""
+    assessment = OmniusClient.parse_environmental_assessment(assessment_json)
+    contradictory_summary = OmniusClient.parse_environmental_assessment(
+        assessment_json.replace('"people_visible":true', '"people_visible":false')
     )
     silent = OmniusClient.parse_environmental_deliberation(
         """{"action":"silence","utterance":null,"reflection":"A person entered, but there is no evidence that interruption would help.","confidence":0.8,"reason":"Presence alone does not warrant speech.","connections":[],"open_questions":["Whether the person will address Egg."]}"""
@@ -198,6 +200,7 @@ def test_environmental_model_contracts_allow_silence_or_speech_without_fallback(
     )
 
     assert assessment is not None and assessment["people_visible"] is True
+    assert contradictory_summary is not None and contradictory_summary["people_visible"] is True
     assert silent is not None and silent["utterance"] is None
     assert spoken is not None and spoken["utterance"]
     assert OmniusClient.parse_environmental_deliberation(

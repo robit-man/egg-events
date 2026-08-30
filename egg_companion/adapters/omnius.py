@@ -3698,13 +3698,16 @@ class OmniusClient:
             )
         if camera_ids is not None and seen_cameras != camera_ids:
             return None
-        if parsed.get("people_visible") != ("person" in subject_kinds):
-            return None
+        # The evidence-bearing camera subjects are authoritative here. A VLM
+        # can occasionally contradict them in the redundant summary boolean;
+        # deriving the value avoids discarding valid grounding and, critically,
+        # can never grant speech permission without a validated person subject.
+        people_visible = "person" in subject_kinds
         return {
             "grounded": parsed["grounded"],
             "confidence": float(confidence),
             "scene_summary": " ".join(str(parsed["scene_summary"]).split()),
-            "people_visible": parsed["people_visible"],
+            "people_visible": people_visible,
             "person_continuity": " ".join(
                 str(parsed["person_continuity"]).split()
             ),
