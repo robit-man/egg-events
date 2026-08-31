@@ -175,7 +175,11 @@ environmental_cognition:
   enabled: true
   outward_speech_enabled: true
   queue_size: 1
-  minimum_salience: 0.18
+  # Raised from 0.18: the shared LLM backend serves only one request at a
+  # time (OLLAMA_NUM_PARALLEL=1), so every background cognition cycle is a
+  # window where a live spoken turn can queue behind it. Fewer, more
+  # meaningful cycles directly shrinks how often that collision happens.
+  minimum_salience: 0.32
   salience_half_life_seconds: 45
   habituation_half_life_seconds: 600
   current_evidence_max_age_seconds: 30
