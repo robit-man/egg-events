@@ -6553,9 +6553,59 @@ class CompanionRuntime:
         union = left.area + right.area - intersection
         return intersection / union if union > 0 else 0.0
 
+    @staticmethod
+    def _join_utterance_texts(texts: list[str]) -> str:
+        """Join consolidated utterance fragments as separate sentences.
+
+        Only inserts a separator when the preceding fragment doesn't
+        already end in terminal punctuation, so a burst like ["wait", "no
+        check the news instead"] reads as "wait. no check the news
+        instead" rather than a run-on clause, without doubling punctuation
+        when a fragment already ends in ./!/?.
+        """
+        joined = texts[0]
+        for extra in texts[1:]:
+            joined += f" {extra}" if joined.endswith((".", "!", "?")) else f". {extra}"
+        return joined
+
     async def _reason_about_transcript(self) -> None:
         while True:
-            turn = await self._utterances.get()
+            drained = [await self._utterances.get()]
+            while True:
+                try:
+                    drained.append(self._utterances.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            # Any turn still queued once we reach here is provably stale:
+            # ConversationTurnController.revision only ever increases, and
+            # can_publish/finish_processing require an exact match against
+            # it -- a queued turn processed on its own could never win that
+            # check once a newer one has already finalized. Consolidating
+            # them into one request (rather than N sequential round trips,
+            # of which only the last could ever be spoken) costs nothing
+            # that would have survived anyway, and gives the model full
+            # scope of a rapid burst instead of one isolated fragment.
+            #
+            # Trade-off, accepted deliberately: consolidation happens
+            # uniformly before any curiosity-question / identity-question /
+            # general-dialogue branching inside _handle_audio_turn. If an
+            # accepted identity or curiosity answer has an unrelated clause
+            # merged onto it from the same burst, that trailing clause is
+            # not separately processed -- made visible via the log below
+            # rather than silently invisible, not specially handled.
+            turn = drained[-1]
+            if len(drained) > 1:
+                turn = replace(
+                    turn,
+                    text=self._join_utterance_texts([item.text for item in drained]),
+                    started_at=drained[0].started_at,
+                )
+                logger.info(
+                    "consolidated %d queued utterances into one reasoning turn: %s",
+                    len(drained),
+                    [item.text for item in drained],
+                )
+                self._record_voice_transition("heard_turn_consolidated")
             task = asyncio.create_task(
                 self._handle_audio_turn(turn), name=f"heard-turn:{turn.revision}"
             )
@@ -6578,8 +6628,9 @@ class CompanionRuntime:
                     self._active_reasoning_revision = None
                 self._conversation_turns.finish_processing(turn.revision)
                 self._record_voice_transition("heard_turn_processing_finished")
-                self._turn_visual_snapshots.pop(turn.utterance_id, None)
-                self._turn_acoustic_context.pop(turn.utterance_id, None)
+                for item in drained:
+                    self._turn_visual_snapshots.pop(item.utterance_id, None)
+                    self._turn_acoustic_context.pop(item.utterance_id, None)
 
     def _cancel_stale_reasoning(self, current_revision: int) -> bool:
         active = self._active_reasoning_task

@@ -158,3 +158,56 @@ def test_superseded_reasoning_is_not_mistaken_for_component_shutdown_on_python_3
         await asyncio.gather(worker, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_join_utterance_texts_reads_as_separate_sentences() -> None:
+    join = CompanionRuntime._join_utterance_texts
+    assert join(["only one"]) == "only one"
+    assert join(["wait", "no check the news instead"]) == "wait. no check the news instead"
+    assert join(["already ends here.", "next fragment"]) == "already ends here. next fragment"
+    assert join(["is that right?", "yes"]) == "is that right? yes"
+
+
+def test_queued_burst_of_utterances_is_consolidated_into_one_reasoning_turn() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        handled: list[AudioTurn] = []
+        finished = asyncio.Event()
+
+        async def handle(turn: AudioTurn) -> None:
+            handled.append(turn)
+            finished.set()
+
+        runtime._handle_audio_turn = handle  # type: ignore[method-assign]
+        first = AudioTurn("one", 1, "wait", 1.0, 1.5, barge_id=None)
+        second = AudioTurn("two", 2, "no check the news", 1.5, 2.0, barge_id="barge-1")
+        third = AudioTurn("three", 3, "instead", 2.0, 2.5, barge_id="barge-1")
+        for utterance_id in ("one", "two", "three"):
+            runtime._turn_visual_snapshots[utterance_id] = object()  # type: ignore[assignment]
+            runtime._turn_acoustic_context[utterance_id] = {"dummy": True}
+
+        # Queue all three before the reasoning loop gets a chance to run
+        # get() -- asyncio.create_task doesn't start executing until the
+        # caller yields, so this reliably reproduces "already queued when
+        # the loop wakes up" without needing to fake cancellation timing.
+        runtime._utterances.put_nowait(first)
+        runtime._utterances.put_nowait(second)
+        runtime._utterances.put_nowait(third)
+        worker = asyncio.create_task(runtime._reason_about_transcript())
+        await asyncio.wait_for(finished.wait(), timeout=1)
+
+        assert len(handled) == 1
+        merged = handled[0]
+        assert merged.text == "wait. no check the news. instead"
+        assert merged.revision == 3
+        assert merged.utterance_id == "three"
+        assert merged.ended_at == 2.5
+        assert merged.barge_id == "barge-1"
+        assert merged.started_at == 1.0
+
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        assert runtime._turn_visual_snapshots == {}
+        assert runtime._turn_acoustic_context == {}
+
+    asyncio.run(scenario())
