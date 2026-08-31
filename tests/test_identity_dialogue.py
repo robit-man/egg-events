@@ -533,12 +533,13 @@ def test_realtime_model_intent_signal_routes_memory_recall_unavailable_status() 
     asyncio.run(scenario())
 
 
-def test_heard_turn_speaks_a_fallback_when_reasoning_raises() -> None:
-    """A failed/timed-out model call must still produce audible feedback,
+def test_heard_turn_stays_silent_but_visible_when_reasoning_raises() -> None:
+    """A failed/timed-out model call must never speak a hardcoded canned
 
-    never silent turn drop. Regression test for a real production incident:
-    under heavy load the realtime chat request timed out, and the turn was
-    logged and discarded with nothing spoken back.
+    apology -- that hides the real failure behind a scripted line instead
+    of it being fixed at the source. It must also never be a silent,
+    invisible turn drop: the failure is recorded in runtime-error telemetry
+    and the interaction log so it's fully visible for diagnosis.
     """
 
     async def scenario() -> None:
@@ -563,8 +564,10 @@ def test_heard_turn_speaks_a_fallback_when_reasoning_raises() -> None:
 
         await runtime._handle_audio_turn(turn)
 
-        assert len(spoken) == 1
-        assert spoken[0]
+        assert spoken == []
+        assert runtime.telemetry._runtime_errors
+        assert runtime.telemetry._runtime_errors[-1]["component"] == "reasoning"
+        assert "simulated backend timeout" in runtime.telemetry._runtime_errors[-1]["detail"]
 
     asyncio.run(scenario())
 

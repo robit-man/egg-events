@@ -6840,17 +6840,21 @@ class CompanionRuntime:
                 context,
             )
         except Exception as error:
-            logger.warning("reasoning unavailable for heard turn; speaking a fallback: %s", error)
+            # No canned apology: a hardcoded reply here just hides the real
+            # failure behind a scripted line instead of surfacing it. Fix
+            # the actual cause (see e.g. the num_predict truncation fix);
+            # this stays silent but fully visible in logs/telemetry so a
+            # real failure is never mistaken for a successful turn.
+            logger.error("reasoning unavailable for heard turn: %s", error, exc_info=True)
             if not self._conversation_turns.can_publish(turn.revision):
                 return
-            fallback = "Sorry, I'm having trouble thinking right now."
-            spoken = await self._speak(fallback, expected_revision=turn.revision)
             reason = f"reasoning unavailable: {error}"
-            self.telemetry.record_interaction(spoken, reason, transcript, fallback)
+            self.telemetry.record_runtime_error("reasoning", error)
+            self.telemetry.record_interaction(False, reason, transcript, "")
             self._queue_interaction_memory(
                 transcript,
-                fallback,
-                spoken,
+                "",
+                False,
                 reason,
                 context_id=turn.utterance_id,
             )

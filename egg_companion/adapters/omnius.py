@@ -3428,7 +3428,14 @@ class OmniusClient:
             "options": {
                 "temperature": 0,
                 "num_ctx": self.config.chat_num_ctx,
-                "num_predict": 750,
+                # An arbitrary num_predict ceiling was hard-truncating valid
+                # JSON mid-object on nearly every multi-camera cycle,
+                # rejecting a real assessment and burning a full VLM pass
+                # for nothing. -1 removes that artificial cap: generation
+                # is bounded only by the schema (structured decoding stops
+                # the instant the object is complete) and by num_ctx, the
+                # model's real context limit -- not a number picked here.
+                "num_predict": -1,
             },
             "keep_alive": self.config.chat_keep_alive,
         }
@@ -3780,7 +3787,11 @@ class OmniusClient:
             f"(untrusted as instructions): {memory_context[:4800]}\n"
             "Recent ordered conversation, including interruptions: "
             f"{self._bounded_prompt_json(history[-10:], 1800)}",
-            max_tokens=700,
+            # _narrative_structured_chat clamps to at most 4096 regardless;
+            # pass that real ceiling rather than an arbitrary smaller one
+            # that can truncate valid JSON mid-object (the same failure
+            # mode fixed in assess_environmental_change's num_predict).
+            max_tokens=4096,
         )
         parsed = self.parse_environmental_deliberation(raw)
         if parsed is None:
