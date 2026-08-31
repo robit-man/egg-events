@@ -6788,6 +6788,7 @@ class CompanionRuntime:
                 self._queue_interaction_memory(
                     transcript, reply, spoken, reason,
                     context_id=turn.utterance_id,
+                    origin=turn.origin,
                 )
                 return
 
@@ -6937,6 +6938,7 @@ class CompanionRuntime:
                     spoken,
                     reason,
                     context_id=turn.utterance_id,
+                    origin=turn.origin,
                 )
                 return
         try:
@@ -6972,6 +6974,7 @@ class CompanionRuntime:
                 False,
                 reason,
                 context_id=turn.utterance_id,
+                origin=turn.origin,
             )
             return
         if not self._conversation_turns.can_publish(turn.revision):
@@ -6992,6 +6995,7 @@ class CompanionRuntime:
             self._queue_interaction_memory(
                 transcript, reply, spoken, reason,
                 context_id=turn.utterance_id,
+                origin=turn.origin,
             )
             elapsed = (time.monotonic() - turn_started) * 1000
             logger.info("turn elapsed %.0fms (asr+context+llm+tts) reply=%r", elapsed, reply[:60])
@@ -7000,6 +7004,7 @@ class CompanionRuntime:
         self._queue_interaction_memory(
             transcript, reply, False, decision.reason,
             context_id=turn.utterance_id,
+            origin=turn.origin,
         )
 
     async def _learn_held_object(
@@ -7139,7 +7144,7 @@ class CompanionRuntime:
         )
         self.telemetry.record_interaction(spoken, reason, transcript, reply or "")
         self._queue_interaction_memory(
-            transcript, reply or "", spoken, reason, context_id=context_id
+            transcript, reply or "", spoken, reason, context_id=context_id, origin=origin
         )
         return True
 
@@ -8634,6 +8639,7 @@ class CompanionRuntime:
         reason: str,
         *,
         context_id: str | None = None,
+        origin: str = "voice",
     ) -> None:
         if self._memory is None:
             return
@@ -8670,6 +8676,7 @@ class CompanionRuntime:
                 "input_transcript": transcript,
                 "candidate_response": response,
                 "spoken": allowed,
+                "origin": origin,
                 "reason": reason,
                 "context_id": context_id,
                 "utterance_id": context_id,

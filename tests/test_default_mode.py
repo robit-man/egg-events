@@ -77,6 +77,36 @@ def test_conversation_history_is_chronological_and_marks_suppression(tmp_path) -
     store.close()
 
 
+def test_conversation_history_marks_text_origin_replies_as_delivered_not_spoken(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    now = datetime.now(timezone.utc)
+    store.append_evidence(
+        EvidenceRef(
+            "heard-text-1", "speech", now, "dashboard-chat", "dashboard-chat", quality=1.0,
+            metadata={"transcript": "what did you see this morning"},
+        )
+    )
+    store.append_evidence(
+        EvidenceRef(
+            "reply-text-1", "action", now + timedelta(seconds=1), "policy", "speech", quality=1.0,
+            metadata={
+                "candidate_response": "Nothing yet, my records start later.",
+                "spoken": True,
+                "origin": "text",
+                "reason": "typed message answered",
+            },
+        )
+    )
+
+    history = store.conversation_history()
+
+    assert [item["role"] for item in history] == ["heard", "agent"]
+    assert history[1]["status"] == "delivered"
+    store.close()
+
+
 def test_conversation_history_coalesces_late_memory_and_tool_metadata(tmp_path) -> None:
     store = _store(tmp_path)
     now = datetime.now(timezone.utc)

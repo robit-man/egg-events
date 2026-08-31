@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from egg_companion.cognition.conversation import AudioTurn
 from egg_companion.config import EggConfig
@@ -318,6 +319,38 @@ def test_deliver_text_reply_never_synthesizes_or_plays_audio() -> None:
         delivered = await runtime._deliver_text_reply("answer", expected_revision=0)
 
         assert delivered
+
+    asyncio.run(scenario())
+
+
+def test_queue_interaction_memory_tags_text_origin_replies() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        runtime._memory = SimpleNamespace(retrieval_snapshot=lambda: [])
+
+        runtime._queue_interaction_memory(
+            "what did you see", "nothing yet", True, "typed message answered",
+            context_id="turn-1", origin="text",
+        )
+
+        event = runtime._memory_events.get_nowait()
+        assert event.evidence[0].metadata["origin"] == "text"
+        assert event.evidence[0].metadata["spoken"] is True
+
+    asyncio.run(scenario())
+
+
+def test_queue_interaction_memory_defaults_to_voice_origin() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        runtime._memory = SimpleNamespace(retrieval_snapshot=lambda: [])
+
+        runtime._queue_interaction_memory(
+            "hello", "hi there", True, "conversational reply", context_id="turn-1"
+        )
+
+        event = runtime._memory_events.get_nowait()
+        assert event.evidence[0].metadata["origin"] == "voice"
 
     asyncio.run(scenario())
 

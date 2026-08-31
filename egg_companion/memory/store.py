@@ -2510,13 +2510,18 @@ class MemoryStore:
                 heard_by_context[context_id] = existing
             elif isinstance(response, str) and response.strip():
                 spoken = bool(payload.get("spoken"))
+                is_text_origin = payload.get("origin") == "text"
+                if is_text_origin:
+                    status = "delivered" if spoken else "suppressed"
+                else:
+                    status = "spoken" if spoken else "suppressed"
                 history.append(
                     {
                         "id": str(row["evidence_id"]),
                         "context_id": context_id,
                         "role": "agent",
                         "text": " ".join(response.split())[:2000],
-                        "status": "spoken" if spoken else "suppressed",
+                        "status": status,
                         "at": str(row["captured_at"]),
                         "reason": str(payload.get("reason") or "")[:300],
                     }
