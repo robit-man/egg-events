@@ -650,6 +650,47 @@ class TestWorldQuery:
         summary = query.summary()
         assert summary["total_entities"] >= 1
 
+    def test_recall_object_sightings_resolves_label_to_camera_history(self, world_stores):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:keys"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+
+        detection = {
+            "entity_id": "entity:1",
+            "label": "my keys",
+            "confidence": 0.85,
+            "bbox": [10, 20, 100, 200],
+        }
+        event = MockEvent(
+            payload={"detections": [detection], "frame_shape": (480, 640)},
+            evidence=("ev:1",),
+        )
+        delta = normalizer.normalize_event(event, evidence_ids=("ev:1",), frame_shape=(480, 640))
+        reconciler.ingest(delta)
+
+        results = query.recall_object_sightings("keys")
+        assert len(results) == 1
+        assert results[0]["entity_id"] == "entity:1"
+        assert results[0]["sightings"][0]["camera_id"] == "cam0"
+
+        assert query.recall_object_sightings("umbrella") == []
+
 
 class TestCognitiveContext:
     def test_build_window(self, world_stores):
@@ -1099,6 +1140,22 @@ class TestWorldStateStoreProperty:
         explanation = state.explain("e1", "label")
         assert explanation["value"] == "person"
         assert explanation["evidence_ids"] == ["ev:1"]
+
+    def test_search_property_text_matches_case_insensitive_substring(self, db):
+        state = WorldStateStore(db)
+        state.upsert_property(
+            "object-1", "label",
+            TypedValue(raw="my keys", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:1", (), "observation", utcnow().isoformat(),
+        )
+        state.upsert_property(
+            "object-2", "label",
+            TypedValue(raw="red mug", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:2", (), "observation", utcnow().isoformat(),
+        )
+        matches = state.search_property_text("KEYS")
+        assert [m["entity_id"] for m in matches] == ["object-1"]
+        assert state.search_property_text("umbrella") == []
 
 
 class TestWorldStatePruning:

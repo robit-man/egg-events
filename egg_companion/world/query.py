@@ -149,6 +149,47 @@ class WorldQuery:
             ],
         }
 
+    def recall_object_sightings(
+        self, query: str, limit: int = 5, history_per_entity: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Resolve a free-text object/person term to recent sightings.
+
+        Two-step: resolve query against current label/semantic_tags to find
+        candidate entities, then pull each candidate's last_seen assertion
+        history for the camera and timestamp of each past sighting.
+        """
+        candidates = self._state.search_property_text(query, limit=limit)
+        results: list[dict[str, Any]] = []
+        for candidate in candidates:
+            entity_id = candidate["entity_id"]
+            label = self.property_value(entity_id, "label") or candidate["value"]
+            history = (
+                self._reconciler.get_assertion_history(entity_id, "last_seen")
+                if self._reconciler is not None
+                else []
+            )
+            sightings = [
+                {
+                    "camera_id": (
+                        row["source_id"].split(":", 1)[-1]
+                        if ":" in row["source_id"]
+                        else row["source_id"]
+                    ),
+                    "seen_at": row["valid_from"],
+                    "confidence": row["confidence"],
+                }
+                for row in history[:history_per_entity]
+            ]
+            if not sightings:
+                continue
+            results.append({
+                "entity_id": entity_id,
+                "label": label,
+                "matched_property": candidate["property_id"],
+                "sightings": sightings,
+            })
+        return results
+
     def world_summary(self) -> dict[str, Any]:
         """Full world model summary for dashboard and debugging."""
         summary = self.summary()

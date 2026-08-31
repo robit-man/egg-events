@@ -577,6 +577,69 @@ def test_camera_addressed_vlm_grounding_reaches_memory_and_world_model(tmp_path)
     asyncio.run(scenario())
 
 
+def test_realtime_model_intent_signal_routes_memory_recall_back_into_reply(tmp_path) -> None:
+    async def scenario() -> None:
+        payload = _runtime_config().model_dump()
+        payload["memory"].update(
+            {
+                "enabled": True,
+                "storage_dir": str(tmp_path / "memory"),
+                "retain_raw_media": False,
+            }
+        )
+        payload["identity"]["storage_dir"] = str(tmp_path / "identity")
+        payload["object_learning"]["storage_dir"] = str(tmp_path / "objects")
+        runtime = CompanionRuntime(EggConfig.model_validate(payload))
+        assert runtime._memory is not None
+        assert runtime._memory.world_query is not None
+        contexts = []
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            contexts.append((context, allow_tool_requests))
+            if "OBJECT MEMORY TOOL RESULT" not in context:
+                return "[[TOOL:MEMORY|my keys]]"
+            assert "OBJECT MEMORY TOOL RESULT" in context
+            return "You left your keys by camera-video1 a few minutes ago."
+
+        def recall(query: str, limit: int = 5):
+            assert query == "my keys"
+            return [{
+                "entity_id": "object-001",
+                "label": "keys",
+                "matched_property": "label",
+                "sightings": [
+                    {
+                        "camera_id": "camera-video1",
+                        "seen_at": "2026-08-30T00:00:00+00:00",
+                        "confidence": 0.9,
+                    }
+                ],
+            }]
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._memory.world_query.recall_object_sightings = recall  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "Where did you last see my keys?",
+            utterance_id="heard-semantic-memory",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert [allow for _, allow in contexts] == [True, True]
+        assert spoken == ["You left your keys by camera-video1 a few minutes ago."]
+        runtime._memory.close(datetime.now(timezone.utc))
+
+    asyncio.run(scenario())
+
+
 def test_human_speech_preempts_environmental_model_work_without_polling() -> None:
     async def scenario() -> None:
         runtime = CompanionRuntime(_runtime_config())

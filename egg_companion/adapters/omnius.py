@@ -438,6 +438,9 @@ class OmniusClient:
             "reasonable general default. In particular, a broad request to look up the news "
             "calls search_current_web with a concise current-headlines query rather than asking "
             "for a topic. Call inspect_current_camera when the answer depends on current pixels. "
+            "Call recall_object_memory when the speaker asks where or when something was "
+            "previously seen, not what is visible right now; never substitute it for "
+            "inspect_current_camera and never substitute inspect_current_camera for it. "
             "Call read_current_camera_text when exact visible writing is required and pixels or "
             "prior camera inspection identify text that still needs dedicated reading. "
             "Call inspect_local_runtime for current service, process, hardware, repository, "
@@ -513,6 +516,7 @@ class OmniusClient:
             "ocr": "question",
             "web_search": "query",
             "shell": "command",
+            "memory": "query",
         }
         query = arguments.get(query_keys[tool])
         return tool, " ".join(query.split()) if isinstance(query, str) and query.strip() else None
@@ -528,7 +532,7 @@ class OmniusClient:
         )
         legacy_matches = list(
             re.finditer(
-                r"\[\[\s*TOOL\s*:\s*(VISION|OCR|WEB_SEARCH|SHELL)"
+                r"\[\[\s*TOOL\s*:\s*(VISION|OCR|WEB_SEARCH|SHELL|MEMORY)"
                 r"(?:\s*\|\s*([^\]\r\n]{1,300}))?\s*\]\]",
                 content,
                 flags=re.IGNORECASE,
@@ -549,9 +553,9 @@ class OmniusClient:
                 return None
             tool = decoded.get("tool")
             arguments = decoded.get("arguments", {})
-            if tool not in {"vision", "ocr", "web_search", "shell"} or not isinstance(
-                arguments, dict
-            ):
+            if tool not in {
+                "vision", "ocr", "web_search", "shell", "memory",
+            } or not isinstance(arguments, dict):
                 return None
             return {"tool": tool, "arguments": arguments}
 
@@ -564,6 +568,7 @@ class OmniusClient:
             "ocr": "question",
             "web_search": "query",
             "shell": "command",
+            "memory": "query",
         }[tool]
         if query and tool == "vision":
             return None
@@ -4255,6 +4260,31 @@ class OmniusClient:
             {
                 "type": "function",
                 "function": {
+                    "name": "recall_object_memory",
+                    "description": (
+                        "Recall when and where Egg previously saw a specific object or "
+                        "person from its own memory of past camera detections. Use this "
+                        "for questions about where something was seen before or when it "
+                        "was last seen -- never for what is visible right now."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "The object or person being asked about, in the "
+                                    "speaker's own words, e.g. 'my keys' or 'the red mug'."
+                                ),
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "inspect_local_runtime",
                     "description": (
                         "Inspect current local service, process, hardware, repository, file, or "
@@ -4382,6 +4412,14 @@ class OmniusClient:
                     else "current general news headlines"
                 )
                 return self._realtime_tool_marker("web_search", {"query": normalized})
+            if name == "recall_object_memory":
+                query = arguments.get("query")
+                normalized = (
+                    " ".join(query.split())[:200]
+                    if isinstance(query, str) and query.strip()
+                    else "the object or person just asked about"
+                )
+                return self._realtime_tool_marker("memory", {"query": normalized})
             if name == "inspect_local_runtime":
                 command = arguments.get("command")
                 request = arguments.get("request")

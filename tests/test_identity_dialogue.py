@@ -489,6 +489,50 @@ def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> N
     asyncio.run(scenario())
 
 
+def test_realtime_model_intent_signal_routes_memory_recall_unavailable_status() -> None:
+    """With memory disabled (this file's default _config), the model-selected
+
+    memory tool must still dispatch cleanly and tell the model plainly that
+    no memory is available, rather than crashing or inventing a sighting.
+    The happy-path recall (memory enabled, real results) is covered in
+    tests/test_environmental_cognition.py, which already constructs a
+    runtime with a real memory pipeline.
+    """
+
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_config())
+        assert runtime._memory is None
+        contexts = []
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            contexts.append((context, allow_tool_requests))
+            if "OBJECT MEMORY TOOL STATUS" not in context:
+                return "[[TOOL:MEMORY|my keys]]"
+            assert "OBJECT MEMORY TOOL STATUS" in context
+            return "I don't have any memory of that."
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "Where did you last see my keys?",
+            utterance_id="heard-semantic-memory",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert [allow for _, allow in contexts] == [True, True]
+        assert spoken == ["I don't have any memory of that."]
+
+    asyncio.run(scenario())
+
+
 def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() -> None:
     async def scenario() -> None:
         runtime = CompanionRuntime(_config())

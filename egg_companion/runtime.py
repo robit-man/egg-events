@@ -7130,6 +7130,16 @@ class CompanionRuntime:
                         else None
                     ),
                 )
+            elif tool == "memory":
+                query = arguments.get("query")
+                normalized_query = (
+                    " ".join(query.split())[:200]
+                    if isinstance(query, str) and query.strip()
+                    else transcript[:200]
+                )
+                context = await self._context_with_memory_recall(
+                    turn.utterance_id, normalized_query, context
+                )
             else:
                 context += "\n\nTOOL CONTROL STATUS: rejected an unknown native capability."
 
@@ -7177,6 +7187,67 @@ class CompanionRuntime:
             return (
                 f"{context}\n\nWEB SEARCH TOOL STATUS: unavailable. Do not invent a current "
                 "answer; briefly say the search could not be completed."
+            )
+
+    async def _context_with_memory_recall(self, context_id: str, query: str, context: str) -> str:
+        """Execute an explicit model-selected recall of past object sightings."""
+        started = time.monotonic()
+        self._record_turn_tool_start(context_id, "memory", query)
+        world_query = self._memory.world_query if self._memory is not None else None
+        if world_query is None:
+            detail = "World memory is unavailable."
+            self._record_turn_tool_call(
+                context_id,
+                "memory",
+                query,
+                False,
+                detail,
+                (time.monotonic() - started) * 1000,
+            )
+            return (
+                f"{context}\n\nOBJECT MEMORY TOOL STATUS: {detail} Do not invent a past sighting."
+            )
+        try:
+            sightings = await asyncio.to_thread(
+                world_query.recall_object_sightings,
+                query,
+                5,
+            )
+            evidence = json.dumps(sightings, ensure_ascii=False)[:2000]
+            self._record_turn_tool_call(
+                context_id,
+                "memory",
+                query,
+                True,
+                evidence,
+                (time.monotonic() - started) * 1000,
+            )
+            if not sightings:
+                return (
+                    f"{context}\n\nOBJECT MEMORY TOOL RESULT: no past sighting of "
+                    f"{query!r} was found in memory. Say plainly that Egg has no memory "
+                    "of it, do not invent one."
+                )
+            return (
+                f"{context}\n\nOBJECT MEMORY TOOL RESULT (past detections; each sighting "
+                "has a camera_id and seen_at timestamp; camera_id is the camera's own "
+                "identifier, there is no room name mapping -- refer to it as-is or as "
+                f"'a camera view' if asked to phrase naturally):\n{evidence}"
+            )
+        except Exception as error:
+            logger.warning("memory recall tool invocation failed: %s", error)
+            detail = str(error)
+            self._record_turn_tool_call(
+                context_id,
+                "memory",
+                query,
+                False,
+                detail,
+                (time.monotonic() - started) * 1000,
+            )
+            return (
+                f"{context}\n\nOBJECT MEMORY TOOL STATUS: unavailable. Do not invent a "
+                f"past sighting. Reason: {detail}"
             )
 
     async def _context_with_camera_ocr(

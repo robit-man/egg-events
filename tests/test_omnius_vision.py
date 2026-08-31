@@ -527,6 +527,20 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
         item["function"]["name"] == "read_current_camera_text"
         for item in OmniusClient._realtime_tool_definitions()
     )
+    assert OmniusClient.parse_realtime_tool_request("[[TOOL:MEMORY]]") == "memory"
+    assert OmniusClient.parse_realtime_tool_handoff("[[TOOL:MEMORY|my keys]]") == (
+        "memory",
+        "my keys",
+    )
+    memory_marker = OmniusClient._realtime_tool_marker("memory", {"query": "my keys"})
+    assert OmniusClient.parse_realtime_tool_call(memory_marker) == {
+        "tool": "memory",
+        "arguments": {"query": "my keys"},
+    }
+    assert any(
+        item["function"]["name"] == "recall_object_memory"
+        for item in OmniusClient._realtime_tool_definitions()
+    )
 
 
 def test_web_search_urls_are_parsed_only_from_typed_result_fields() -> None:

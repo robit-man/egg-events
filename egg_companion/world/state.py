@@ -400,6 +400,49 @@ class WorldStateStore:
             ).fetchall()
             return [row[0] for row in rows]
 
+    def search_property_text(
+        self,
+        query: str,
+        property_ids: tuple[str, ...] = ("label", "semantic_tags"),
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search over current property values.
+
+        Scans the materialized current-state cache (not full history) for
+        property_id in property_ids whose value_json contains query
+        case-insensitively. Returns one row per matching entity_id (most
+        recently updated property wins when an entity matches on more than
+        one property_id).
+        """
+        normalized = " ".join(query.split()).strip().lower()
+        if not normalized:
+            return []
+        with self._lock:
+            placeholders = ",".join("?" for _ in property_ids)
+            rows = self._conn.execute(
+                f"""SELECT entity_id, property_id, value_json, updated_at
+                FROM current_property_state
+                WHERE property_id IN ({placeholders}) AND LOWER(value_json) LIKE ?
+                ORDER BY updated_at DESC""",
+                (*property_ids, f"%{normalized}%"),
+            ).fetchall()
+        seen: set[str] = set()
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            entity_id = row[0]
+            if entity_id in seen:
+                continue
+            seen.add(entity_id)
+            matches.append({
+                "entity_id": entity_id,
+                "property_id": row[1],
+                "value": json.loads(row[2]),
+                "updated_at": row[3],
+            })
+            if len(matches) >= limit:
+                break
+        return matches
+
     def entity_brief_counts(self) -> dict[str, dict[str, object]]:
         """Bulk property/relation counts per entity in a single query."""
         with self._lock:
