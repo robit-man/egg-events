@@ -52,7 +52,6 @@ from egg_companion.core.environmental_cognition import (
     EnvironmentalNoveltyTracker,
     EnvironmentalStimulus,
 )
-from egg_companion.world.query import TIME_PERIODS, resolve_time_period
 from egg_companion.core.occupancy import (
     VoxelGrid,
     resolve_camera_yaw_degrees,
@@ -7160,10 +7159,14 @@ class CompanionRuntime:
                     if isinstance(query, str) and query.strip()
                     else transcript[:200]
                 )
-                time_period = arguments.get("time_period")
-                normalized_period = time_period if time_period in TIME_PERIODS else "any"
+                since_arg = arguments.get("since")
+                until_arg = arguments.get("until")
                 context = await self._context_with_memory_recall(
-                    turn.utterance_id, normalized_query, context, normalized_period
+                    turn.utterance_id,
+                    normalized_query,
+                    context,
+                    since_arg if isinstance(since_arg, str) else None,
+                    until_arg if isinstance(until_arg, str) else None,
                 )
             elif tool == "past_ocr":
                 query = arguments.get("query")
@@ -7172,10 +7175,14 @@ class CompanionRuntime:
                     if isinstance(query, str) and query.strip()
                     else transcript[:200]
                 )
-                time_period = arguments.get("time_period")
-                normalized_period = time_period if time_period in TIME_PERIODS else "any"
+                since_arg = arguments.get("since")
+                until_arg = arguments.get("until")
                 context = await self._context_with_past_camera_text(
-                    turn.utterance_id, normalized_query, context, normalized_period
+                    turn.utterance_id,
+                    normalized_query,
+                    context,
+                    since_arg if isinstance(since_arg, str) else None,
+                    until_arg if isinstance(until_arg, str) else None,
                 )
             else:
                 context += "\n\nTOOL CONTROL STATUS: rejected an unknown native capability."
@@ -7280,8 +7287,47 @@ class CompanionRuntime:
             })
         return results
 
+    async def _resolve_object_sightings(
+        self,
+        world_query: object,
+        query: str,
+        since: str | None,
+        until: str | None,
+    ) -> list[dict[str, object]]:
+        """Associative (embedding) similarity is the primary recall ranking.
+
+        No substring/regex matching in the normal path: a query is ranked
+        against known labels by semantic similarity, not literal text
+        overlap, so "the thing I drink from" finds "red mug" just as
+        readily as "mug" does. The literal SQL-LIKE resolver only serves as
+        a defensive fallback when the embedding model itself is
+        unavailable (self._vision is None), not as a normal-path heuristic.
+        """
+        if self._vision is not None:
+            return await asyncio.to_thread(
+                self._associative_object_recall,
+                world_query,
+                query,
+                5,
+                since,
+                until,
+            )
+        return await asyncio.to_thread(
+            world_query.recall_object_sightings,
+            query,
+            5,
+            3,
+            since,
+            until,
+        )
+
     async def _context_with_memory_recall(
-        self, context_id: str, query: str, context: str, time_period: str = "any"
+        self,
+        context_id: str,
+        query: str,
+        context: str,
+        since: str | None = None,
+        until: str | None = None,
     ) -> str:
         """Execute an explicit model-selected recall of past object sightings."""
         started = time.monotonic()
@@ -7300,29 +7346,9 @@ class CompanionRuntime:
             return (
                 f"{context}\n\nOBJECT MEMORY TOOL STATUS: {detail} Do not invent a past sighting."
             )
-        since_until = resolve_time_period(time_period)
-        since, until = since_until if since_until is not None else (None, None)
-        period_note = (
-            f" filtered to {time_period.replace('_', ' ')}" if since_until is not None else ""
-        )
+        period_note = f" between {since} and {until}" if since or until else ""
         try:
-            sightings = await asyncio.to_thread(
-                world_query.recall_object_sightings,
-                query,
-                5,
-                3,
-                since,
-                until,
-            )
-            if not sightings and self._vision is not None:
-                sightings = await asyncio.to_thread(
-                    self._associative_object_recall,
-                    world_query,
-                    query,
-                    5,
-                    since,
-                    until,
-                )
+            sightings = await self._resolve_object_sightings(world_query, query, since, until)
             evidence = json.dumps(sightings, ensure_ascii=False)[:2000]
             self._record_turn_tool_call(
                 context_id,
@@ -7363,7 +7389,12 @@ class CompanionRuntime:
             )
 
     async def _context_with_past_camera_text(
-        self, context_id: str, query: str, context: str, time_period: str = "any"
+        self,
+        context_id: str,
+        query: str,
+        context: str,
+        since: str | None = None,
+        until: str | None = None,
     ) -> str:
         """Run OCR against the stored frame from a specific past sighting.
 
@@ -7394,29 +7425,9 @@ class CompanionRuntime:
                 f"{context}\n\nPAST CAMERA TEXT TOOL STATUS: {detail} Do not invent "
                 "past visible text."
             )
-        since_until = resolve_time_period(time_period)
-        since, until = since_until if since_until is not None else (None, None)
-        period_note = (
-            f" filtered to {time_period.replace('_', ' ')}" if since_until is not None else ""
-        )
+        period_note = f" between {since} and {until}" if since or until else ""
         try:
-            candidates = await asyncio.to_thread(
-                world_query.recall_object_sightings,
-                query,
-                5,
-                3,
-                since,
-                until,
-            )
-            if not candidates and self._vision is not None:
-                candidates = await asyncio.to_thread(
-                    self._associative_object_recall,
-                    world_query,
-                    query,
-                    5,
-                    since,
-                    until,
-                )
+            candidates = await self._resolve_object_sightings(world_query, query, since, until)
             evidenced = [
                 sighting
                 for candidate in candidates
@@ -8981,12 +8992,23 @@ class CompanionRuntime:
             f"{directions}{people}{audio}"
         )
 
+    @staticmethod
+    def _current_time_context() -> str:
+        now = datetime.now().astimezone()
+        return (
+            f"CURRENT DATE AND TIME: {now.strftime('%A, %Y-%m-%d %H:%M %Z')} -- the real "
+            "reference point for resolving any relative date/time in the request (e.g. "
+            "'yesterday', 'last week', 'what time is it')."
+        )
+
     async def _cognitive_context(
         self,
         transcript: str,
         visual_snapshot: _TurnVisualSnapshot | None = None,
     ) -> str:
-        live_scene = self._visual_snapshot_context(visual_snapshot)
+        live_scene = (
+            f"{self._current_time_context()}\n{self._visual_snapshot_context(visual_snapshot)}"
+        )
         if self._memory is None:
             return live_scene
         observations = [

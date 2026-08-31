@@ -542,31 +542,44 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
         for item in OmniusClient._realtime_tool_definitions()
     )
     timed_memory_marker = OmniusClient._realtime_tool_marker(
-        "memory", {"query": "my keys", "time_period": "yesterday"}
+        "memory",
+        {
+            "query": "my keys",
+            "since": "2026-08-24T00:00:00+00:00",
+            "until": "2026-08-31T00:00:00+00:00",
+        },
     )
     assert OmniusClient.parse_realtime_tool_call(timed_memory_marker) == {
         "tool": "memory",
-        "arguments": {"query": "my keys", "time_period": "yesterday"},
+        "arguments": {
+            "query": "my keys",
+            "since": "2026-08-24T00:00:00+00:00",
+            "until": "2026-08-31T00:00:00+00:00",
+        },
     }
     recall_schema = next(
         item["function"]
         for item in OmniusClient._realtime_tool_definitions()
         if item["function"]["name"] == "recall_object_memory"
     )
-    assert set(recall_schema["parameters"]["properties"]["time_period"]["enum"]) == {
-        "any", "today", "yesterday", "this_week", "last_week", "this_month",
-    }
+    assert {"since", "until"} <= set(recall_schema["parameters"]["properties"])
+    assert "enum" not in recall_schema["parameters"]["properties"]["since"]
+    assert OmniusClient._normalized_iso_datetime("2026-08-24T00:00:00+00:00") == (
+        "2026-08-24T00:00:00+00:00"
+    )
+    assert OmniusClient._normalized_iso_datetime("yesterday") is None
+    assert OmniusClient._normalized_iso_datetime(None) is None
     assert OmniusClient.parse_realtime_tool_request("[[TOOL:PAST_OCR]]") == "past_ocr"
     assert OmniusClient.parse_realtime_tool_handoff("[[TOOL:PAST_OCR|the sign]]") == (
         "past_ocr",
         "the sign",
     )
     past_ocr_marker = OmniusClient._realtime_tool_marker(
-        "past_ocr", {"query": "the sign", "time_period": "yesterday"}
+        "past_ocr", {"query": "the sign", "since": "2026-08-24T00:00:00+00:00"}
     )
     assert OmniusClient.parse_realtime_tool_call(past_ocr_marker) == {
         "tool": "past_ocr",
-        "arguments": {"query": "the sign", "time_period": "yesterday"},
+        "arguments": {"query": "the sign", "since": "2026-08-24T00:00:00+00:00"},
     }
     assert any(
         item["function"]["name"] == "read_past_camera_text"

@@ -23,7 +23,6 @@ from egg_companion.cognition.dialogue import (
     InterruptionDecision,
     parse_interruption_decision,
 )
-from egg_companion.world.query import TIME_PERIODS
 
 
 logger = logging.getLogger(__name__)
@@ -442,8 +441,10 @@ class OmniusClient:
             "Call recall_object_memory when the speaker asks where or when something was "
             "previously seen, not what is visible right now; never substitute it for "
             "inspect_current_camera and never substitute inspect_current_camera for it. "
-            "Pass its time_period when the speaker names one (today, yesterday, this "
-            "week, last week, this month), otherwise leave it as any. "
+            "It and read_past_camera_text both accept since/until: when the speaker names a "
+            "time window, reason it out into exact ISO datetimes yourself from the CURRENT "
+            "DATE AND TIME already in context -- never guess a date without that reference "
+            "point, and omit since/until entirely when no window was mentioned. "
             "Call read_current_camera_text when exact visible writing is required and pixels or "
             "prior camera inspection identify text that still needs dedicated reading. Call "
             "read_past_camera_text instead when the writing was seen earlier and is not visible "
@@ -588,6 +589,22 @@ class OmniusClient:
             "tool": tool,
             "arguments": {query_key: query} if query else {},
         }
+
+    @staticmethod
+    def _normalized_iso_datetime(value: object) -> str | None:
+        """Accept only a value the model reasoned into a real ISO datetime.
+
+        Not a heuristic parser of relative phrases -- purely a sanity guard
+        so a malformed value is dropped (falls back to no time bound)
+        rather than silently mis-filtering recall results.
+        """
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return value.strip()
 
     @staticmethod
     def _realtime_tool_marker(tool: str, arguments: dict[str, object]) -> str:
@@ -4320,12 +4337,21 @@ class OmniusClient:
                                     "speaker's own words, e.g. 'my keys' or 'the red mug'."
                                 ),
                             },
-                            "time_period": {
+                            "since": {
                                 "type": "string",
-                                "enum": sorted(TIME_PERIODS),
                                 "description": (
-                                    "The time period being asked about, or 'any' if none "
-                                    "was mentioned."
+                                    "Start of the time window being asked about, as an exact "
+                                    "ISO 8601 datetime, reasoned out from CURRENT DATE AND TIME "
+                                    "in context (e.g. 'yesterday' -> yesterday's midnight). "
+                                    "Omit entirely if no time window was mentioned."
+                                ),
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": (
+                                    "End of the time window being asked about, as an exact "
+                                    "ISO 8601 datetime, reasoned out the same way as since. "
+                                    "Omit entirely if no time window was mentioned."
                                 ),
                             },
                         },
@@ -4352,12 +4378,20 @@ class OmniusClient:
                                     "asked about, in the speaker's own words."
                                 ),
                             },
-                            "time_period": {
+                            "since": {
                                 "type": "string",
-                                "enum": sorted(TIME_PERIODS),
                                 "description": (
-                                    "The time period being asked about, or 'any' if none "
-                                    "was mentioned."
+                                    "Start of the time window being asked about, as an exact "
+                                    "ISO 8601 datetime, reasoned out from CURRENT DATE AND TIME "
+                                    "in context. Omit entirely if no time window was mentioned."
+                                ),
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": (
+                                    "End of the time window being asked about, as an exact "
+                                    "ISO 8601 datetime, reasoned out the same way as since. "
+                                    "Omit entirely if no time window was mentioned."
                                 ),
                             },
                         },
@@ -4502,11 +4536,14 @@ class OmniusClient:
                     if isinstance(query, str) and query.strip()
                     else "the object or person just asked about"
                 )
-                time_period = arguments.get("time_period")
-                normalized_period = time_period if time_period in TIME_PERIODS else "any"
-                return self._realtime_tool_marker(
-                    "memory", {"query": normalized, "time_period": normalized_period}
-                )
+                memory_marker_args: dict[str, object] = {"query": normalized}
+                since = self._normalized_iso_datetime(arguments.get("since"))
+                until = self._normalized_iso_datetime(arguments.get("until"))
+                if since is not None:
+                    memory_marker_args["since"] = since
+                if until is not None:
+                    memory_marker_args["until"] = until
+                return self._realtime_tool_marker("memory", memory_marker_args)
             if name == "read_past_camera_text":
                 query = arguments.get("query")
                 normalized = (
@@ -4514,11 +4551,14 @@ class OmniusClient:
                     if isinstance(query, str) and query.strip()
                     else "the object or scene just asked about"
                 )
-                time_period = arguments.get("time_period")
-                normalized_period = time_period if time_period in TIME_PERIODS else "any"
-                return self._realtime_tool_marker(
-                    "past_ocr", {"query": normalized, "time_period": normalized_period}
-                )
+                past_ocr_marker_args: dict[str, object] = {"query": normalized}
+                since = self._normalized_iso_datetime(arguments.get("since"))
+                until = self._normalized_iso_datetime(arguments.get("until"))
+                if since is not None:
+                    past_ocr_marker_args["since"] = since
+                if until is not None:
+                    past_ocr_marker_args["until"] = until
+                return self._realtime_tool_marker("past_ocr", past_ocr_marker_args)
             if name == "inspect_local_runtime":
                 command = arguments.get("command")
                 request = arguments.get("request")

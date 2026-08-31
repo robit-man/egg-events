@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from egg_companion.world.identity import IdentityGraph
@@ -386,37 +385,3 @@ class WorldQuery:
         }
 
 
-TIME_PERIODS = {"any", "today", "yesterday", "this_week", "last_week", "this_month"}
-
-
-def resolve_time_period(period: str | None) -> tuple[str, str] | None:
-    """Resolve a fixed period keyword to a UTC (since, until) ISO bound.
-
-    Deliberately not model-resolved free text: the model has no ground
-    truth for "now" in its context, so it only classifies the kind of
-    period asked about and this does the actual date arithmetic against a
-    real clock. Returns None for "any"/unrecognized/missing -- no filter,
-    matching current unscoped behavior.
-    """
-    if period is None or period == "any" or period not in TIME_PERIODS:
-        return None
-    now_local = datetime.now().astimezone()
-    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    if period == "today":
-        start, end = today_start, today_start + timedelta(days=1)
-    elif period == "yesterday":
-        start, end = today_start - timedelta(days=1), today_start
-    elif period == "this_week":
-        start = today_start - timedelta(days=today_start.weekday())
-        end = start + timedelta(days=7)
-    elif period == "last_week":
-        this_week_start = today_start - timedelta(days=today_start.weekday())
-        start, end = this_week_start - timedelta(days=7), this_week_start
-    else:  # this_month
-        start = today_start.replace(day=1)
-        next_month = start.replace(day=28) + timedelta(days=4)
-        end = next_month.replace(day=1)
-    return (
-        start.astimezone(timezone.utc).isoformat(),
-        end.astimezone(timezone.utc).isoformat(),
-    )

@@ -25,7 +25,6 @@ from egg_companion.world import (
     WorldGraphStore,
     WorldQuery,
     WorldStateStore,
-    resolve_time_period,
 )
 from egg_companion.world.types import WorldDelta
 from egg_companion.world.spatial import SpatialRelation
@@ -797,32 +796,6 @@ class TestWorldQuery:
         )
         labels = {c["label"] for c in query.candidate_labels()}
         assert labels == {"keys", "mug"}
-
-
-class TestResolveTimePeriod:
-    def test_unrecognized_or_any_returns_none(self):
-        assert resolve_time_period("any") is None
-        assert resolve_time_period(None) is None
-        assert resolve_time_period("whenever") is None
-
-    def test_today_bounds_contain_now_and_exclude_yesterday(self):
-        since, until = resolve_time_period("today")
-        now = datetime.now(timezone.utc).isoformat()
-        assert since <= now <= until
-        yesterday_since, yesterday_until = resolve_time_period("yesterday")
-        assert yesterday_until <= since
-
-    def test_this_week_contains_today_and_last_week_precedes_it(self):
-        since, until = resolve_time_period("this_week")
-        today_since, _ = resolve_time_period("today")
-        assert since <= today_since <= until
-        last_since, last_until = resolve_time_period("last_week")
-        assert last_until <= since
-
-    def test_this_month_contains_today(self):
-        since, until = resolve_time_period("this_month")
-        today_since, _ = resolve_time_period("today")
-        assert since <= today_since <= until
 
 
 class TestCognitiveContext:
