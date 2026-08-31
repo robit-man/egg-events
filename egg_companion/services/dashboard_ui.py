@@ -231,6 +231,15 @@ PAGE = r"""<!doctype html>
     .message-tag.memory { border-color: #59406f; color: #d8b4fe; }
     .message-tag.association { border-color: #28556c; color: #7dd3fc; }
     .message.suppressed { opacity: .55; border: 1px dashed var(--line-strong); }
+    .sidebar-chat-feed { display: grid; gap: 6px; max-height: 200px; margin: 0 2px 8px; overflow-y: auto; align-content: start; }
+    .sidebar-chat-feed .message { max-width: 100%; padding: 7px 9px; font-size: 11px; border-radius: 8px; }
+    .sidebar-chat-feed .message-role { font-size: 8px; }
+    .sidebar-chat-feed .message-meta { font-size: 8px; }
+    .sidebar-chat-feed .message-tags { gap: 4px; margin-top: 5px; }
+    .sidebar-chat-feed .empty { padding: 8px 9px; font-size: 11px; }
+    .sidebar-chat-form { display: flex; gap: 6px; margin: 0 2px; }
+    .sidebar-chat-form .input { flex: 1; min-width: 0; padding: 8px 9px; font-size: 12px; }
+    .sidebar-chat-form .button { padding: 8px 11px; font-size: 12px; }
 
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
     .field { display: grid; gap: 6px; }
@@ -599,6 +608,12 @@ PAGE = r"""<!doctype html>
       <nav class="nav">
         <a class="nav-link" href="/configuration" data-route="/configuration" data-title="Configuration"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h7M15 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="13" cy="18" r="2"/></svg><span>Configuration</span></a>
       </nav>
+      <div class="nav-label" style="margin-top:22px">Ask Egg</div>
+      <div id="sidebar-chat-feed" class="sidebar-chat-feed"><div class="empty">No admitted speech yet.</div></div>
+      <form id="sidebar-chat-form" class="sidebar-chat-form">
+        <input id="sidebar-chat-input" class="input" type="text" placeholder="Ask Egg…" autocomplete="off" maxlength="2000">
+        <button class="button primary" type="submit">Send</button>
+      </form>
       <div class="sidebar-footer">
         <div class="connection"><span id="connection-dot" class="connection-dot"></span><span id="connection-label">Connecting</span></div>
         <div id="sidebar-meta" class="sidebar-meta">Waiting for runtime</div>
@@ -1044,6 +1059,7 @@ PAGE = r"""<!doctype html>
         if (Array.isArray(ledger)) conversationLedger = ledger;
         conversationLoadedAt = Date.now();
         const telemetry = currentState?.telemetry || {};
+        renderConversation(telemetry, '#sidebar-chat-feed');
         if ($('.page.active')?.dataset.page === '/') renderConversation(telemetry, '#overview-conversation');
         if ($('.page.active')?.dataset.page === '/voice') renderConversation(telemetry, '#conversation', true);
       } catch (_) {
@@ -1528,6 +1544,25 @@ PAGE = r"""<!doctype html>
     }
     $('#voice-reconnect').addEventListener('click', () => voiceAction('reconnect'));
     $('#voice-reload').addEventListener('click', () => { catalog = null; loadCatalog(true); });
+    $('#sidebar-chat-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const input = $('#sidebar-chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+      input.disabled = true;
+      try {
+        const response = await fetch('/api/chat/message', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
+        if (!response.ok) throw new Error(await response.text());
+        input.value = '';
+        await loadConversation(true);
+      } catch (error) {
+        const meta = $('#sidebar-meta');
+        if (meta) meta.textContent = error.message || 'Message failed to send';
+      } finally {
+        input.disabled = false;
+        input.focus();
+      }
+    });
     $('#people-search').addEventListener('input', () => currentState && renderEntities(currentState));
     $('#objects-search').addEventListener('input', () => currentState && renderEntities(currentState));
     $('#identities').addEventListener('click', event => {

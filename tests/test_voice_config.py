@@ -211,3 +211,124 @@ def test_queued_burst_of_utterances_is_consolidated_into_one_reasoning_turn() ->
         assert runtime._turn_acoustic_context == {}
 
     asyncio.run(scenario())
+
+
+def test_queue_text_turn_enqueues_text_origin_turn() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+
+        utterance_id = runtime.queue_text_turn("what did you see")
+
+        queued = runtime._utterances.get_nowait()
+        assert queued.origin == "text"
+        assert queued.text == "what did you see"
+        assert queued.utterance_id == utterance_id
+        assert queued.barge_id is None
+
+    asyncio.run(scenario())
+
+
+def test_queue_text_turn_writes_heard_transcript_evidence() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        runtime._memory = object()  # bypass the "memory disabled" guard
+
+        utterance_id = runtime.queue_text_turn("what did you see")
+
+        event = runtime._memory_events.get_nowait()
+        assert event.event_type == "speech"
+        assert event.payload["transcript"] == "what did you see"
+        assert event.evidence[0].modality == "speech"
+        assert event.evidence[0].metadata["transcript"] == "what did you see"
+        assert event.evidence[0].metadata["context_id"] == utterance_id
+        assert event.evidence[0].metadata["utterance_id"] == utterance_id
+
+    asyncio.run(scenario())
+
+
+def test_queue_text_turn_rejects_empty_text() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+
+        raised = False
+        try:
+            runtime.queue_text_turn("   ")
+        except ValueError:
+            raised = True
+
+        assert raised
+        assert runtime._utterances.empty()
+
+    asyncio.run(scenario())
+
+
+def test_deliver_reply_routes_text_origin_without_speak() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+
+        async def failing_speak(*_args, **_kwargs):
+            raise AssertionError("text-origin replies must never call _speak")
+
+        runtime._speak = failing_speak  # type: ignore[method-assign]
+
+        delivered = await runtime._deliver_reply(
+            "text", "here is your answer", expected_revision=0
+        )
+
+        assert delivered
+
+    asyncio.run(scenario())
+
+
+def test_deliver_reply_routes_voice_origin_through_speak() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        called: list[tuple[str, int | None]] = []
+
+        async def fake_speak(text, expected_revision=None):
+            called.append((text, expected_revision))
+            return True
+
+        runtime._speak = fake_speak  # type: ignore[method-assign]
+
+        delivered = await runtime._deliver_reply("voice", "hello", expected_revision=0)
+
+        assert delivered
+        assert called == [("hello", 0)]
+
+    asyncio.run(scenario())
+
+
+def test_deliver_text_reply_never_synthesizes_or_plays_audio() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+
+        async def failing_synthesize(_text: str) -> bytes:
+            raise AssertionError("text replies must not synthesize audio")
+
+        class FailingSpeaker:
+            is_playing = False
+
+            async def play_wav(self, *_args, **_kwargs):
+                raise AssertionError("text replies must not reach the speaker")
+
+        runtime._omnius.synthesize = failing_synthesize
+        runtime._speaker = FailingSpeaker()
+
+        delivered = await runtime._deliver_text_reply("answer", expected_revision=0)
+
+        assert delivered
+
+    asyncio.run(scenario())
+
+
+def test_deliver_text_reply_rejects_stale_revision() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        runtime._conversation_turns.revision = 5
+
+        delivered = await runtime._deliver_text_reply("stale answer", expected_revision=1)
+
+        assert not delivered
+
+    asyncio.run(scenario())

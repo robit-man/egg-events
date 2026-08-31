@@ -3269,6 +3269,40 @@ class CompanionRuntime:
         )
         return media_key, media_checksum
 
+    def _queue_text_turn_memory(self, text: str, utterance_id: str) -> None:
+        """Text-origin counterpart to ``_queue_speech_memory``.
+
+        A typed dashboard message has no audio to persist, DoA, or ASR
+        metadata, but still needs a ``modality="speech"``, ``transcript``-bearing
+        evidence row -- that's what ``conversation_history()``
+        (``memory/store.py``) matches to build the "heard" ledger row, keyed
+        on this turn's ``utterance_id`` so ``_queue_interaction_memory``'s
+        later reply event lines up with it as the same conversation turn.
+        """
+        if self._memory is None:
+            return
+        now = datetime.now(timezone.utc)
+        evidence = EvidenceRef(
+            str(uuid4()), "speech", now, "dashboard-chat", "dashboard-chat",
+            quality=1.0,
+            metadata={
+                "transcript": text,
+                "context_id": utterance_id,
+                "utterance_id": utterance_id,
+            },
+        )
+        self._queue_memory_event(
+            PerceptualEvent(
+                str(uuid4()),
+                "speech",
+                now,
+                "dashboard-chat",
+                (evidence,),
+                (),
+                payload={"transcript": text, "entities": []},
+            )
+        )
+
     def _queue_memory_event(self, event: PerceptualEvent) -> None:
         if self._memory_events.full():
             if event.event_type in {"vision", "attention"}:
@@ -6568,6 +6602,33 @@ class CompanionRuntime:
             joined += f" {extra}" if joined.endswith((".", "!", "?")) else f". {extra}"
         return joined
 
+    def queue_text_turn(self, text: str) -> str:
+        """Queue a dashboard-typed message through the same reasoning
+        pipeline as heard speech (mirrors the ASR finalize call site above,
+        minus audio-specific bookkeeping -- no acoustic context, no speech
+        memory, no barge lease). The reply is delivered without TTS; see
+        ``_deliver_reply``.
+        """
+        utterance_id = str(uuid4())
+        turn = self._conversation_turns.finalize_audio_turn(
+            text,
+            utterance_id=utterance_id,
+            started_at=time.monotonic(),
+            origin="text",
+        )
+        self._queue_text_turn_memory(turn.text, utterance_id)
+        self._record_voice_transition("heard_turn_finalized")
+        self._cancel_stale_reasoning(turn.revision)
+        if self._utterances.full():
+            reason = "conversation reasoning overload; rejected newest finalized turn"
+            logger.warning(reason)
+            self.telemetry.record_runtime_error("reasoning-ingress-overload", reason)
+            self._conversation_turns.reject_reasoning()
+            self._record_voice_transition("reasoning_ingress_rejected")
+            raise RuntimeError(reason)
+        self._utterances.put_nowait(turn)
+        return turn.utterance_id
+
     async def _reason_about_transcript(self) -> None:
         while True:
             drained = [await self._utterances.get()]
@@ -6717,7 +6778,9 @@ class CompanionRuntime:
                         turn.utterance_id,
                     )
                 reply = str(interpretation["reply"])
-                spoken = await self._speak(reply, expected_revision=turn.revision)
+                spoken = await self._deliver_reply(
+                    turn.origin, reply, expected_revision=turn.revision
+                )
                 reason = "model interpreted response to its proactive question"
                 self.telemetry.record_interaction(
                     spoken, reason, transcript, reply
@@ -6748,6 +6811,7 @@ class CompanionRuntime:
                 transcript,
                 turn.revision,
                 pending_identity.camera_id,
+                origin=turn.origin,
             ):
                 return
 
@@ -6801,6 +6865,7 @@ class CompanionRuntime:
                 transcript,
                 turn.revision,
                 self._latest_observation.camera_id if self._latest_observation else None,
+                origin=turn.origin,
             ):
                 return
         if dialogue.act == "object_naming":
@@ -6859,8 +6924,8 @@ class CompanionRuntime:
                             transcript,
                             turn.utterance_id,
                         )
-                spoken = await self._speak(
-                    feedback["reply"], expected_revision=turn.revision
+                spoken = await self._deliver_reply(
+                    turn.origin, feedback["reply"], expected_revision=turn.revision
                 )
                 reason = "human visual-label feedback applied to memory"
                 self.telemetry.record_interaction(
@@ -6915,7 +6980,9 @@ class CompanionRuntime:
             transcript, reply, directed=dialogue.directed
         )
         if decision.allow_speech:
-            spoken = await self._speak(reply, expected_revision=turn.revision)
+            spoken = await self._deliver_reply(
+                turn.origin, reply, expected_revision=turn.revision
+            )
             reason = (
                 decision.reason
                 if spoken
@@ -7017,6 +7084,7 @@ class CompanionRuntime:
         expected_revision: int,
         camera_id: str | None,
         context_id: str | None = None,
+        origin: str = "voice",
     ) -> bool:
         context_id = (
             context_id
@@ -7060,7 +7128,7 @@ class CompanionRuntime:
             logger.warning("model-authored identity acknowledgement unavailable: %s", error)
             reply = None
         spoken = (
-            await self._speak(reply, expected_revision=expected_revision)
+            await self._deliver_reply(origin, reply, expected_revision=expected_revision)
             if reply
             else False
         )
@@ -9302,6 +9370,65 @@ class CompanionRuntime:
             self._last_spoken_at = time.monotonic()
             self._record_voice_transition("playback_completed")
             return True
+
+    async def _deliver_reply(
+        self,
+        origin: str,
+        text: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Dispatch a reply to its origin's delivery channel.
+
+        Voice-origin turns are audibly spoken via ``_speak``. Text-origin
+        turns (dashboard chat) skip TTS/playback entirely -- the reply still
+        reaches the user through the durable interaction ledger that
+        ``_queue_interaction_memory`` writes right after this returns.
+        """
+        if origin == "text":
+            return await self._deliver_text_reply(text, expected_revision)
+        return await self._speak(text, expected_revision=expected_revision)
+
+    async def _deliver_text_reply(
+        self, text: str, expected_revision: int | None = None
+    ) -> bool:
+        """Policy-gated, TTS-free counterpart to ``_speak`` for text turns.
+
+        Mirrors ``_speak``'s policy gate exactly so a text reply is subject
+        to the same PolicyValidator rules as a spoken one -- only the
+        delivery mechanism differs, not the governance around what Egg says.
+        """
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return False
+
+        proposal_id: str | None = None
+        if self._memory is not None:
+            proposal, violations = self._memory.propose_action(
+                "speak", inputs={"text": normalized},
+            )
+            blocking = [v for v in violations if v.blocked]
+            if blocking:
+                logger.warning(
+                    "text reply blocked by policy: %s",
+                    "; ".join(v.reason for v in blocking),
+                )
+                return False
+            proposal_id = proposal.proposal_id
+
+        revision = (
+            self._conversation_turns.revision
+            if expected_revision is None
+            else expected_revision
+        )
+        delivered = self._conversation_turns.is_current(revision)
+        if delivered:
+            self.telemetry.record_reply(normalized)
+        if proposal_id is not None and self._memory is not None:
+            self._memory.record_action_execution(
+                proposal_id, success=delivered, result=normalized[:200],
+            )
+        return delivered
 
     async def focus_camera(
         self, camera_id: str, duration_seconds: float = 45.0

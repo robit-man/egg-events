@@ -60,6 +60,7 @@ class AudioTurn:
     started_at: float
     ended_at: float
     barge_id: str | None = None
+    origin: Literal["voice", "text"] = "voice"
 
 
 class ConversationTurnController:
@@ -155,6 +156,7 @@ class ConversationTurnController:
         started_at: float,
         ended_at: float | None = None,
         barge_id: str | None = None,
+        origin: Literal["voice", "text"] = "voice",
     ) -> AudioTurn:
         normalized = " ".join(text.strip().split())
         if not normalized:
@@ -169,6 +171,7 @@ class ConversationTurnController:
             started_at=started_at,
             ended_at=ended,
             barge_id=barge_id,
+            origin=origin,
         )
         self._history.append(
             TranscriptTurn(

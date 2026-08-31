@@ -429,6 +429,23 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             raise web.HTTPBadGateway(text=str(error)) from error
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
+    async def chat_message_handler(request: web.Request) -> web.Response:
+        require_loopback(request)
+        body = await request.json()
+        text = str(body.get("text", "")).strip()
+        if not text:
+            raise web.HTTPBadRequest(text="text is required")
+        try:
+            utterance_id = companion().queue_text_turn(text)
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPServiceUnavailable(text=str(error)) from error
+        return web.json_response(
+            {"ok": True, "utterance_id": utterance_id},
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def action_focus_camera_handler(request: web.Request) -> web.Response:
         require_loopback(request)
         body = await request.json()
@@ -680,6 +697,7 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     app.router.add_get("/api/voice/conversation", conversation_history_handler)
     app.router.add_put("/api/voice/config", voice_config_handler)
     app.router.add_post("/api/voice/action", voice_action_handler)
+    app.router.add_post("/api/chat/message", chat_message_handler)
     app.router.add_post("/api/actions/focus_camera", action_focus_camera_handler)
     app.router.add_post("/api/actions/inspect_entity", action_inspect_entity_handler)
     app.router.add_get("/api/dreams", dreams_handler)

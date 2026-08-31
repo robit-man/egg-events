@@ -147,6 +147,8 @@ def test_bare_name_answer_bypasses_general_router_and_targets_prompted_face() ->
             transcript: str,
             expected_revision: int,
             camera_id: str | None,
+            context_id: str | None = None,
+            origin: str = "voice",
         ) -> bool:
             accepted.append((profile_id, name, camera_id or ""))
             return True
