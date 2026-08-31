@@ -263,6 +263,59 @@ def test_environmental_assessment_tolerates_a_repeated_camera_tile() -> None:
     assert assessment["camera_observations"][0]["scene_summary"] == "One person is near a table."
 
 
+def test_environmental_assessment_drops_relation_to_undeclared_subject() -> None:
+    """A relation naming a background object that was never given its own
+
+    subject entry (e.g. a person "near" a "monitor" that has no subject of
+    its own) is a harmless omission, not evidence the assessment is broken.
+    Regression test for a real production incident: this was causing a
+    hard rejection of an otherwise-valid, complete assessment.
+    """
+    import json
+
+    payload = {
+        "grounded": True,
+        "confidence": 0.8,
+        "scene_summary": "A person is at a desk.",
+        "people_visible": True,
+        "person_continuity": "One visible person remains in view.",
+        "meaningful_change": "The person entered the camera view.",
+        "change_magnitude": 0.8,
+        "addressability": "They are visible but not necessarily addressing Egg.",
+        "prior_query_answer": None,
+        "camera_observations": [
+            {
+                "camera_id": "camera-1",
+                "scene_summary": "Person seated at a desk facing a monitor.",
+                "scene_tags": ["person", "desk"],
+                "subjects": [{
+                    "local_id": "person-1", "prior_local_id": None, "detector_support": [],
+                    "kind": "person", "label": "seated person",
+                    "visible_behavior": "sitting", "behavior_confidence": 0.7,
+                    "confidence": 0.8, "tags": ["seated"],
+                    "evidence": "A person is visible seated at a desk.",
+                }],
+                "relations": [{
+                    "source_local_id": "person-1",
+                    "relation": "near",
+                    "target_local_id": "monitor",
+                    "confidence": 0.8,
+                    "evidence": "Person faces the monitor on the desk.",
+                }],
+                "uncertainties": ["The person's intent is not visible."],
+            },
+        ],
+        "overall_uncertainties": ["The person's intent is unknown."],
+        "memory_query": "recent interactions connected with the visible person",
+        "next_visual_query": "Whether the person remains at the desk",
+    }
+    assessment = OmniusClient.parse_environmental_assessment(
+        json.dumps(payload), camera_ids={"camera-1"}
+    )
+    assert assessment is not None
+    assert assessment["camera_observations"][0]["relations"] == []
+
+
 def test_environmental_reflection_enters_retrieval_and_reflective_working_context(
     tmp_path,
 ) -> None:

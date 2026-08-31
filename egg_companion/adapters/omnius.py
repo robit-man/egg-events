@@ -3718,10 +3718,7 @@ class OmniusClient:
                 target_local_id = relation.get("target_local_id")
                 relation_confidence = relation.get("confidence")
                 if (
-                    source_local_id not in local_ids
-                    or target_local_id not in local_ids
-                    or source_local_id == target_local_id
-                    or relation.get("relation")
+                    relation.get("relation")
                     not in {"holds", "near", "inside", "on_top_of"}
                     or not isinstance(relation_confidence, (int, float))
                     or isinstance(relation_confidence, bool)
@@ -3729,6 +3726,16 @@ class OmniusClient:
                     or not cls._bounded_text(relation.get("evidence"), 400)
                 ):
                     return None
+                if (
+                    source_local_id not in local_ids
+                    or target_local_id not in local_ids
+                    or source_local_id == target_local_id
+                ):
+                    # A relation naming a background object the model didn't
+                    # bother giving its own subject entry (or a degenerate
+                    # self-relation) is a harmless omission, not evidence
+                    # the assessment is broken -- drop just this relation.
+                    continue
                 relations.append(
                     {
                         "source_local_id": str(source_local_id),
