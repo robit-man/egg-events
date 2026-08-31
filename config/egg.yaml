@@ -128,7 +128,14 @@ omnius:
   voice_model: supertonic
   voice_name: F4
   bearer_token_env: EGG_OMNIUS_TOKEN
-  timeout_seconds: 30
+  # Raised from 30: confirmed directly on this device that a successful
+  # reply can legitimately take 14-30+ seconds even uncontended (single
+  # inference slot, real hardware latency), and a client-side cancel here
+  # doesn't just fail this request -- it can abort an in-progress model
+  # load entirely, turning a slow reply into a cascading failure instead
+  # of just a slow one. Give a genuinely-slow-but-working request room to
+  # actually finish rather than get cancelled right as it might succeed.
+  timeout_seconds: 60
   chat_num_ctx: 4096
   chat_history_messages: 12
   chat_keep_alive: 30m
