@@ -169,11 +169,13 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert "health recheck running" in dashboard.PAGE
     assert "Cognition unavailable" in dashboard.PAGE
     assert "Audio comprehension unavailable" in dashboard.PAGE
-    assert 'id="sidebar-chat-form"' in dashboard.PAGE
-    assert 'id="sidebar-chat-feed"' in dashboard.PAGE
-    assert 'id="sidebar-chat-input"' in dashboard.PAGE
+    assert 'href="/chat" data-route="/chat"' in dashboard.PAGE
+    assert 'data-page="/chat"' in dashboard.PAGE
+    assert 'id="chat-form"' in dashboard.PAGE
+    assert 'id="chat-conversation"' in dashboard.PAGE
+    assert 'id="chat-input"' in dashboard.PAGE
     assert "/api/chat/message" in dashboard.PAGE
-    assert "renderConversation(telemetry, '#sidebar-chat-feed')" in dashboard.PAGE
+    assert "renderConversation(telemetry, '#chat-conversation', true)" in dashboard.PAGE
     assert "border-radius: 0 !important" in dashboard.PAGE
     assert 'data-person-id=' in dashboard.PAGE
     assert 'id="person-inspector"' in dashboard.PAGE

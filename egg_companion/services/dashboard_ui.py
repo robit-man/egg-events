@@ -231,15 +231,8 @@ PAGE = r"""<!doctype html>
     .message-tag.memory { border-color: #59406f; color: #d8b4fe; }
     .message-tag.association { border-color: #28556c; color: #7dd3fc; }
     .message.suppressed { opacity: .55; border: 1px dashed var(--line-strong); }
-    .sidebar-chat-feed { display: grid; gap: 6px; max-height: 200px; margin: 0 2px 8px; overflow-y: auto; align-content: start; }
-    .sidebar-chat-feed .message { max-width: 100%; padding: 7px 9px; font-size: 11px; border-radius: 8px; }
-    .sidebar-chat-feed .message-role { font-size: 8px; }
-    .sidebar-chat-feed .message-meta { font-size: 8px; }
-    .sidebar-chat-feed .message-tags { gap: 4px; margin-top: 5px; }
-    .sidebar-chat-feed .empty { padding: 8px 9px; font-size: 11px; }
-    .sidebar-chat-form { display: flex; gap: 6px; margin: 0 2px; }
-    .sidebar-chat-form .input { flex: 1; min-width: 0; padding: 8px 9px; font-size: 12px; }
-    .sidebar-chat-form .button { padding: 8px 11px; font-size: 12px; }
+    .chat-form { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
+    .chat-form .input { flex: 1; min-width: 220px; }
 
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
     .field { display: grid; gap: 6px; }
@@ -595,6 +588,7 @@ PAGE = r"""<!doctype html>
         <a class="nav-link" href="/" data-route="/" data-title="Overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-13h6V4h-6v3Z"/></svg><span>Overview</span></a>
         <a class="nav-link" href="/vision" data-route="/vision" data-title="Vision"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg><span>Vision</span></a>
         <a class="nav-link" href="/voice" data-route="/voice" data-title="Voice & Conversation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3M8 22h8"/></svg><span>Voice</span></a>
+        <a class="nav-link" href="/chat" data-route="/chat" data-title="Chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 5h16v11H8l-4 4V5Z"/><path d="M8 9h8M8 12h5"/></svg><span>Chat</span></a>
         <a class="nav-link" href="/entities" data-route="/entities" data-title="People & Objects"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0M16 5h5v5h-5zM17 15h4v4h-4z"/></svg><span>People & objects</span></a>
         <a class="nav-link" href="/memory" data-route="/memory" data-title="Memory"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg><span>Memory</span></a>
         <a class="nav-link" href="/cognition" data-route="/cognition" data-title="Cognition"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 4a3 3 0 0 0-5 2.2A3.5 3.5 0 0 0 5 13a4 4 0 0 0 4 6M15 4a3 3 0 0 1 5 2.2A3.5 3.5 0 0 1 19 13a4 4 0 0 1-4 6M9 4v16M15 4v16M9 8h3M12 16h3"/></svg><span>Cognition</span></a>
@@ -608,12 +602,6 @@ PAGE = r"""<!doctype html>
       <nav class="nav">
         <a class="nav-link" href="/configuration" data-route="/configuration" data-title="Configuration"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h7M15 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="13" cy="18" r="2"/></svg><span>Configuration</span></a>
       </nav>
-      <div class="nav-label" style="margin-top:22px">Ask Egg</div>
-      <div id="sidebar-chat-feed" class="sidebar-chat-feed"><div class="empty">No admitted speech yet.</div></div>
-      <form id="sidebar-chat-form" class="sidebar-chat-form">
-        <input id="sidebar-chat-input" class="input" type="text" placeholder="Ask Egg…" autocomplete="off" maxlength="2000">
-        <button class="button primary" type="submit">Send</button>
-      </form>
       <div class="sidebar-footer">
         <div class="connection"><span id="connection-dot" class="connection-dot"></span><span id="connection-label">Connecting</span></div>
         <div id="sidebar-meta" class="sidebar-meta">Waiting for runtime</div>
@@ -674,6 +662,21 @@ PAGE = r"""<!doctype html>
             <article class="card span-4"><div class="card-header"><div><h3 class="card-title">Turn lifecycle</h3><p class="card-note">Current conversation authority</p></div></div><div id="turn-state" class="table-wrap"></div></article>
             <article class="card span-7"><div class="card-header"><div><h3 class="card-title">Conversation history</h3><p class="card-note">Complete durable audible ledger; survives navigation and daemon restarts</p></div></div><div id="conversation" class="conversation"><div class="empty">No admitted speech yet.</div></div></article>
             <article class="card span-5"><div class="card-header"><div><h3 class="card-title">Live voice controls</h3><p class="card-note">Applied in-page; an Egg restart is not required</p></div><button id="voice-reload" class="button" type="button">Reload models</button></div><div id="voice-catalog-status" class="badge-row" style="margin-bottom:12px"><span class="badge">Discovering local models</span></div><form id="voice" class="form-grid"><div class="field"><label>ASR model</label><select class="select" name="asr_model"><option>Loading models…</option></select></div><div class="field"><label>ASR language</label><input class="input" name="asr_language" placeholder="en or auto" pattern="auto|[a-z]{2,3}(-[A-Z]{2})?"></div><div class="field"><label>TTS model</label><select class="select" name="voice_model"><option>Loading models…</option></select></div><div class="field"><label>Voice</label><select class="select" name="voice_name"><option>Loading voices…</option></select></div><div class="field"><label>Maximum utterance</label><input class="input" name="segment_seconds" type="number" min="1" max="15" step=".5"></div><div class="field"><label>RMS admission gate</label><input class="input" name="rms_threshold" type="number" min=".001" max="1" step=".001"></div><div class="field"><label>ASR target RMS</label><input class="input" name="asr_target_rms" type="number" min=".001" max="1" step=".001"></div><div class="field"><label>Maximum ASR gain</label><input class="input" name="asr_max_gain" type="number" min="1" max="48" step="1"></div><div class="field"><label>Pre-VAD gain</label><input class="input" name="vad_input_gain" type="number" min="1" max="32" step=".5"></div><div class="button-row"><button class="button primary" type="submit">Apply settings</button><button id="voice-reconnect" class="button" type="button">Reconnect models</button></div><span id="voice-result" class="result"></span></form></article>
+          </div>
+        </section>
+
+        <section class="page" data-page="/chat">
+          <div class="page-heading"><div><h2>Chat</h2><p>Typed questions are routed through the same reasoning and tool pipeline as speech; replies land here as text and are never spoken aloud.</p></div></div>
+          <div class="grid">
+            <article class="card span-12">
+              <div class="card-header"><div><h3 class="card-title">Conversation</h3><p class="card-note">Same durable ledger as voice; typed turns are tagged text-only and skip synthesis</p></div></div>
+              <div id="chat-conversation" class="conversation"><div class="empty">No admitted speech yet.</div></div>
+              <form id="chat-form" class="chat-form">
+                <input id="chat-input" class="input" type="text" placeholder="Ask Egg…" autocomplete="off" maxlength="2000">
+                <button class="button primary" type="submit">Send</button>
+                <span id="chat-result" class="result"></span>
+              </form>
+            </article>
           </div>
         </section>
 
@@ -790,7 +793,7 @@ PAGE = r"""<!doctype html>
     const $ = (selector, root = document) => root.querySelector(selector);
     const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
     const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
-    const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/narrative':'Narrative','/world':'World','/system':'System','/configuration':'Configuration'};
+    const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/chat':'Chat','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/narrative':'Narrative','/world':'World','/system':'System','/configuration':'Configuration'};
     let currentState = null;
     let effectiveConfig = null;
     let catalog = null;
@@ -846,7 +849,7 @@ PAGE = r"""<!doctype html>
       if (route === '/vision' && priorRoute !== '/vision') window.dispatchEvent(new CustomEvent('egg:vision-activate'));
       if (priorRoute === '/vision' && route !== '/vision') window.dispatchEvent(new CustomEvent('egg:vision-deactivate'));
       if (route === '/voice' && !catalog) loadCatalog();
-      if (route === '/' || route === '/voice') loadConversation();
+      if (route === '/' || route === '/voice' || route === '/chat') loadConversation();
       if (route === '/graph') loadGraph();
       if (route === '/dreams') loadDreams();
       if (route === '/narrative') loadNarratives();
@@ -1059,9 +1062,9 @@ PAGE = r"""<!doctype html>
         if (Array.isArray(ledger)) conversationLedger = ledger;
         conversationLoadedAt = Date.now();
         const telemetry = currentState?.telemetry || {};
-        renderConversation(telemetry, '#sidebar-chat-feed');
         if ($('.page.active')?.dataset.page === '/') renderConversation(telemetry, '#overview-conversation');
         if ($('.page.active')?.dataset.page === '/voice') renderConversation(telemetry, '#conversation', true);
+        if ($('.page.active')?.dataset.page === '/chat') renderConversation(telemetry, '#chat-conversation', true);
       } catch (_) {
         conversationLoadedAt = 0;
       } finally {
@@ -1388,7 +1391,7 @@ PAGE = r"""<!doctype html>
         const response = await fetch('/api/state', {cache:'no-store'}); if (!response.ok) throw new Error(await response.text());
         render(await response.json());
         const route = $('.page.active')?.dataset.page;
-        if (route === '/' || route === '/voice') loadConversation();
+        if (route === '/' || route === '/voice' || route === '/chat') loadConversation();
         if (route === '/dreams') loadDreams();
       } catch (error) { setConnection('offline', 'Disconnected', 'Retrying automatically'); $('#last-sync').textContent = 'Update failed'; }
       finally { refreshing = false; }
@@ -1544,20 +1547,19 @@ PAGE = r"""<!doctype html>
     }
     $('#voice-reconnect').addEventListener('click', () => voiceAction('reconnect'));
     $('#voice-reload').addEventListener('click', () => { catalog = null; loadCatalog(true); });
-    $('#sidebar-chat-form').addEventListener('submit', async event => {
+    $('#chat-form').addEventListener('submit', async event => {
       event.preventDefault();
-      const input = $('#sidebar-chat-input');
+      const input = $('#chat-input'), result = $('#chat-result');
       const text = input.value.trim();
       if (!text) return;
       input.disabled = true;
       try {
         const response = await fetch('/api/chat/message', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
         if (!response.ok) throw new Error(await response.text());
-        input.value = '';
+        input.value = ''; result.className = 'result'; result.textContent = '';
         await loadConversation(true);
       } catch (error) {
-        const meta = $('#sidebar-meta');
-        if (meta) meta.textContent = error.message || 'Message failed to send';
+        result.className = 'result error'; result.textContent = error.message || 'Message failed to send';
       } finally {
         input.disabled = false;
         input.focus();
