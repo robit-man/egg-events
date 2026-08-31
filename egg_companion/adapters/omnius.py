@@ -3576,11 +3576,16 @@ class OmniusClient:
             camera_id = camera.get("camera_id")
             if (
                 not cls._bounded_text(camera_id, 120)
-                or str(camera_id) in seen_cameras
                 or (camera_ids is not None and str(camera_id) not in camera_ids)
                 or not cls._bounded_text(camera.get("scene_summary"), 500)
             ):
                 return None
+            if str(camera_id) in seen_cameras:
+                # A repeated camera_id is a harmless model quirk (the same
+                # tile described twice), not evidence the assessment is
+                # broken -- keep the first description, drop the repeat,
+                # rather than discarding an otherwise-valid assessment.
+                continue
             seen_cameras.add(str(camera_id))
             tags = strings(camera.get("scene_tags"), 3, 100)
             uncertainties = strings(camera.get("uncertainties"), 1, 300)

@@ -208,6 +208,61 @@ def test_environmental_model_contracts_allow_silence_or_speech_without_fallback(
     ) is None
 
 
+def test_environmental_assessment_tolerates_a_repeated_camera_tile() -> None:
+    """A duplicated camera_id in camera_observations is a harmless model
+
+    quirk (the same tile described twice), not evidence the assessment is
+    broken. Regression test for a real production incident: this was
+    causing a hard rejection of an otherwise-valid, complete assessment.
+    """
+    import json
+
+    payload = {
+        "grounded": True,
+        "confidence": 0.8,
+        "scene_summary": "A person is near the table.",
+        "people_visible": True,
+        "person_continuity": "One visible person remains in view.",
+        "meaningful_change": "The person entered the camera view.",
+        "change_magnitude": 0.8,
+        "addressability": "They are visible but not necessarily addressing Egg.",
+        "prior_query_answer": None,
+        "camera_observations": [
+            {
+                "camera_id": "camera-1",
+                "scene_summary": "One person is near a table.",
+                "scene_tags": ["person", "table"],
+                "subjects": [{
+                    "local_id": "person-1", "prior_local_id": None, "detector_support": [],
+                    "kind": "person", "label": "person",
+                    "visible_behavior": "standing near a table", "behavior_confidence": 0.7,
+                    "confidence": 0.8, "tags": ["standing"],
+                    "evidence": "A full person silhouette is visible beside the table.",
+                }],
+                "relations": [],
+                "uncertainties": ["The person's intent is not visible."],
+            },
+            {
+                "camera_id": "camera-1",
+                "scene_summary": "Repeated description of the same tile.",
+                "scene_tags": ["person", "table"],
+                "subjects": [],
+                "relations": [],
+                "uncertainties": ["Duplicate tile description."],
+            },
+        ],
+        "overall_uncertainties": ["The person's intent is unknown."],
+        "memory_query": "recent interactions connected with the visible person and table",
+        "next_visual_query": "Whether the person remains by the table",
+    }
+    assessment = OmniusClient.parse_environmental_assessment(
+        json.dumps(payload), camera_ids={"camera-1"}
+    )
+    assert assessment is not None
+    assert len(assessment["camera_observations"]) == 1
+    assert assessment["camera_observations"][0]["scene_summary"] == "One person is near a table."
+
+
 def test_environmental_reflection_enters_retrieval_and_reflective_working_context(
     tmp_path,
 ) -> None:
