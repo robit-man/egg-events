@@ -3456,7 +3456,7 @@ class OmniusClient:
             raise RuntimeError(
                 "Ornith environmental VLM returned an invalid completion"
             ) from error
-        return self.parse_environmental_assessment(
+        parsed = self.parse_environmental_assessment(
             content,
             camera_ids={camera_id for camera_id, _image, _captured_at in frames},
             detector_candidate_ids={
@@ -3467,6 +3467,14 @@ class OmniusClient:
                 if isinstance(candidate, dict) and candidate.get("candidate_id")
             },
         )
+        if parsed is None:
+            logger.warning(
+                "environmental assessment JSON rejected (%d chars, %d cameras): %s",
+                len(content) if isinstance(content, str) else -1,
+                len(frames),
+                content[:4000] if isinstance(content, str) else repr(content)[:4000],
+            )
+        return parsed
 
     @classmethod
     def parse_environmental_assessment(
@@ -3774,7 +3782,14 @@ class OmniusClient:
             f"{self._bounded_prompt_json(history[-10:], 1800)}",
             max_tokens=700,
         )
-        return self.parse_environmental_deliberation(raw)
+        parsed = self.parse_environmental_deliberation(raw)
+        if parsed is None:
+            logger.warning(
+                "environmental deliberation JSON rejected (%d chars): %s",
+                len(raw) if isinstance(raw, str) else -1,
+                raw[:4000] if isinstance(raw, str) else repr(raw)[:4000],
+            )
+        return parsed
 
     @classmethod
     def parse_environmental_deliberation(
