@@ -533,6 +533,42 @@ def test_realtime_model_intent_signal_routes_memory_recall_unavailable_status() 
     asyncio.run(scenario())
 
 
+def test_heard_turn_speaks_a_fallback_when_reasoning_raises() -> None:
+    """A failed/timed-out model call must still produce audible feedback,
+
+    never silent turn drop. Regression test for a real production incident:
+    under heavy load the realtime chat request timed out, and the turn was
+    logged and discarded with nothing spoken back.
+    """
+
+    async def scenario() -> None:
+        runtime = CompanionRuntime(_config())
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            raise TimeoutError("simulated backend timeout")
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "Are you there?",
+            utterance_id="heard-reasoning-timeout",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert len(spoken) == 1
+        assert spoken[0]
+
+    asyncio.run(scenario())
+
+
 def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() -> None:
     async def scenario() -> None:
         runtime = CompanionRuntime(_config())

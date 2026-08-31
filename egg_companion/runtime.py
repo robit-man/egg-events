@@ -6822,20 +6822,37 @@ class CompanionRuntime:
                     context_id=turn.utterance_id,
                 )
                 return
-        context = await self._cognitive_context(transcript, visual_snapshot)
-        if not self._conversation_turns.can_publish(turn.revision):
+        try:
+            context = await self._cognitive_context(transcript, visual_snapshot)
+            if not self._conversation_turns.can_publish(turn.revision):
+                return
+            # Tool routing is owned by the native conversation model. The separate
+            # dialogue pass may classify social acts, but its legacy tool field is
+            # deliberately not executed here: there is one inference-driven selector
+            # with accumulated results and no keyword or fixed-sequence capture path.
+            reply = await self._run_realtime_tool_loop(
+                turn,
+                visual_snapshot,
+                transcript,
+                live_context,
+                context,
+            )
+        except Exception as error:
+            logger.warning("reasoning unavailable for heard turn; speaking a fallback: %s", error)
+            if not self._conversation_turns.can_publish(turn.revision):
+                return
+            fallback = "Sorry, I'm having trouble thinking right now."
+            spoken = await self._speak(fallback, expected_revision=turn.revision)
+            reason = f"reasoning unavailable: {error}"
+            self.telemetry.record_interaction(spoken, reason, transcript, fallback)
+            self._queue_interaction_memory(
+                transcript,
+                fallback,
+                spoken,
+                reason,
+                context_id=turn.utterance_id,
+            )
             return
-        # Tool routing is owned by the native conversation model. The separate
-        # dialogue pass may classify social acts, but its legacy tool field is
-        # deliberately not executed here: there is one inference-driven selector
-        # with accumulated results and no keyword or fixed-sequence capture path.
-        reply = await self._run_realtime_tool_loop(
-            turn,
-            visual_snapshot,
-            transcript,
-            live_context,
-            context,
-        )
         if not self._conversation_turns.can_publish(turn.revision):
             return
         decision = self._interaction_policy.evaluate(
