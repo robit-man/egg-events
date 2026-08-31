@@ -52,6 +52,7 @@ from egg_companion.core.environmental_cognition import (
     EnvironmentalNoveltyTracker,
     EnvironmentalStimulus,
 )
+from egg_companion.world.query import TIME_PERIODS, resolve_time_period
 from egg_companion.core.occupancy import (
     VoxelGrid,
     resolve_camera_yaw_degrees,
@@ -259,6 +260,7 @@ class CompanionRuntime:
             maxsize=config.ocr.queue_size
         )
         self._memory = None
+        self._object_label_embedding_cache: dict[str, np.ndarray] = {}
         if config.memory.enabled:
             try:
                 memory_store = MemoryStore(config.memory)
@@ -7154,8 +7156,10 @@ class CompanionRuntime:
                     if isinstance(query, str) and query.strip()
                     else transcript[:200]
                 )
+                time_period = arguments.get("time_period")
+                normalized_period = time_period if time_period in TIME_PERIODS else "any"
                 context = await self._context_with_memory_recall(
-                    turn.utterance_id, normalized_query, context
+                    turn.utterance_id, normalized_query, context, normalized_period
                 )
             else:
                 context += "\n\nTOOL CONTROL STATUS: rejected an unknown native capability."
@@ -7206,7 +7210,63 @@ class CompanionRuntime:
                 "answer; briefly say the search could not be completed."
             )
 
-    async def _context_with_memory_recall(self, context_id: str, query: str, context: str) -> str:
+    # CLIP text-text cosine similarities run higher than image-text; this is
+    # a conservative floor picked to admit clear paraphrases ("the thing I
+    # drink from" ~ "mug") while rejecting unrelated vocabulary.
+    _ASSOCIATIVE_RECALL_MIN_SIMILARITY = 0.3
+
+    def _associative_object_recall(
+        self,
+        world_query: object,
+        query: str,
+        limit: int,
+        since: str | None,
+        until: str | None,
+    ) -> list[dict[str, object]]:
+        """Embedding fallback for when literal substring recall finds nothing.
+
+        Only reached when recall_object_sightings returned no candidates, so
+        this never pays its CLIP cost on the common case of a query that
+        already uses roughly the right word. Candidate label embeddings are
+        cached on self so repeat fallbacks don't re-embed a stable
+        vocabulary; the query embedding is always computed fresh.
+        """
+        vision = self._vision
+        if vision is None:
+            return []
+        candidates = world_query.candidate_labels()
+        if not candidates:
+            return []
+        query_vector = vision.embed_text(query)
+        scored: list[tuple[float, dict[str, object]]] = []
+        for candidate in candidates:
+            label = candidate["label"]
+            label_vector = self._object_label_embedding_cache.get(label)
+            if label_vector is None:
+                label_vector = vision.embed_text(label)
+                self._object_label_embedding_cache[label] = label_vector
+            similarity = float(np.dot(query_vector, label_vector))
+            if similarity >= self._ASSOCIATIVE_RECALL_MIN_SIMILARITY:
+                scored.append((similarity, candidate))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        results: list[dict[str, object]] = []
+        for _similarity, candidate in scored[:limit]:
+            sighting_record = world_query.sightings_for_entity(
+                candidate["entity_id"], 3, since, until
+            )
+            if sighting_record is None:
+                continue
+            results.append({
+                "entity_id": candidate["entity_id"],
+                "label": candidate["label"],
+                "matched_property": "embedding",
+                "sightings": sighting_record["sightings"],
+            })
+        return results
+
+    async def _context_with_memory_recall(
+        self, context_id: str, query: str, context: str, time_period: str = "any"
+    ) -> str:
         """Execute an explicit model-selected recall of past object sightings."""
         started = time.monotonic()
         self._record_turn_tool_start(context_id, "memory", query)
@@ -7224,12 +7284,29 @@ class CompanionRuntime:
             return (
                 f"{context}\n\nOBJECT MEMORY TOOL STATUS: {detail} Do not invent a past sighting."
             )
+        since_until = resolve_time_period(time_period)
+        since, until = since_until if since_until is not None else (None, None)
+        period_note = (
+            f" filtered to {time_period.replace('_', ' ')}" if since_until is not None else ""
+        )
         try:
             sightings = await asyncio.to_thread(
                 world_query.recall_object_sightings,
                 query,
                 5,
+                3,
+                since,
+                until,
             )
+            if not sightings and self._vision is not None:
+                sightings = await asyncio.to_thread(
+                    self._associative_object_recall,
+                    world_query,
+                    query,
+                    5,
+                    since,
+                    until,
+                )
             evidence = json.dumps(sightings, ensure_ascii=False)[:2000]
             self._record_turn_tool_call(
                 context_id,
@@ -7242,14 +7319,16 @@ class CompanionRuntime:
             if not sightings:
                 return (
                     f"{context}\n\nOBJECT MEMORY TOOL RESULT: no past sighting of "
-                    f"{query!r} was found in memory. Say plainly that Egg has no memory "
-                    "of it, do not invent one."
+                    f"{query!r} was found in memory{period_note}. Say plainly that Egg has "
+                    "no memory of it, do not invent one."
                 )
             return (
-                f"{context}\n\nOBJECT MEMORY TOOL RESULT (past detections; each sighting "
-                "has a camera_id and seen_at timestamp; camera_id is the camera's own "
-                "identifier, there is no room name mapping -- refer to it as-is or as "
-                f"'a camera view' if asked to phrase naturally):\n{evidence}"
+                f"{context}\n\nOBJECT MEMORY TOOL RESULT{period_note} (past detections; each "
+                "sighting has a camera_id and seen_at timestamp; camera_id is the camera's "
+                "own identifier, there is no room name mapping -- refer to it as-is or as "
+                "'a camera view' if asked to phrase naturally; matched_property "
+                "\"embedding\" means an associative match, not the exact word used):"
+                f"\n{evidence}"
             )
         except Exception as error:
             logger.warning("memory recall tool invocation failed: %s", error)

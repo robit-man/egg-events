@@ -25,6 +25,7 @@ from egg_companion.world import (
     WorldGraphStore,
     WorldQuery,
     WorldStateStore,
+    resolve_time_period,
 )
 from egg_companion.world.types import WorldDelta
 from egg_companion.world.spatial import SpatialRelation
@@ -691,6 +692,102 @@ class TestWorldQuery:
 
         assert query.recall_object_sightings("umbrella") == []
 
+    def test_recall_object_sightings_since_until_narrows_history(self, world_stores):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:keys2"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+        detection = {
+            "entity_id": "entity:2",
+            "label": "my keys",
+            "confidence": 0.85,
+            "bbox": [10, 20, 100, 200],
+        }
+        for occurred_at, evidence_id in (
+            ("2020-01-01T00:00:00+00:00", "ev:old"),
+            ("2030-01-01T00:00:00+00:00", "ev:new"),
+        ):
+            event = MockEvent(
+                occurred_at=occurred_at,
+                payload={"detections": [detection], "frame_shape": (480, 640)},
+                evidence=(evidence_id,),
+            )
+            delta = normalizer.normalize_event(
+                event, evidence_ids=(evidence_id,), frame_shape=(480, 640)
+            )
+            reconciler.ingest(delta)
+
+        unfiltered = query.recall_object_sightings("keys")
+        assert len(unfiltered[0]["sightings"]) == 2
+
+        narrowed = query.recall_object_sightings(
+            "keys", since="2025-01-01T00:00:00+00:00", until="2035-01-01T00:00:00+00:00"
+        )
+        assert len(narrowed[0]["sightings"]) == 1
+        assert narrowed[0]["sightings"][0]["seen_at"] == "2030-01-01T00:00:00+00:00"
+
+    def test_candidate_labels_deduplicates_by_label_text(self, world_stores):
+        state = world_stores["state"]
+        query = world_stores["query"]
+        state.upsert_property(
+            "object-1", "label",
+            TypedValue(raw="keys", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:1", (), "observation", utcnow().isoformat(),
+        )
+        state.upsert_property(
+            "object-2", "label",
+            TypedValue(raw="keys", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:2", (), "observation", utcnow().isoformat(),
+        )
+        state.upsert_property(
+            "object-3", "label",
+            TypedValue(raw="mug", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:3", (), "observation", utcnow().isoformat(),
+        )
+        labels = {c["label"] for c in query.candidate_labels()}
+        assert labels == {"keys", "mug"}
+
+
+class TestResolveTimePeriod:
+    def test_unrecognized_or_any_returns_none(self):
+        assert resolve_time_period("any") is None
+        assert resolve_time_period(None) is None
+        assert resolve_time_period("whenever") is None
+
+    def test_today_bounds_contain_now_and_exclude_yesterday(self):
+        since, until = resolve_time_period("today")
+        now = datetime.now(timezone.utc).isoformat()
+        assert since <= now <= until
+        yesterday_since, yesterday_until = resolve_time_period("yesterday")
+        assert yesterday_until <= since
+
+    def test_this_week_contains_today_and_last_week_precedes_it(self):
+        since, until = resolve_time_period("this_week")
+        today_since, _ = resolve_time_period("today")
+        assert since <= today_since <= until
+        last_since, last_until = resolve_time_period("last_week")
+        assert last_until <= since
+
+    def test_this_month_contains_today(self):
+        since, until = resolve_time_period("this_month")
+        today_since, _ = resolve_time_period("today")
+        assert since <= today_since <= until
+
 
 class TestCognitiveContext:
     def test_build_window(self, world_stores):
@@ -1156,6 +1253,25 @@ class TestWorldStateStoreProperty:
         matches = state.search_property_text("KEYS")
         assert [m["entity_id"] for m in matches] == ["object-1"]
         assert state.search_property_text("umbrella") == []
+
+    def test_all_property_values_returns_every_current_label(self, db):
+        state = WorldStateStore(db)
+        state.upsert_property(
+            "object-1", "label",
+            TypedValue(raw="my keys", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:1", (), "observation", utcnow().isoformat(),
+        )
+        state.upsert_property(
+            "object-2", "label",
+            TypedValue(raw="red mug", value_type=ValueType.STRING),
+            0.9, 0.8, "assert:2", (), "observation", utcnow().isoformat(),
+        )
+        values = state.all_property_values("label")
+        assert {v["entity_id"]: v["value"] for v in values} == {
+            "object-1": "my keys",
+            "object-2": "red mug",
+        }
+        assert len(state.all_property_values("label", limit=1)) == 1
 
 
 class TestWorldStatePruning:

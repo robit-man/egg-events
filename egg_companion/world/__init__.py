@@ -35,7 +35,7 @@ from egg_companion.world.events import EventStore
 from egg_companion.world.functions import FunctionRegistry
 from egg_companion.world.actions import ActionStore
 from egg_companion.world.policy import PolicyValidator
-from egg_companion.world.query import WorldQuery
+from egg_companion.world.query import TIME_PERIODS, WorldQuery, resolve_time_period
 from egg_companion.world.context import CognitiveContext
 from egg_companion.world.metrics import MetricsCollector
 from egg_companion.world.bridge import KnowledgeGraphBridge
@@ -76,6 +76,8 @@ __all__ = [
     "ActionStore",
     "PolicyValidator",
     "WorldQuery",
+    "TIME_PERIODS",
+    "resolve_time_period",
     "CognitiveContext",
     "MetricsCollector",
     "KnowledgeGraphBridge",

@@ -443,6 +443,29 @@ class WorldStateStore:
                 break
         return matches
 
+    def all_property_values(
+        self, property_id: str = "label", limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Current value of property_id across every entity that has one.
+
+        Most-recently-updated first. Used as the candidate pool for
+        associative (embedding) recall when a literal text search finds
+        nothing.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT entity_id, value_json, updated_at
+                FROM current_property_state
+                WHERE property_id = ?
+                ORDER BY updated_at DESC
+                LIMIT ?""",
+                (property_id, limit),
+            ).fetchall()
+        return [
+            {"entity_id": row[0], "value": json.loads(row[1]), "updated_at": row[2]}
+            for row in rows
+        ]
+
     def entity_brief_counts(self) -> dict[str, dict[str, object]]:
         """Bulk property/relation counts per entity in a single query."""
         with self._lock:

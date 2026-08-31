@@ -23,6 +23,7 @@ from egg_companion.cognition.dialogue import (
     InterruptionDecision,
     parse_interruption_decision,
 )
+from egg_companion.world.query import TIME_PERIODS
 
 
 logger = logging.getLogger(__name__)
@@ -441,6 +442,8 @@ class OmniusClient:
             "Call recall_object_memory when the speaker asks where or when something was "
             "previously seen, not what is visible right now; never substitute it for "
             "inspect_current_camera and never substitute inspect_current_camera for it. "
+            "Pass its time_period when the speaker names one (today, yesterday, this "
+            "week, last week, this month), otherwise leave it as any. "
             "Call read_current_camera_text when exact visible writing is required and pixels or "
             "prior camera inspection identify text that still needs dedicated reading. "
             "Call inspect_local_runtime for current service, process, hardware, repository, "
@@ -4276,7 +4279,15 @@ class OmniusClient:
                                     "The object or person being asked about, in the "
                                     "speaker's own words, e.g. 'my keys' or 'the red mug'."
                                 ),
-                            }
+                            },
+                            "time_period": {
+                                "type": "string",
+                                "enum": sorted(TIME_PERIODS),
+                                "description": (
+                                    "The time period being asked about, or 'any' if none "
+                                    "was mentioned."
+                                ),
+                            },
                         },
                         "required": ["query"],
                     },
@@ -4419,7 +4430,11 @@ class OmniusClient:
                     if isinstance(query, str) and query.strip()
                     else "the object or person just asked about"
                 )
-                return self._realtime_tool_marker("memory", {"query": normalized})
+                time_period = arguments.get("time_period")
+                normalized_period = time_period if time_period in TIME_PERIODS else "any"
+                return self._realtime_tool_marker(
+                    "memory", {"query": normalized, "time_period": normalized_period}
+                )
             if name == "inspect_local_runtime":
                 command = arguments.get("command")
                 request = arguments.get("request")

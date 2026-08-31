@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from egg_companion.world.identity import IdentityGraph
@@ -149,8 +150,54 @@ class WorldQuery:
             ],
         }
 
+    def sightings_for_entity(
+        self,
+        entity_id: str,
+        history_per_entity: int = 3,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Recent camera+timestamp sightings for one already-resolved entity.
+
+        When since/until are given, the full history is filtered to that
+        window before truncating to history_per_entity -- so a time-scoped
+        query isn't silently limited to only the N most-recent-overall
+        sightings when those happen to fall outside the requested window.
+        """
+        history = (
+            self._reconciler.get_assertion_history(entity_id, "last_seen")
+            if self._reconciler is not None
+            else []
+        )
+        if since is not None or until is not None:
+            history = [
+                row for row in history
+                if (since is None or row["valid_from"] >= since)
+                and (until is None or row["valid_from"] <= until)
+            ]
+        sightings = [
+            {
+                "camera_id": (
+                    row["source_id"].split(":", 1)[-1]
+                    if ":" in row["source_id"]
+                    else row["source_id"]
+                ),
+                "seen_at": row["valid_from"],
+                "confidence": row["confidence"],
+            }
+            for row in history[:history_per_entity]
+        ]
+        if not sightings:
+            return None
+        return {"entity_id": entity_id, "sightings": sightings}
+
     def recall_object_sightings(
-        self, query: str, limit: int = 5, history_per_entity: int = 3,
+        self,
+        query: str,
+        limit: int = 5,
+        history_per_entity: int = 3,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve a free-text object/person term to recent sightings.
 
@@ -162,33 +209,35 @@ class WorldQuery:
         results: list[dict[str, Any]] = []
         for candidate in candidates:
             entity_id = candidate["entity_id"]
-            label = self.property_value(entity_id, "label") or candidate["value"]
-            history = (
-                self._reconciler.get_assertion_history(entity_id, "last_seen")
-                if self._reconciler is not None
-                else []
-            )
-            sightings = [
-                {
-                    "camera_id": (
-                        row["source_id"].split(":", 1)[-1]
-                        if ":" in row["source_id"]
-                        else row["source_id"]
-                    ),
-                    "seen_at": row["valid_from"],
-                    "confidence": row["confidence"],
-                }
-                for row in history[:history_per_entity]
-            ]
-            if not sightings:
+            sighting_record = self.sightings_for_entity(entity_id, history_per_entity, since, until)
+            if sighting_record is None:
                 continue
+            label = self.property_value(entity_id, "label") or candidate["value"]
             results.append({
                 "entity_id": entity_id,
                 "label": label,
                 "matched_property": candidate["property_id"],
-                "sightings": sightings,
+                "sightings": sighting_record["sightings"],
             })
         return results
+
+    def candidate_labels(self, limit: int = 60) -> list[dict[str, Any]]:
+        """Unique current label values, for associative (embedding) recall.
+
+        One entry per unique label text (the most-recently-updated entity
+        wins ties), so the caller embeds each distinct word/phrase once
+        rather than once per entity that happens to share a label.
+        """
+        rows = self._state.all_property_values("label", limit=limit)
+        seen_labels: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            label = row["value"]
+            if not isinstance(label, str) or not label.strip() or label in seen_labels:
+                continue
+            seen_labels.add(label)
+            candidates.append({"entity_id": row["entity_id"], "label": label})
+        return candidates
 
     def world_summary(self) -> dict[str, Any]:
         """Full world model summary for dashboard and debugging."""
@@ -334,3 +383,39 @@ class WorldQuery:
                 for rt in set(r["relation_type_id"] for r in relations)
             },
         }
+
+
+TIME_PERIODS = {"any", "today", "yesterday", "this_week", "last_week", "this_month"}
+
+
+def resolve_time_period(period: str | None) -> tuple[str, str] | None:
+    """Resolve a fixed period keyword to a UTC (since, until) ISO bound.
+
+    Deliberately not model-resolved free text: the model has no ground
+    truth for "now" in its context, so it only classifies the kind of
+    period asked about and this does the actual date arithmetic against a
+    real clock. Returns None for "any"/unrecognized/missing -- no filter,
+    matching current unscoped behavior.
+    """
+    if period is None or period == "any" or period not in TIME_PERIODS:
+        return None
+    now_local = datetime.now().astimezone()
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "today":
+        start, end = today_start, today_start + timedelta(days=1)
+    elif period == "yesterday":
+        start, end = today_start - timedelta(days=1), today_start
+    elif period == "this_week":
+        start = today_start - timedelta(days=today_start.weekday())
+        end = start + timedelta(days=7)
+    elif period == "last_week":
+        this_week_start = today_start - timedelta(days=today_start.weekday())
+        start, end = this_week_start - timedelta(days=7), this_week_start
+    else:  # this_month
+        start = today_start.replace(day=1)
+        next_month = start.replace(day=28) + timedelta(days=4)
+        end = next_month.replace(day=1)
+    return (
+        start.astimezone(timezone.utc).isoformat(),
+        end.astimezone(timezone.utc).isoformat(),
+    )

@@ -602,7 +602,13 @@ def test_realtime_model_intent_signal_routes_memory_recall_back_into_reply(tmp_p
             assert "OBJECT MEMORY TOOL RESULT" in context
             return "You left your keys by camera-video1 a few minutes ago."
 
-        def recall(query: str, limit: int = 5):
+        def recall(
+            query: str,
+            limit: int = 5,
+            history_per_entity: int = 3,
+            since: str | None = None,
+            until: str | None = None,
+        ):
             assert query == "my keys"
             return [{
                 "entity_id": "object-001",
@@ -638,6 +644,55 @@ def test_realtime_model_intent_signal_routes_memory_recall_back_into_reply(tmp_p
         runtime._memory.close(datetime.now(timezone.utc))
 
     asyncio.run(scenario())
+
+
+def test_associative_object_recall_uses_embedding_similarity_and_caches_labels() -> None:
+    runtime = CompanionRuntime(_runtime_config())
+    embed_calls: list[str] = []
+
+    class FakeVision:
+        def embed_text(self, text: str) -> np.ndarray:
+            embed_calls.append(text)
+            vectors = {
+                "the drink": np.array([1.0, 0.0], dtype=np.float32),
+                "red mug": np.array([0.9938, 0.1104], dtype=np.float32),
+                "umbrella": np.array([0.0, 1.0], dtype=np.float32),
+            }
+            return vectors[text]
+
+    class FakeWorldQuery:
+        def __init__(self):
+            self.bounds_seen: list[tuple[str | None, str | None]] = []
+
+        def candidate_labels(self):
+            return [
+                {"entity_id": "object-1", "label": "red mug"},
+                {"entity_id": "object-2", "label": "umbrella"},
+            ]
+
+        def sightings_for_entity(self, entity_id, history_per_entity, since, until):
+            self.bounds_seen.append((since, until))
+            return {
+                "entity_id": entity_id,
+                "sightings": [{"camera_id": "cam0", "seen_at": "x", "confidence": 0.5}],
+            }
+
+    runtime._vision = FakeVision()  # type: ignore[assignment]
+    world_query = FakeWorldQuery()
+
+    results = runtime._associative_object_recall(
+        world_query, "the drink", 5, "2020-01-01T00:00:00+00:00", "2021-01-01T00:00:00+00:00"
+    )
+    assert [r["entity_id"] for r in results] == ["object-1"]
+    assert results[0]["matched_property"] == "embedding"
+    assert embed_calls == ["the drink", "red mug", "umbrella"]
+    assert world_query.bounds_seen == [
+        ("2020-01-01T00:00:00+00:00", "2021-01-01T00:00:00+00:00")
+    ]
+
+    embed_calls.clear()
+    runtime._associative_object_recall(world_query, "the drink", 5, None, None)
+    assert embed_calls == ["the drink"]
 
 
 def test_human_speech_preempts_environmental_model_work_without_polling() -> None:
