@@ -184,6 +184,7 @@ class WorldQuery:
                 ),
                 "seen_at": row["valid_from"],
                 "confidence": row["confidence"],
+                "evidence_id": row["evidence_ids"][0] if row["evidence_ids"] else None,
             }
             for row in history[:history_per_entity]
         ]

@@ -556,6 +556,22 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     assert set(recall_schema["parameters"]["properties"]["time_period"]["enum"]) == {
         "any", "today", "yesterday", "this_week", "last_week", "this_month",
     }
+    assert OmniusClient.parse_realtime_tool_request("[[TOOL:PAST_OCR]]") == "past_ocr"
+    assert OmniusClient.parse_realtime_tool_handoff("[[TOOL:PAST_OCR|the sign]]") == (
+        "past_ocr",
+        "the sign",
+    )
+    past_ocr_marker = OmniusClient._realtime_tool_marker(
+        "past_ocr", {"query": "the sign", "time_period": "yesterday"}
+    )
+    assert OmniusClient.parse_realtime_tool_call(past_ocr_marker) == {
+        "tool": "past_ocr",
+        "arguments": {"query": "the sign", "time_period": "yesterday"},
+    }
+    assert any(
+        item["function"]["name"] == "read_past_camera_text"
+        for item in OmniusClient._realtime_tool_definitions()
+    )
 
 
 def test_web_search_urls_are_parsed_only_from_typed_result_fields() -> None:

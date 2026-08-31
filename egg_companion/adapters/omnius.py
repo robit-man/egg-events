@@ -445,7 +445,9 @@ class OmniusClient:
             "Pass its time_period when the speaker names one (today, yesterday, this "
             "week, last week, this month), otherwise leave it as any. "
             "Call read_current_camera_text when exact visible writing is required and pixels or "
-            "prior camera inspection identify text that still needs dedicated reading. "
+            "prior camera inspection identify text that still needs dedicated reading. Call "
+            "read_past_camera_text instead when the writing was seen earlier and is not visible "
+            "right now; never substitute one for the other. "
             "Call inspect_local_runtime for current service, process, hardware, repository, "
             "file, or log state; that state must never be guessed. Do not call a function when "
             "the speaker explicitly asks only about capabilities, asks how one works, says not "
@@ -520,6 +522,7 @@ class OmniusClient:
             "web_search": "query",
             "shell": "command",
             "memory": "query",
+            "past_ocr": "query",
         }
         query = arguments.get(query_keys[tool])
         return tool, " ".join(query.split()) if isinstance(query, str) and query.strip() else None
@@ -535,7 +538,7 @@ class OmniusClient:
         )
         legacy_matches = list(
             re.finditer(
-                r"\[\[\s*TOOL\s*:\s*(VISION|OCR|WEB_SEARCH|SHELL|MEMORY)"
+                r"\[\[\s*TOOL\s*:\s*(VISION|OCR|WEB_SEARCH|SHELL|MEMORY|PAST_OCR)"
                 r"(?:\s*\|\s*([^\]\r\n]{1,300}))?\s*\]\]",
                 content,
                 flags=re.IGNORECASE,
@@ -557,7 +560,12 @@ class OmniusClient:
             tool = decoded.get("tool")
             arguments = decoded.get("arguments", {})
             if tool not in {
-                "vision", "ocr", "web_search", "shell", "memory",
+                "vision",
+                "ocr",
+                "web_search",
+                "shell",
+                "memory",
+                "past_ocr",
             } or not isinstance(arguments, dict):
                 return None
             return {"tool": tool, "arguments": arguments}
@@ -572,6 +580,7 @@ class OmniusClient:
             "web_search": "query",
             "shell": "command",
             "memory": "query",
+            "past_ocr": "query",
         }[tool]
         if query and tool == "vision":
             return None
@@ -4327,6 +4336,38 @@ class OmniusClient:
             {
                 "type": "function",
                 "function": {
+                    "name": "read_past_camera_text",
+                    "description": (
+                        "Read text that was visible in a specific past camera sighting -- a "
+                        "sign, screen, or label seen earlier that is not visible right now. "
+                        "Use read_current_camera_text instead for text visible now."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "The object, sign, or scene whose past text is being "
+                                    "asked about, in the speaker's own words."
+                                ),
+                            },
+                            "time_period": {
+                                "type": "string",
+                                "enum": sorted(TIME_PERIODS),
+                                "description": (
+                                    "The time period being asked about, or 'any' if none "
+                                    "was mentioned."
+                                ),
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "inspect_local_runtime",
                     "description": (
                         "Inspect current local service, process, hardware, repository, file, or "
@@ -4465,6 +4506,18 @@ class OmniusClient:
                 normalized_period = time_period if time_period in TIME_PERIODS else "any"
                 return self._realtime_tool_marker(
                     "memory", {"query": normalized, "time_period": normalized_period}
+                )
+            if name == "read_past_camera_text":
+                query = arguments.get("query")
+                normalized = (
+                    " ".join(query.split())[:200]
+                    if isinstance(query, str) and query.strip()
+                    else "the object or scene just asked about"
+                )
+                time_period = arguments.get("time_period")
+                normalized_period = time_period if time_period in TIME_PERIODS else "any"
+                return self._realtime_tool_marker(
+                    "past_ocr", {"query": normalized, "time_period": normalized_period}
                 )
             if name == "inspect_local_runtime":
                 command = arguments.get("command")

@@ -689,8 +689,44 @@ class TestWorldQuery:
         assert len(results) == 1
         assert results[0]["entity_id"] == "entity:1"
         assert results[0]["sightings"][0]["camera_id"] == "cam0"
+        assert results[0]["sightings"][0]["evidence_id"] == "ev:1"
 
         assert query.recall_object_sightings("umbrella") == []
+
+    def test_recall_object_sightings_evidence_id_is_none_without_evidence(self, world_stores):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class MockEvent:
+            event_id: str = "event:mug"
+            event_type: str = "vision"
+            occurred_at: str = ""
+            source_id: str = "camera:cam0"
+            evidence: tuple = ()
+            entity_ids: tuple = ()
+            payload: dict = None
+
+            def __post_init__(self):
+                if self.payload is None:
+                    object.__setattr__(self, "payload", {})
+
+        normalizer = world_stores["normalizer"]
+        reconciler = world_stores["reconciler"]
+        query = world_stores["query"]
+
+        detection = {
+            "entity_id": "entity:2",
+            "label": "red mug",
+            "confidence": 0.85,
+            "bbox": [10, 20, 100, 200],
+        }
+        event = MockEvent(payload={"detections": [detection], "frame_shape": (480, 640)})
+        delta = normalizer.normalize_event(event, frame_shape=(480, 640))
+        reconciler.ingest(delta)
+
+        results = query.recall_object_sightings("mug")
+        assert len(results) == 1
+        assert results[0]["sightings"][0]["evidence_id"] is None
 
     def test_recall_object_sightings_since_until_narrows_history(self, world_stores):
         from dataclasses import dataclass

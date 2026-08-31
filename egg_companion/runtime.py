@@ -7165,6 +7165,18 @@ class CompanionRuntime:
                 context = await self._context_with_memory_recall(
                     turn.utterance_id, normalized_query, context, normalized_period
                 )
+            elif tool == "past_ocr":
+                query = arguments.get("query")
+                normalized_query = (
+                    " ".join(query.split())[:200]
+                    if isinstance(query, str) and query.strip()
+                    else transcript[:200]
+                )
+                time_period = arguments.get("time_period")
+                normalized_period = time_period if time_period in TIME_PERIODS else "any"
+                context = await self._context_with_past_camera_text(
+                    turn.utterance_id, normalized_query, context, normalized_period
+                )
             else:
                 context += "\n\nTOOL CONTROL STATUS: rejected an unknown native capability."
 
@@ -7348,6 +7360,144 @@ class CompanionRuntime:
             return (
                 f"{context}\n\nOBJECT MEMORY TOOL STATUS: unavailable. Do not invent a "
                 f"past sighting. Reason: {detail}"
+            )
+
+    async def _context_with_past_camera_text(
+        self, context_id: str, query: str, context: str, time_period: str = "any"
+    ) -> str:
+        """Run OCR against the stored frame from a specific past sighting.
+
+        Reuses the exact same name/time resolution as memory recall, then
+        picks the most recent matching sighting that actually has a stored
+        evidence image (retain_raw_media must be enabled and the image not
+        yet expired) and OCRs that frame with the same engine the live
+        read_current_camera_text tool uses.
+        """
+        started = time.monotonic()
+        self._record_turn_tool_start(context_id, "past_ocr", query)
+        world_query = self._memory.world_query if self._memory is not None else None
+        if world_query is None or not self.config.ocr.enabled:
+            detail = (
+                "World memory is unavailable."
+                if world_query is None
+                else "Advanced OCR is disabled."
+            )
+            self._record_turn_tool_call(
+                context_id,
+                "past_ocr",
+                query,
+                False,
+                detail,
+                (time.monotonic() - started) * 1000,
+            )
+            return (
+                f"{context}\n\nPAST CAMERA TEXT TOOL STATUS: {detail} Do not invent "
+                "past visible text."
+            )
+        since_until = resolve_time_period(time_period)
+        since, until = since_until if since_until is not None else (None, None)
+        period_note = (
+            f" filtered to {time_period.replace('_', ' ')}" if since_until is not None else ""
+        )
+        try:
+            candidates = await asyncio.to_thread(
+                world_query.recall_object_sightings,
+                query,
+                5,
+                3,
+                since,
+                until,
+            )
+            if not candidates and self._vision is not None:
+                candidates = await asyncio.to_thread(
+                    self._associative_object_recall,
+                    world_query,
+                    query,
+                    5,
+                    since,
+                    until,
+                )
+            evidenced = [
+                sighting
+                for candidate in candidates
+                for sighting in candidate["sightings"]
+                if sighting.get("evidence_id")
+            ]
+            if not evidenced:
+                detail = f"no past sighting of {query!r} with a stored image was found{period_note}"
+                self._record_turn_tool_call(
+                    context_id,
+                    "past_ocr",
+                    query,
+                    True,
+                    detail,
+                    (time.monotonic() - started) * 1000,
+                )
+                return (
+                    f"{context}\n\nPAST CAMERA TEXT TOOL RESULT: {detail}. Only a text "
+                    "description may exist for it, or the stored image has already expired. "
+                    "Say plainly that Egg cannot read text from that sighting, do not invent "
+                    "any."
+                )
+            most_recent = max(evidenced, key=lambda sighting: sighting["seen_at"])
+            image = await asyncio.to_thread(self.evidence_media, most_recent["evidence_id"])
+            if image is None:
+                detail = "the stored image for that sighting has expired"
+                self._record_turn_tool_call(
+                    context_id,
+                    "past_ocr",
+                    query,
+                    True,
+                    detail,
+                    (time.monotonic() - started) * 1000,
+                )
+                return (
+                    f"{context}\n\nPAST CAMERA TEXT TOOL RESULT: {detail}. Say plainly that "
+                    "Egg can no longer read text from that sighting, do not invent any."
+                )
+            image_bytes, _media_type = image
+            result = await self._run_advanced_ocr(image_bytes, explicit_read_request=True)
+            evidence = json.dumps(
+                {
+                    "seen_at": most_recent["seen_at"],
+                    "camera_id": most_recent["camera_id"],
+                    "ocr": result,
+                },
+                ensure_ascii=False,
+            )[:2000]
+            self._record_turn_tool_call(
+                context_id,
+                "past_ocr",
+                query,
+                True,
+                evidence,
+                (time.monotonic() - started) * 1000,
+            )
+            if not result or not str(result.get("text") or "").strip():
+                return (
+                    f"{context}\n\nPAST CAMERA TEXT TOOL RESULT: no readable text was found "
+                    f"in the stored frame from {most_recent['seen_at']}. Say plainly no text "
+                    "was found, do not invent any."
+                )
+            return (
+                f"{context}\n\nPAST CAMERA TEXT TOOL RESULT (OCR of a frame stored from "
+                f"{most_recent['seen_at']} on {most_recent['camera_id']} -- this is what was "
+                f"visible then, not necessarily now):\n{evidence}"
+            )
+        except Exception as error:
+            logger.warning("past camera text tool invocation failed: %s", error)
+            detail = str(error)
+            self._record_turn_tool_call(
+                context_id,
+                "past_ocr",
+                query,
+                False,
+                detail,
+                (time.monotonic() - started) * 1000,
+            )
+            return (
+                f"{context}\n\nPAST CAMERA TEXT TOOL STATUS: unavailable. Do not invent "
+                f"past visible text. Reason: {detail}"
             )
 
     async def _context_with_camera_ocr(

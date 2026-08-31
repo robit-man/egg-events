@@ -701,6 +701,157 @@ def test_realtime_model_intent_signal_routes_memory_recall_back_into_reply(tmp_p
     asyncio.run(scenario())
 
 
+def test_realtime_model_intent_signal_routes_past_ocr_back_into_reply(tmp_path) -> None:
+    async def scenario() -> None:
+        payload = _runtime_config().model_dump()
+        payload["memory"].update(
+            {
+                "enabled": True,
+                "storage_dir": str(tmp_path / "memory"),
+                "retain_raw_media": False,
+            }
+        )
+        payload["identity"]["storage_dir"] = str(tmp_path / "identity")
+        payload["object_learning"]["storage_dir"] = str(tmp_path / "objects")
+        runtime = CompanionRuntime(EggConfig.model_validate(payload))
+        assert runtime._memory is not None
+        contexts = []
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            contexts.append((context, allow_tool_requests))
+            if "PAST CAMERA TEXT TOOL RESULT" not in context:
+                return "[[TOOL:PAST_OCR|the sign by the door]]"
+            assert "PAST CAMERA TEXT TOOL RESULT" in context
+            return "It said ROOM 204."
+
+        def recall(
+            query: str,
+            limit: int = 5,
+            history_per_entity: int = 3,
+            since: str | None = None,
+            until: str | None = None,
+        ):
+            assert query == "the sign by the door"
+            return [
+                {
+                    "entity_id": "object-002",
+                    "label": "sign",
+                    "matched_property": "label",
+                    "sightings": [
+                        {
+                            "camera_id": "camera-video1",
+                            "seen_at": "2026-08-30T00:00:00+00:00",
+                            "confidence": 0.9,
+                            "evidence_id": "ev:sign-1",
+                        }
+                    ],
+                }
+            ]
+
+        def evidence_media(evidence_id: str):
+            assert evidence_id == "ev:sign-1"
+            return (b"fake-jpeg-bytes", "image/jpeg")
+
+        async def run_advanced_ocr(image_png: bytes, **kwargs):
+            assert image_png == b"fake-jpeg-bytes"
+            return {"text": "ROOM 204", "confidence": 0.9, "engine": "local"}
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._memory.world_query.recall_object_sightings = recall  # type: ignore[method-assign]
+        runtime.evidence_media = evidence_media  # type: ignore[method-assign]
+        runtime._run_advanced_ocr = run_advanced_ocr  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "What did the sign by the door say?",
+            utterance_id="heard-semantic-past-ocr",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert [allow for _, allow in contexts] == [True, True]
+        assert spoken == ["It said ROOM 204."]
+        runtime._memory.close(datetime.now(timezone.utc))
+
+    asyncio.run(scenario())
+
+
+def test_realtime_model_intent_signal_routes_past_ocr_no_evidence_status(tmp_path) -> None:
+    async def scenario() -> None:
+        payload = _runtime_config().model_dump()
+        payload["memory"].update(
+            {
+                "enabled": True,
+                "storage_dir": str(tmp_path / "memory"),
+                "retain_raw_media": False,
+            }
+        )
+        payload["identity"]["storage_dir"] = str(tmp_path / "identity")
+        payload["object_learning"]["storage_dir"] = str(tmp_path / "objects")
+        runtime = CompanionRuntime(EggConfig.model_validate(payload))
+        assert runtime._memory is not None
+        contexts = []
+        spoken = []
+
+        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+            contexts.append((context, allow_tool_requests))
+            if "PAST CAMERA TEXT TOOL RESULT" not in context:
+                return "[[TOOL:PAST_OCR|the sign by the door]]"
+            assert "PAST CAMERA TEXT TOOL RESULT" in context
+            return "I don't have a stored image of that to read."
+
+        def recall(
+            query: str,
+            limit: int = 5,
+            history_per_entity: int = 3,
+            since: str | None = None,
+            until: str | None = None,
+        ):
+            return [
+                {
+                    "entity_id": "object-002",
+                    "label": "sign",
+                    "matched_property": "label",
+                    "sightings": [
+                        {
+                            "camera_id": "camera-video1",
+                            "seen_at": "2026-08-30T00:00:00+00:00",
+                            "confidence": 0.9,
+                            "evidence_id": None,
+                        }
+                    ],
+                }
+            ]
+
+        async def speak(text: str, expected_revision: int | None = None) -> bool:
+            spoken.append(text)
+            return True
+
+        runtime._omnius.conversation_reply = conversation  # type: ignore[method-assign]
+        runtime._memory.world_query.recall_object_sightings = recall  # type: ignore[method-assign]
+        runtime._speak = speak  # type: ignore[method-assign]
+        turn = runtime._conversation_turns.finalize_audio_turn(
+            "What did the sign by the door say?",
+            utterance_id="heard-semantic-past-ocr-none",
+            started_at=1.0,
+            ended_at=1.2,
+        )
+
+        await runtime._handle_audio_turn(turn)
+
+        assert [allow for _, allow in contexts] == [True, True]
+        assert spoken == ["I don't have a stored image of that to read."]
+        runtime._memory.close(datetime.now(timezone.utc))
+
+    asyncio.run(scenario())
+
+
 def test_associative_object_recall_uses_embedding_similarity_and_caches_labels() -> None:
     runtime = CompanionRuntime(_runtime_config())
     embed_calls: list[str] = []

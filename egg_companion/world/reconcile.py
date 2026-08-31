@@ -630,7 +630,7 @@ class Reconciler:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT assertion_id, value_json, epistemic_kind, source_id, confidence,
-                authority, valid_from, valid_to, state, recorded_at
+                authority, valid_from, valid_to, state, recorded_at, evidence_ids_json
                 FROM world_assertions
                 WHERE subject_id = ? AND property_id = ?
                 ORDER BY valid_from DESC""",
@@ -643,6 +643,7 @@ class Reconciler:
                     "confidence": row[4], "authority": row[5],
                     "valid_from": row[6], "valid_to": row[7],
                     "state": row[8], "recorded_at": row[9],
+                    "evidence_ids": json.loads(row[10]),
                 }
                 for row in rows
             ]
@@ -672,7 +673,7 @@ class Reconciler:
             rows = self._conn.execute(
                 f"""SELECT subject_id, property_id, assertion_id, value_json,
                 epistemic_kind, source_id, confidence, authority, valid_from,
-                valid_to, state, recorded_at
+                valid_to, state, recorded_at, evidence_ids_json
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (
                         PARTITION BY subject_id, property_id ORDER BY valid_from DESC
@@ -694,6 +695,7 @@ class Reconciler:
                 "confidence": row[6], "authority": row[7],
                 "valid_from": row[8], "valid_to": row[9],
                 "state": row[10], "recorded_at": row[11],
+                "evidence_ids": json.loads(row[12]),
             })
         return grouped
 
