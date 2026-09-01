@@ -169,6 +169,15 @@ class OmniusConfig(BaseModel):
     # an explicit value, namespaced Ornith manifests request their full 262K
     # training window and consume memory needed by ASR/TTS/VLM runtimes.
     chat_num_ctx: int = Field(default=4096, ge=2048, le=32768)
+    # Multi-camera environmental grounding sends a contact-sheet image plus a
+    # long text prompt (frame ledger, detector ledger, prior assessment) and
+    # expects a multi-camera structured JSON reply -- chat_num_ctx's small
+    # text-only budget was routinely exhausted by the prompt alone, silently
+    # truncating the completion mid-object on nearly every multi-camera
+    # cycle (observed directly: rejected assessments consistently cut off
+    # around the same output length). This is a separate, larger budget for
+    # that one heavier workload, not a duplicate of chat_num_ctx.
+    vision_num_ctx: int = Field(default=16384, ge=4096, le=131072)
     # Keep enough alternating heard/agent messages for natural follow-ups while
     # leaving most of the bounded prompt window to grounded cognitive context.
     chat_history_messages: int = Field(default=12, ge=4, le=24)

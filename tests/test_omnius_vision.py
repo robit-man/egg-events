@@ -390,6 +390,58 @@ def test_realtime_chat_falls_back_to_non_streaming_on_transport_failure(monkeypa
     assert reply == "fallback reply"
 
 
+def test_environmental_assessment_uses_its_own_wider_context_budget(monkeypatch) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    requests = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {"message": {"content": "not valid json, only the request matters here"}}
+
+    class Session:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return Response()
+
+    image = BytesIO()
+    Image.new("RGB", (640, 480), "orange").save(image, format="JPEG")
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    asyncio.run(
+        client.assess_environmental_change(
+            [("front", image.getvalue(), "2026-01-01T00:00:00+00:00")],
+            {"kind": "person_count_changed"},
+            None,
+        )
+    )
+
+    assert len(requests) == 1
+    options = requests[0][1]["json"]["options"]
+    assert options["num_ctx"] == client.config.vision_num_ctx
+    assert options["num_ctx"] != client.config.chat_num_ctx
+
+
 def test_cognition_health_uses_lightweight_backend_readiness(monkeypatch) -> None:
     class Response:
         status = 200

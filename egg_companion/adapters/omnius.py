@@ -3456,7 +3456,12 @@ class OmniusClient:
             "think": False,
             "options": {
                 "temperature": 0,
-                "num_ctx": self.config.chat_num_ctx,
+                # This call sends an image plus a long multi-section text
+                # prompt and expects a multi-camera structured reply --
+                # chat_num_ctx is sized for lightweight text-only chat and
+                # was routinely exhausted by the prompt alone here, so this
+                # uses the separate, larger vision_num_ctx budget instead.
+                "num_ctx": self.config.vision_num_ctx,
                 # An arbitrary num_predict ceiling was hard-truncating valid
                 # JSON mid-object on nearly every multi-camera cycle,
                 # rejecting a real assessment and burning a full VLM pass
