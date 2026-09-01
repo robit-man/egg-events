@@ -13,6 +13,7 @@ import tempfile
 import time
 import wave
 import zlib
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 import aiohttp
@@ -406,6 +407,7 @@ class OmniusClient:
         history: list[dict[str, object]] | None = None,
         *,
         allow_tool_requests: bool = True,
+        on_delta: Callable[[str], None] | None = None,
     ) -> str:
         common_contract = (
             "Reply briefly and naturally for speech, normally in 45 words or fewer and up to 70 "
@@ -498,6 +500,7 @@ class OmniusClient:
         return await self._realtime_chat(
             messages,
             allow_tool_requests=allow_tool_requests,
+            on_delta=on_delta,
         )
 
     @staticmethod
@@ -4443,15 +4446,23 @@ class OmniusClient:
         messages: list[dict[str, str]],
         *,
         allow_tool_requests: bool,
+        on_delta: Callable[[str], None] | None = None,
     ) -> str:
-        """Run one native function-capable decision/reply generation."""
+        """Run one native function-capable decision/reply generation.
+
+        ``on_delta``, when supplied, streams the reply over SSE and calls
+        back with each content fragment as it arrives (for live dashboard
+        display) while still returning the same finalized string this
+        method always has -- streaming is purely a transport detail, not a
+        different contract for callers.
+        """
 
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         token_limit = 128 if allow_tool_requests else 160
         payload: dict[str, object] = {
             "model": self.config.model,
             "messages": list(messages),
-            "stream": False,
+            "stream": on_delta is not None,
             "max_tokens": token_limit,
             "num_ctx": self.config.chat_num_ctx,
             "keep_alive": self.config.chat_keep_alive,
@@ -4464,13 +4475,26 @@ class OmniusClient:
             # the same model, context window, token cap, and native functions.
             "realtime": False,
         }
+        url = f"{str(self.config.base_url).rstrip('/')}/v1/chat"
+        if on_delta is not None:
+            try:
+                message = await self._realtime_chat_stream(url, payload, timeout, on_delta)
+            except Exception as error:
+                logger.warning(
+                    "streaming realtime chat unavailable, retrying non-streaming: %s", error
+                )
+                payload["stream"] = False
+                message = await self._realtime_chat_once(url, payload, timeout)
+        else:
+            message = await self._realtime_chat_once(url, payload, timeout)
+        return self._finalize_realtime_message(message, allow_tool_requests=allow_tool_requests)
+
+    async def _realtime_chat_once(
+        self, url: str, payload: dict[str, object], timeout: aiohttp.ClientTimeout
+    ) -> dict[str, object]:
         async with self._model_gate:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{str(self.config.base_url).rstrip('/')}/v1/chat",
-                    json=payload,
-                    headers=self._headers(),
-                ) as response:
+                async with session.post(url, json=payload, headers=self._headers()) as response:
                     if response.status >= 400:
                         detail = (await response.text())[:500]
                         raise RuntimeError(f"Omnius realtime chat HTTP {response.status}: {detail}")
@@ -4481,7 +4505,60 @@ class OmniusClient:
             raise RuntimeError("Omnius realtime chat returned an invalid completion") from error
         if not isinstance(message, dict):
             raise RuntimeError("Omnius realtime chat returned an invalid message")
+        return message
 
+    async def _realtime_chat_stream(
+        self,
+        url: str,
+        payload: dict[str, object],
+        timeout: aiohttp.ClientTimeout,
+        on_delta: Callable[[str], None],
+    ) -> dict[str, object]:
+        content_parts: list[str] = []
+        tool_calls_by_index: dict[int, dict[str, object]] = {}
+        async with self._model_gate:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=self._headers()) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:500]
+                        raise RuntimeError(f"Omnius realtime chat HTTP {response.status}: {detail}")
+                    async for raw_line in response.content:
+                        line = raw_line.decode("utf-8", "ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chunk.get("choices") or [{}]
+                        delta = choices[0].get("delta") or {} if choices else {}
+                        text = delta.get("content")
+                        if isinstance(text, str) and text:
+                            content_parts.append(text)
+                            on_delta(text)
+                        for call in delta.get("tool_calls") or []:
+                            if not isinstance(call, dict):
+                                continue
+                            index = call.get("index", 0)
+                            slot = tool_calls_by_index.setdefault(
+                                index, {"function": {"name": "", "arguments": ""}}
+                            )
+                            function = call.get("function") or {}
+                            if function.get("name"):
+                                slot["function"]["name"] = function["name"]
+                            if function.get("arguments"):
+                                slot["function"]["arguments"] += function["arguments"]
+        return {
+            "content": "".join(content_parts) or None,
+            "tool_calls": list(tool_calls_by_index.values()) or None,
+        }
+
+    def _finalize_realtime_message(
+        self, message: dict[str, object], *, allow_tool_requests: bool
+    ) -> str:
         calls = message.get("tool_calls")
         if allow_tool_requests and isinstance(calls, list) and calls:
             if len(calls) != 1 or not isinstance(calls[0], dict):

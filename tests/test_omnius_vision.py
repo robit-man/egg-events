@@ -214,6 +214,182 @@ def test_audio_classifier_health_accepts_structured_503_readiness(monkeypatch) -
     }
 
 
+def test_realtime_chat_streams_content_deltas_and_calls_on_delta(monkeypatch) -> None:
+    lines = [
+        b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n',
+        b'data: {"choices":[{"delta":{"content":" there"}}]}\n',
+        b"data: [DONE]\n",
+    ]
+
+    class StreamContent:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._items:
+                raise StopAsyncIteration
+            return self._items.pop(0)
+
+    class Response:
+        status = 200
+
+        def __init__(self):
+            self.content = StreamContent(lines)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def text(self):
+            return ""
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            assert kwargs["json"]["stream"] is True
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+    deltas: list[str] = []
+
+    reply = asyncio.run(
+        client.conversation_reply(
+            "hi", "context", [], allow_tool_requests=False, on_delta=deltas.append
+        )
+    )
+
+    assert deltas == ["Hello", " there"]
+    assert reply == "Hello there"
+
+
+def test_realtime_chat_streams_fragmented_tool_call_arguments(monkeypatch) -> None:
+    lines = [
+        b'data: {"choices":[{"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"name":"search_current_web"}}]}}]}\n',
+        b'data: {"choices":[{"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"arguments":"{\\"qu"}}]}}]}\n',
+        b'data: {"choices":[{"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"arguments":"ery\\": \\"weather\\"}"}}]}}]}\n',
+        b"data: [DONE]\n",
+    ]
+
+    class StreamContent:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._items:
+                raise StopAsyncIteration
+            return self._items.pop(0)
+
+    class Response:
+        status = 200
+
+        def __init__(self):
+            self.content = StreamContent(lines)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def text(self):
+            return ""
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    reply = asyncio.run(
+        client.conversation_reply(
+            "look up the weather", "context", [],
+            allow_tool_requests=True, on_delta=lambda _delta: None,
+        )
+    )
+
+    assert OmniusClient.parse_realtime_tool_call(reply) == {
+        "tool": "web_search",
+        "arguments": {"query": "weather"},
+    }
+
+
+def test_realtime_chat_falls_back_to_non_streaming_on_transport_failure(monkeypatch) -> None:
+    class FailingStreamResponse:
+        status = 200
+
+        async def __aenter__(self):
+            raise ConnectionError("stream reset")
+
+        async def __aexit__(self, *_):
+            return None
+
+    class NonStreamResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {"choices": [{"message": {"content": "fallback reply"}}]}
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            return FailingStreamResponse() if kwargs["json"]["stream"] else NonStreamResponse()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    reply = asyncio.run(
+        client.conversation_reply(
+            "hi", "context", [], allow_tool_requests=False, on_delta=lambda _delta: None
+        )
+    )
+
+    assert reply == "fallback reply"
+
+
 def test_cognition_health_uses_lightweight_backend_readiness(monkeypatch) -> None:
     class Response:
         status = 200
@@ -467,7 +643,7 @@ def test_realtime_tool_contract_executes_polite_capability_requests_semantically
         client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
         captured: list[dict[str, str]] = []
 
-        async def realtime_chat(messages, *, allow_tool_requests) -> str:
+        async def realtime_chat(messages, *, allow_tool_requests, on_delta=None) -> str:
             assert allow_tool_requests
             captured.extend(messages)
             return "[[TOOL:WEB_SEARCH]]"

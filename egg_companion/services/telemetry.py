@@ -49,6 +49,10 @@ class RuntimeTelemetry:
         self._waveform_sample_count = config.audio.waveform_samples
         self._waveform_sequence = 0
         self._waveform_updated_at: str | None = None
+        self._reply_stream_context_id: str | None = None
+        self._reply_stream_text = ""
+        self._reply_stream_done = True
+        self._reply_stream_sequence = 0
         self._audio_rms: float | None = None
         self._vad_speech = False
         self._vad_speech_ratio = 0.0
@@ -245,6 +249,36 @@ class RuntimeTelemetry:
                 "samples": list(self._waveform),
                 "rms": self._audio_rms,
                 "updated_at": self._waveform_updated_at,
+            }
+
+    def start_reply_stream(self, context_id: str) -> None:
+        with self._lock:
+            self._reply_stream_context_id = context_id
+            self._reply_stream_text = ""
+            self._reply_stream_done = False
+            self._reply_stream_sequence += 1
+
+    def append_reply_stream_delta(self, context_id: str, delta: str) -> None:
+        with self._lock:
+            if self._reply_stream_context_id != context_id:
+                return
+            self._reply_stream_text += delta
+            self._reply_stream_sequence += 1
+
+    def finish_reply_stream(self, context_id: str) -> None:
+        with self._lock:
+            if self._reply_stream_context_id != context_id:
+                return
+            self._reply_stream_done = True
+            self._reply_stream_sequence += 1
+
+    def reply_stream_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "context_id": self._reply_stream_context_id,
+                "text": self._reply_stream_text,
+                "done": self._reply_stream_done,
+                "sequence": self._reply_stream_sequence,
             }
 
     def record_transcript(self, transcript: str, metadata: dict[str, object] | None = None) -> None:

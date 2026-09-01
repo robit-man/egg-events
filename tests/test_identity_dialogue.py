@@ -239,7 +239,9 @@ def test_visual_turn_uses_frames_frozen_at_utterance_boundary() -> None:
                 "tool_query": utterance,
             }
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             if "CURRENT CAMERA TOOL RESULT" not in context:
                 return "[[TOOL:VISION]]"
             return "You are holding a dark object."
@@ -355,7 +357,9 @@ def test_realtime_model_can_chain_camera_evidence_into_selected_ocr_region() -> 
         full_frame_ocr_calls = []
         spoken: list[str] = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             calls.append(allow_tool_requests)
             if "CURRENT CAMERA TOOL RESULT" not in context:
                 return "[[TOOL:VISION]]"
@@ -458,7 +462,9 @@ def test_realtime_model_intent_signal_routes_web_evidence_back_into_reply() -> N
         contexts = []
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             contexts.append((context, allow_tool_requests))
             if "WEB SEARCH TOOL EVIDENCE" not in context:
                 return "[[TOOL:WEB_SEARCH|current test launch news]]"
@@ -507,7 +513,9 @@ def test_realtime_model_intent_signal_routes_memory_recall_unavailable_status() 
         contexts = []
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             contexts.append((context, allow_tool_requests))
             if "OBJECT MEMORY TOOL STATUS" not in context:
                 return "[[TOOL:MEMORY|my keys]]"
@@ -548,7 +556,9 @@ def test_heard_turn_stays_silent_but_visible_when_reasoning_raises() -> None:
         runtime = CompanionRuntime(_config())
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             raise TimeoutError("simulated backend timeout")
 
         async def speak(text: str, expected_revision: int | None = None) -> bool:
@@ -580,7 +590,9 @@ def test_realtime_model_intent_signal_routes_read_only_shell_through_omnius() ->
         contexts = []
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             contexts.append((context, allow_tool_requests))
             if "READ-ONLY SHELL TOOL EVIDENCE" not in context:
                 return "[[TOOL:SHELL|git status --short]]"

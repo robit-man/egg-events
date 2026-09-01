@@ -703,7 +703,9 @@ def test_realtime_model_intent_signal_routes_memory_recall_back_into_reply(tmp_p
         contexts = []
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             contexts.append((context, allow_tool_requests))
             if "OBJECT MEMORY TOOL RESULT" not in context:
                 return "[[TOOL:MEMORY|my keys]]"
@@ -771,7 +773,9 @@ def test_realtime_model_intent_signal_routes_past_ocr_back_into_reply(tmp_path) 
         contexts = []
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             contexts.append((context, allow_tool_requests))
             if "PAST CAMERA TEXT TOOL RESULT" not in context:
                 return "[[TOOL:PAST_OCR|the sign by the door]]"
@@ -852,7 +856,9 @@ def test_realtime_model_intent_signal_routes_past_ocr_no_evidence_status(tmp_pat
         contexts = []
         spoken = []
 
-        async def conversation(utterance, context, history, *, allow_tool_requests=True):
+        async def conversation(
+            utterance, context, history, *, allow_tool_requests=True, on_delta=None
+        ):
             contexts.append((context, allow_tool_requests))
             if "PAST CAMERA TEXT TOOL RESULT" not in context:
                 return "[[TOOL:PAST_OCR|the sign by the door]]"

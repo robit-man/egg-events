@@ -208,3 +208,50 @@ def test_inference_updates_never_rewrite_raw_camera_stream() -> None:
         "basis": "mask_overlap",
         "mask_iou": 0.88,
     }
+
+
+def test_reply_stream_accumulates_deltas_for_the_active_context() -> None:
+    config = make_config()
+    telemetry = RuntimeTelemetry(config)
+
+    telemetry.start_reply_stream("turn-1")
+    telemetry.append_reply_stream_delta("turn-1", "Hello")
+    telemetry.append_reply_stream_delta("turn-1", " there")
+    snapshot = telemetry.reply_stream_snapshot()
+
+    assert snapshot["context_id"] == "turn-1"
+    assert snapshot["text"] == "Hello there"
+    assert snapshot["done"] is False
+
+    telemetry.finish_reply_stream("turn-1")
+    finished = telemetry.reply_stream_snapshot()
+
+    assert finished["done"] is True
+    assert finished["sequence"] > snapshot["sequence"]
+
+
+def test_reply_stream_ignores_deltas_from_a_superseded_context() -> None:
+    config = make_config()
+    telemetry = RuntimeTelemetry(config)
+
+    telemetry.start_reply_stream("turn-1")
+    telemetry.append_reply_stream_delta("turn-1", "stale fragment")
+    telemetry.start_reply_stream("turn-2")
+    telemetry.append_reply_stream_delta("turn-1", "late-arriving stale delta")
+    telemetry.append_reply_stream_delta("turn-2", "current text")
+
+    snapshot = telemetry.reply_stream_snapshot()
+
+    assert snapshot["context_id"] == "turn-2"
+    assert snapshot["text"] == "current text"
+
+
+def test_reply_stream_new_turn_bumps_sequence_for_ws_diffing() -> None:
+    config = make_config()
+    telemetry = RuntimeTelemetry(config)
+
+    before = telemetry.reply_stream_snapshot()["sequence"]
+    telemetry.start_reply_stream("turn-1")
+    after = telemetry.reply_stream_snapshot()["sequence"]
+
+    assert after > before

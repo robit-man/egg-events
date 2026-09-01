@@ -310,14 +310,24 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     async def audio_stream_handler(request: web.Request) -> web.WebSocketResponse:
         socket = web.WebSocketResponse(heartbeat=20)
         await socket.prepare(request)
-        sequence = -1
+        wave_sequence = -1
+        reply_sequence = -1
         try:
             while not socket.closed:
-                payload = companion().telemetry.waveform_snapshot()
-                current = int(payload["sequence"])
-                if current != sequence:
-                    await socket.send_json(payload)
-                    sequence = current
+                telemetry = companion().telemetry
+                outgoing: dict[str, object] = {}
+                waveform = telemetry.waveform_snapshot()
+                current_wave = int(waveform["sequence"])
+                if current_wave != wave_sequence:
+                    wave_sequence = current_wave
+                    outgoing.update(waveform)
+                reply_stream = telemetry.reply_stream_snapshot()
+                current_reply = int(reply_stream["sequence"])
+                if current_reply != reply_sequence:
+                    reply_sequence = current_reply
+                    outgoing["reply_stream"] = reply_stream
+                if outgoing:
+                    await socket.send_json(outgoing)
                 await asyncio.sleep(1 / 120)
         finally:
             await socket.close()

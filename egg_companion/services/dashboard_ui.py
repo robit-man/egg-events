@@ -231,6 +231,9 @@ PAGE = r"""<!doctype html>
     .message-tag.memory { border-color: #59406f; color: #d8b4fe; }
     .message-tag.association { border-color: #28556c; color: #7dd3fc; }
     .message.suppressed { opacity: .55; border: 1px dashed var(--line-strong); }
+    .message.streaming { opacity: .92; }
+    .message.streaming .streaming-text::after { content: '▍'; margin-left: 2px; animation: egg-stream-cursor 1s step-start infinite; }
+    @keyframes egg-stream-cursor { 50% { opacity: 0; } }
     .chat-form { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
     .chat-form .input { flex: 1; min-width: 220px; }
 
@@ -804,6 +807,7 @@ PAGE = r"""<!doctype html>
     let conversationLoading = false;
     let conversationLoadedAt = 0;
     let conversationLedger = [];
+    let replyStreamContextId = '';
     let dreamLoading = false;
     let dreamLoadedAt = 0;
     let dreamState = null;
@@ -1050,6 +1054,42 @@ PAGE = r"""<!doctype html>
         return `<div class="message ${turn.role === 'agent' ? 'agent' : 'heard'} ${turn.status === 'suppressed' ? 'suppressed' : ''}"><span class="message-role">${turn.role === 'agent' ? 'Egg' : 'Heard'}</span>${esc(turn.text)}${tagMarkup}<span class="message-meta">${turn.at ? esc(new Date(turn.at).toLocaleString()) + ' · ' : ''}${esc(stateLabel(turn.status || 'final'))}</span></div>`;
       }).join('');
       node.scrollTop = pinnedToBottom ? node.scrollHeight : previousScroll;
+    }
+    function replyStreamTargetId() {
+      const page = $('.page.active')?.dataset.page;
+      if (page === '/') return '#overview-conversation';
+      if (page === '/voice') return '#conversation';
+      if (page === '/chat') return '#chat-conversation';
+      return null;
+    }
+    function renderReplyStream(stream) {
+      const targetId = replyStreamTargetId();
+      if (!targetId) return;
+      const node = $(targetId);
+      if (!node) return;
+      if (!stream.context_id) return;
+      if (stream.context_id !== replyStreamContextId) {
+        replyStreamContextId = stream.context_id;
+        loadConversation(true);
+      }
+      let bubble = node.querySelector(`.message.streaming[data-context-id="${stream.context_id}"]`);
+      if (!bubble) {
+        node.querySelectorAll('.message.streaming').forEach(stale => stale.remove());
+        bubble = document.createElement('div');
+        bubble.className = 'message agent streaming';
+        bubble.dataset.contextId = stream.context_id;
+        bubble.innerHTML = '<span class="message-role">Egg</span><span class="streaming-text"></span>';
+        node.append(bubble);
+      }
+      const running = (currentState?.telemetry?.tool_calls || [])
+        .filter(call => call.context_id === stream.context_id && call.status === 'running');
+      const placeholder = running.length
+        ? `Running ${running.map(call => esc(String(call.name || 'tool').replaceAll('_', ' '))).join(', ')}…`
+        : 'Thinking…';
+      bubble.querySelector('.streaming-text').textContent = stream.text || placeholder;
+      const pinnedToBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 36;
+      if (pinnedToBottom) node.scrollTop = node.scrollHeight;
+      if (stream.done) setTimeout(() => loadConversation(true), 400);
     }
     async function loadConversation(force = false) {
       const now = Date.now();
@@ -1553,6 +1593,15 @@ PAGE = r"""<!doctype html>
       const text = input.value.trim();
       if (!text) return;
       input.disabled = true;
+      const feed = $('#chat-conversation');
+      if (feed) {
+        feed.querySelector('.empty')?.remove();
+        const echo = document.createElement('div');
+        echo.className = 'message heard';
+        echo.innerHTML = `<span class="message-role">Heard</span>${esc(text)}`;
+        feed.append(echo);
+        feed.scrollTop = feed.scrollHeight;
+      }
       try {
         const response = await fetch('/api/chat/message', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
         if (!response.ok) throw new Error(await response.text());
@@ -1722,7 +1771,13 @@ PAGE = r"""<!doctype html>
 
     function connectLiveWaveform() {
       const protocol = location.protocol === 'https:' ? 'wss' : 'ws'; const socket = new WebSocket(`${protocol}://${location.host}/api/audio/stream`);
-      socket.addEventListener('message', event => { try { drawWave(JSON.parse(event.data).samples || []); } catch (_) {} });
+      socket.addEventListener('message', event => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.samples) drawWave(data.samples);
+          if (data.reply_stream) renderReplyStream(data.reply_stream);
+        } catch (_) {}
+      });
       socket.addEventListener('close', () => setTimeout(connectLiveWaveform, 800)); socket.addEventListener('error', () => socket.close());
     }
     navigate(location.pathname, {replace:true});

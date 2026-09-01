@@ -7169,6 +7169,29 @@ class CompanionRuntime:
         visual_analyses: list[dict[str, object]] = []
         history = self._conversation_turns.prompt_history()
 
+        self.telemetry.start_reply_stream(turn.utterance_id)
+        try:
+            return await self._run_realtime_tool_loop_body(
+                turn, snapshot, transcript, live_context, context,
+                maximum_tool_calls, executed_fingerprints, tool_history,
+                visual_analyses, history,
+            )
+        finally:
+            self.telemetry.finish_reply_stream(turn.utterance_id)
+
+    async def _run_realtime_tool_loop_body(
+        self,
+        turn: AudioTurn,
+        snapshot: _TurnVisualSnapshot | None,
+        transcript: str,
+        live_context: str,
+        context: str,
+        maximum_tool_calls: int,
+        executed_fingerprints: set[str],
+        tool_history: list[dict[str, object]],
+        visual_analyses: list[dict[str, object]],
+        history: list[dict[str, object]],
+    ) -> str:
         for step in range(maximum_tool_calls + 1):
             allow_tools = step < maximum_tool_calls
             reply = await self._omnius.conversation_reply(
@@ -7176,6 +7199,9 @@ class CompanionRuntime:
                 context,
                 history,
                 allow_tool_requests=allow_tools,
+                on_delta=lambda delta: self.telemetry.append_reply_stream_delta(
+                    turn.utterance_id, delta
+                ),
             )
             if not self._conversation_turns.can_publish(turn.revision):
                 return "[[SILENT]]"
