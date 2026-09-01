@@ -390,7 +390,7 @@ def test_realtime_chat_falls_back_to_non_streaming_on_transport_failure(monkeypa
     assert reply == "fallback reply"
 
 
-def test_environmental_assessment_uses_its_own_wider_context_budget(monkeypatch) -> None:
+def test_environmental_assessment_uses_the_shared_model_context_budget(monkeypatch) -> None:
     from io import BytesIO
 
     from PIL import Image
@@ -438,8 +438,88 @@ def test_environmental_assessment_uses_its_own_wider_context_budget(monkeypatch)
 
     assert len(requests) == 1
     options = requests[0][1]["json"]["options"]
-    assert options["num_ctx"] == client.config.vision_num_ctx
-    assert options["num_ctx"] != client.config.chat_num_ctx
+    assert options["num_ctx"] == client.config.model_num_ctx
+
+
+def test_realtime_chat_and_environmental_assessment_request_identical_num_ctx(
+    monkeypatch,
+) -> None:
+    """`model` and `vision_model` are the same loaded Ollama instance in this
+    deployment (one GPU, one serving slot). Any two calls against it that
+    request different num_ctx values force a full model reload between
+    them -- confirmed directly on this device: 48 reloads in two hours,
+    audible churning, 40-90s+ turn latency, dropped replies, all from
+    exactly that mismatch. Every payload must request the same num_ctx.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    requests = []
+
+    class ChatResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {"choices": [{"message": {"content": "hello"}}]}
+
+    class EnvResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def json(self):
+            return {"message": {"content": "not valid json, only the request matters here"}}
+
+    class Session:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return EnvResponse() if url.endswith("/api/chat") else ChatResponse()
+
+    image = BytesIO()
+    Image.new("RGB", (640, 480), "orange").save(image, format="JPEG")
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    asyncio.run(client.conversation_reply("hi", "context", [], allow_tool_requests=False))
+    asyncio.run(
+        client.assess_environmental_change(
+            [("front", image.getvalue(), "2026-01-01T00:00:00+00:00")],
+            {"kind": "person_count_changed"},
+            None,
+        )
+    )
+
+    assert len(requests) == 2
+
+    def _num_ctx(body: dict) -> int:
+        # The Omnius gateway (/v1/chat) takes num_ctx top-level; raw Ollama
+        # (/api/chat) nests it under "options" -- same underlying knob.
+        return body.get("num_ctx", body.get("options", {}).get("num_ctx"))
+
+    num_ctx_values = {_num_ctx(req[1]["json"]) for req in requests}
+    assert len(num_ctx_values) == 1, (
+        f"requests targeting the same shared model must agree on num_ctx, got {num_ctx_values}"
+    )
 
 
 def test_cognition_health_uses_lightweight_backend_readiness(monkeypatch) -> None:

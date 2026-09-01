@@ -165,19 +165,27 @@ class OmniusConfig(BaseModel):
     voice_name: str | None = None
     bearer_token_env: str | None = None
     timeout_seconds: float = Field(default=20, gt=0, le=120)
-    # Omnius forwards this bounded Ollama context for realtime chat. Without
-    # an explicit value, namespaced Ornith manifests request their full 262K
-    # training window and consume memory needed by ASR/TTS/VLM runtimes.
-    chat_num_ctx: int = Field(default=4096, ge=2048, le=32768)
-    # Multi-camera environmental grounding sends a contact-sheet image plus a
-    # long text prompt (frame ledger, detector ledger, prior assessment) and
-    # expects a multi-camera structured JSON reply -- chat_num_ctx's small
-    # text-only budget was routinely exhausted by the prompt alone, silently
-    # truncating the completion mid-object on nearly every multi-camera
-    # cycle (observed directly: rejected assessments consistently cut off
-    # around the same output length). This is a separate, larger budget for
-    # that one heavier workload, not a duplicate of chat_num_ctx.
-    vision_num_ctx: int = Field(default=16384, ge=4096, le=131072)
+    # `model` and `vision_model` name the same underlying Ollama-loaded
+    # instance in this deployment (one GPU, OLLAMA_NUM_PARALLEL=1 -- a
+    # single serving slot). Every call against that slot -- realtime chat,
+    # environmental grounding, OCR, object/identity comparison, visual
+    # question answering -- MUST request this identical num_ctx: llama.cpp
+    # reloads the entire model (multi-second, gigabytes of tensors) any
+    # time a request asks for a different context size than what's
+    # currently loaded. Confirmed directly on this device: letting
+    # environmental grounding request a larger context than the
+    # conversational path caused 48 full model reloads in two hours --
+    # audible "churning", 40-90s+ turn latency, and dropped replies --
+    # simply from the two call types alternating. Without an explicit
+    # value, namespaced Ornith manifests also request their full 262K
+    # training window and consume memory needed by ASR/TTS runtimes, so
+    # this is deliberately bounded, not left to the model's default.
+    # Sized to also cover environmental grounding's heavier prompt (a
+    # multi-camera contact-sheet image plus a long text prompt) --
+    # smaller values here truncated that JSON mid-object even with an
+    # unbounded num_predict, because num_ctx is the real ceiling on
+    # prompt+completion combined.
+    model_num_ctx: int = Field(default=16384, ge=4096, le=131072)
     # Keep enough alternating heard/agent messages for natural follow-ups while
     # leaving most of the bounded prompt window to grounded cognitive context.
     chat_history_messages: int = Field(default=12, ge=4, le=24)

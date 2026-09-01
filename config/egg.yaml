@@ -136,8 +136,7 @@ omnius:
   # of just a slow one. Give a genuinely-slow-but-working request room to
   # actually finish rather than get cancelled right as it might succeed.
   timeout_seconds: 60
-  chat_num_ctx: 4096
-  vision_num_ctx: 16384
+  model_num_ctx: 16384
   chat_history_messages: 12
   chat_keep_alive: 30m
   reasoning_enabled: false

@@ -142,7 +142,7 @@ class OmniusClient:
             "stream": False,
             "temperature": 0,
             "max_tokens": 8,
-            "num_ctx": self.config.chat_num_ctx,
+            "num_ctx": self.config.model_num_ctx,
             "keep_alive": self.config.chat_keep_alive,
             "tools": False,
         }
@@ -2574,7 +2574,7 @@ class OmniusClient:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 300},
+            "options": {"temperature": 0, "num_ctx": self.config.model_num_ctx, "num_predict": 300},
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -2666,7 +2666,7 @@ class OmniusClient:
             # Ornith otherwise spends the entire generation budget reasoning and
             # can finish with an empty content field before it emits the JSON.
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 180},
+            "options": {"temperature": 0, "num_ctx": self.config.model_num_ctx, "num_predict": 180},
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -2725,7 +2725,7 @@ class OmniusClient:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 240},
+            "options": {"temperature": 0, "num_ctx": self.config.model_num_ctx, "num_predict": 240},
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -2801,7 +2801,7 @@ class OmniusClient:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 260},
+            "options": {"temperature": 0, "num_ctx": self.config.model_num_ctx, "num_predict": 260},
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -2911,7 +2911,7 @@ class OmniusClient:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 260},
+            "options": {"temperature": 0, "num_ctx": self.config.model_num_ctx, "num_predict": 260},
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -3034,7 +3034,7 @@ class OmniusClient:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 420},
+            "options": {"temperature": 0, "num_ctx": self.config.model_num_ctx, "num_predict": 420},
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
@@ -3456,12 +3456,11 @@ class OmniusClient:
             "think": False,
             "options": {
                 "temperature": 0,
-                # This call sends an image plus a long multi-section text
-                # prompt and expects a multi-camera structured reply --
-                # chat_num_ctx is sized for lightweight text-only chat and
-                # was routinely exhausted by the prompt alone here, so this
-                # uses the separate, larger vision_num_ctx budget instead.
-                "num_ctx": self.config.vision_num_ctx,
+                # Shared with every other call against this model (see
+                # model_num_ctx's definition in config.py) -- must not
+                # diverge, or the single serving slot reloads the entire
+                # model on every alternation between call types.
+                "num_ctx": self.config.model_num_ctx,
                 # An arbitrary num_predict ceiling was hard-truncating valid
                 # JSON mid-object on nearly every multi-camera cycle,
                 # rejecting a real assessment and burning a full VLM pass
@@ -4163,7 +4162,7 @@ class OmniusClient:
             "think": self.config.reasoning_enabled,
             "realtime": True,
             "max_tokens": bounded_tokens,
-            "num_ctx": self.config.chat_num_ctx,
+            "num_ctx": self.config.model_num_ctx,
             "keep_alive": self.config.chat_keep_alive,
             "realtime_options": {
                 "max_history_messages": 4,
@@ -4206,7 +4205,7 @@ class OmniusClient:
             "stream": False,
             "temperature": 0.2,
             "max_tokens": bounded_max_tokens,
-            "num_ctx": self.config.chat_num_ctx,
+            "num_ctx": self.config.model_num_ctx,
             "keep_alive": self.config.chat_keep_alive,
             "tools": False,
             "think": False,
@@ -4469,7 +4468,7 @@ class OmniusClient:
             "messages": list(messages),
             "stream": on_delta is not None,
             "max_tokens": token_limit,
-            "num_ctx": self.config.chat_num_ctx,
+            "num_ctx": self.config.model_num_ctx,
             "keep_alive": self.config.chat_keep_alive,
             "temperature": 0,
             "tools": self._realtime_tool_definitions() if allow_tool_requests else False,
@@ -4692,7 +4691,7 @@ class OmniusClient:
             "messages": chat_messages,
             "stream": False,
             "max_tokens": 80,
-            "num_ctx": self.config.chat_num_ctx,
+            "num_ctx": self.config.model_num_ctx,
             "keep_alive": self.config.chat_keep_alive,
             "temperature": 0.6,
             "tools": False,
