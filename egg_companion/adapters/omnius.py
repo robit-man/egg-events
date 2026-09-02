@@ -266,6 +266,45 @@ class OmniusClient:
             raise RuntimeError("Omnius ASR catalog is not an object")
         return payload
 
+    async def model_catalog(self) -> list[dict[str, object]]:
+        """List every model Ollama has locally pulled and ready to serve.
+
+        Queries vision_base_url directly (raw Ollama, not the Omnius
+        gateway) since that's where `model`/`vision_model` are actually
+        loaded from.
+        """
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{str(self.config.vision_base_url).rstrip('/')}/api/tags"
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return []
+        catalog: list[dict[str, object]] = []
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("name") or model.get("model")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            details = model.get("details") if isinstance(model.get("details"), dict) else {}
+            catalog.append(
+                {
+                    "name": name,
+                    "size": model.get("size"),
+                    "family": details.get("family"),
+                    "parameter_size": details.get("parameter_size"),
+                    "quantization_level": details.get("quantization_level"),
+                    "capabilities": model.get("capabilities")
+                    if isinstance(model.get("capabilities"), list)
+                    else [],
+                }
+            )
+        return catalog
+
     async def ensure_asr_model(self, model_id: str) -> None:
         asr = await self.asr_catalog()
         models = asr.get("models")

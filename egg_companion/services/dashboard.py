@@ -231,6 +231,8 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
                     "audio.asr_max_gain",
                     "omnius.voice_model",
                     "omnius.voice_name",
+                    "omnius.model",
+                    "omnius.vision_model",
                 ],
             },
             headers={"Cache-Control": "no-store"},
@@ -371,6 +373,26 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
                 force=request.query.get("refresh") == "1"
             ),
             headers={"Cache-Control": "no-store"},
+        )
+
+    async def model_catalog_handler(_: web.Request) -> web.Response:
+        return web.json_response(
+            await companion().model_catalog(),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def model_selection_handler(request: web.Request) -> web.Response:
+        require_loopback(request)
+        body = await request.json()
+        model = str(body.get("model", "")).strip()
+        if not model:
+            raise web.HTTPBadRequest(text="model is required")
+        try:
+            await companion().update_model_selection(model)
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        return web.json_response(
+            {"ok": True, "model": model}, headers={"Cache-Control": "no-store"}
         )
 
     async def conversation_history_handler(request: web.Request) -> web.Response:
@@ -704,6 +726,8 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
     )
     app.router.add_get("/api/objects/{profile_id}/mask.png", object_handler)
     app.router.add_get("/api/voice/catalog", voice_catalog_handler)
+    app.router.add_get("/api/models/catalog", model_catalog_handler)
+    app.router.add_put("/api/models/selection", model_selection_handler)
     app.router.add_get("/api/voice/conversation", conversation_history_handler)
     app.router.add_put("/api/voice/config", voice_config_handler)
     app.router.add_post("/api/voice/action", voice_action_handler)

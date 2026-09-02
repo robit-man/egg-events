@@ -441,6 +441,25 @@ class CompanionRuntime:
             await self._omnius.ensure_asr_model(asr_model)
             self.config.transcription.asr_model = asr_model
 
+    async def model_catalog(self) -> list[dict[str, object]]:
+        return await self._omnius.model_catalog()
+
+    async def update_model_selection(self, model: str) -> None:
+        """Point both the conversational and vision role at one model.
+
+        `model`/`vision_model` load the same Ollama serving slot on this
+        hardware (one GPU, one slot) -- letting them diverge is what
+        caused the reload-thrashing/latency regression fixed via
+        model_num_ctx, so this deliberately always sets both together
+        rather than exposing them as independent fields.
+        """
+        catalog = await self._omnius.model_catalog()
+        available = {str(item["name"]) for item in catalog}
+        if model not in available:
+            raise ValueError(f"model {model!r} is not in the local Ollama catalog")
+        self.config.omnius.model = model
+        self.config.omnius.vision_model = model
+
     def update_occupancy_resolution(self, sample_stride: int) -> dict[str, object]:
         """Live-adjust how many of DA3's per-frame depth points get
         back-projected into voxels each integration cycle -- lower is

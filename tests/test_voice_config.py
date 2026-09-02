@@ -59,6 +59,47 @@ def test_matching_asr_selection_is_still_reconciled_with_backend() -> None:
     asyncio.run(scenario())
 
 
+def test_update_model_selection_sets_both_conversational_and_vision_roles() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+
+        async def model_catalog():
+            return [{"name": "some/other-model:9b"}]
+
+        runtime._omnius.model_catalog = model_catalog  # type: ignore[method-assign]
+
+        await runtime.update_model_selection("some/other-model:9b")
+
+        assert runtime.config.omnius.model == "some/other-model:9b"
+        assert runtime.config.omnius.vision_model == "some/other-model:9b"
+
+    asyncio.run(scenario())
+
+
+def test_update_model_selection_rejects_a_model_not_in_the_local_catalog() -> None:
+    async def scenario() -> None:
+        runtime = CompanionRuntime(degraded_config())
+        original_model = runtime.config.omnius.model
+        original_vision_model = runtime.config.omnius.vision_model
+
+        async def model_catalog():
+            return [{"name": "some/other-model:9b"}]
+
+        runtime._omnius.model_catalog = model_catalog  # type: ignore[method-assign]
+
+        raised = False
+        try:
+            await runtime.update_model_selection("not-pulled/nonexistent:1b")
+        except ValueError:
+            raised = True
+
+        assert raised
+        assert runtime.config.omnius.model == original_model
+        assert runtime.config.omnius.vision_model == original_vision_model
+
+    asyncio.run(scenario())
+
+
 def test_rejected_voice_model_switch_does_not_mutate_config() -> None:
     async def scenario() -> None:
         runtime = CompanionRuntime(degraded_config())

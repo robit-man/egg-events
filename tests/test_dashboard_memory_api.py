@@ -102,6 +102,8 @@ def test_dashboard_registers_governance_routes_and_audit_does_not_block(monkeypa
                 "/api/graph/node",
                 "/api/voice/action",
                 "/api/chat/message",
+                "/api/models/catalog",
+                "/api/models/selection",
                 "/api/actions/focus_camera",
                 "/api/actions/inspect_entity",
                 "/api/voice/conversation",
@@ -176,6 +178,9 @@ def test_dashboard_application_is_professional_spa_with_local_graph_assets() -> 
     assert 'id="chat-input"' in dashboard.PAGE
     assert "/api/chat/message" in dashboard.PAGE
     assert "renderConversation(telemetry, '#chat-conversation', true)" in dashboard.PAGE
+    assert 'id="model-form"' in dashboard.PAGE
+    assert "/api/models/catalog" in dashboard.PAGE
+    assert "/api/models/selection" in dashboard.PAGE
     assert "border-radius: 0 !important" in dashboard.PAGE
     assert 'data-person-id=' in dashboard.PAGE
     assert 'id="person-inspector"' in dashboard.PAGE

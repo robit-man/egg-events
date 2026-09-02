@@ -785,6 +785,13 @@ PAGE = r"""<!doctype html>
         <section class="page" data-page="/configuration">
           <div class="page-heading"><div><h2>Configuration</h2><p>Complete effective runtime configuration. Voice page fields are mutable live; all other values reflect the active process.</p></div></div>
           <div class="grid">
+            <article class="card span-12">
+              <div class="card-header"><div><h3 class="card-title">Model</h3><p class="card-note">Conversational replies and vision/environmental grounding share one loaded Ollama model on this hardware; switching applies to both</p></div></div>
+              <form id="model-form" class="form-grid">
+                <div class="field full"><label>Ollama model</label><select class="select" name="model"><option>Loading models…</option></select></div>
+                <div class="button-row"><button class="button primary" type="submit">Apply model</button><span id="model-result" class="result"></span></div>
+              </form>
+            </article>
             <article class="card span-12"><div class="config-toolbar"><div><h3 class="card-title">Effective configuration</h3><p class="card-note">All active subsystems and discovered devices</p></div><input id="config-search" class="input search" type="search" placeholder="Filter settings"></div><div id="config-sections" class="config-sections"><div class="empty">Loading configuration.</div></div></article>
           </div>
         </section>
@@ -799,6 +806,7 @@ PAGE = r"""<!doctype html>
     const routeTitles = {'/':'Overview','/vision':'Vision','/voice':'Voice & Conversation','/chat':'Chat','/entities':'People & Objects','/memory':'Memory','/cognition':'Cognition','/graph':'Knowledge graph','/dreams':'Dreams','/narrative':'Narrative','/world':'World','/system':'System','/configuration':'Configuration'};
     let currentState = null;
     let effectiveConfig = null;
+    let modelCatalog = null;
     let catalog = null;
     let catalogLoading = false;
     let catalogRetry = null;
@@ -848,6 +856,7 @@ PAGE = r"""<!doctype html>
       document.title = `${routeTitles[route]} · Control Center`;
       document.body.classList.remove('menu-open');
       if (route === '/configuration' && !effectiveConfig) loadConfiguration();
+      if (route === '/configuration' && !modelCatalog) loadModelCatalog();
       if (route === '/vision' && currentState) renderCameras(currentState.telemetry?.cameras || []);
       if (route === '/vision') loadOccupancy();
       if (route === '/vision' && priorRoute !== '/vision') window.dispatchEvent(new CustomEvent('egg:vision-activate'));
@@ -1471,8 +1480,31 @@ PAGE = r"""<!doctype html>
       $('#config-sections').innerHTML = sections || '<div class="empty">No settings match this filter.</div>';
     }
     async function loadConfiguration() {
-      try { const response = await fetch('/api/config', {cache:'no-store'}); if (!response.ok) throw new Error(await response.text()); effectiveConfig = (await response.json()).config; renderConfiguration(); }
+      try { const response = await fetch('/api/config', {cache:'no-store'}); if (!response.ok) throw new Error(await response.text()); effectiveConfig = (await response.json()).config; renderConfiguration(); renderModelSelect(); }
       catch (error) { $('#config-sections').innerHTML = `<div class="empty">Configuration unavailable: ${esc(error.message)}</div>`; }
+    }
+    function renderModelSelect() {
+      const select = $('#model-form [name=model]');
+      if (!select || !modelCatalog) return;
+      const current = effectiveConfig?.omnius?.model || '';
+      select.innerHTML = modelCatalog.map(model => {
+        const size = typeof model.size === 'number' ? `${(model.size / 1e9).toFixed(1)} GB` : null;
+        const caps = Array.isArray(model.capabilities) ? model.capabilities.join(', ') : '';
+        const detail = [size, caps].filter(Boolean).join(' · ');
+        return `<option value="${esc(model.name)}" ${model.name === current ? 'selected' : ''}>${esc(model.name)}${detail ? ` (${esc(detail)})` : ''}</option>`;
+      }).join('') || '<option value="">No local Ollama models found</option>';
+    }
+    async function loadModelCatalog(force = false) {
+      if (!force && modelCatalog) return;
+      try {
+        const response = await fetch('/api/models/catalog', {cache:'no-store'});
+        if (!response.ok) throw new Error(await response.text());
+        modelCatalog = await response.json();
+        renderModelSelect();
+      } catch (error) {
+        const select = $('#model-form [name=model]');
+        if (select) select.innerHTML = `<option value="">Unavailable: ${esc(error.message)}</option>`;
+      }
     }
 
     async function loadGraph(force = false) {
@@ -1575,6 +1607,20 @@ PAGE = r"""<!doctype html>
       const response = await fetch('/api/voice/config', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});
       result.textContent = response.ok ? 'Settings applied' : await response.text(); result.className = `result ${response.ok ? 'success' : 'error'}`;
       if (response.ok) { voiceFormDirty = false; catalog = null; await Promise.all([loadCatalog(), refresh(), loadConfiguration()]); }
+    });
+    $('#model-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const result = $('#model-result'), model = new FormData(event.target).get('model');
+      if (!model) return;
+      result.className = 'result'; result.textContent = 'Applying…';
+      try {
+        const response = await fetch('/api/models/selection', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model})});
+        if (!response.ok) throw new Error(await response.text());
+        result.className = 'result success'; result.textContent = 'Model applied';
+        await loadConfiguration();
+      } catch (error) {
+        result.className = 'result error'; result.textContent = error.message;
+      }
     });
     async function voiceAction(action) {
       const result = $('#voice-result'); result.className = 'result'; result.textContent = `${action === 'stop' ? 'Stopping' : action === 'start' ? 'Starting' : 'Reconnecting'}…`;

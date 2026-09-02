@@ -170,6 +170,67 @@ def test_pause_daemon_listen_uses_voice_stop_without_disabling_tts(monkeypatch) 
     asyncio.run(client.pause_daemon_listen())
 
 
+def test_model_catalog_lists_locally_pulled_ollama_models(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            return {
+                "models": [
+                    {
+                        "name": "robit/ornith-1.5:9b",
+                        "size": 6550814941,
+                        "details": {
+                            "family": "qwen35",
+                            "parameter_size": "9.0B",
+                            "quantization_level": "Q4_K_M",
+                        },
+                        "capabilities": ["completion", "tools", "vision"],
+                    },
+                    {"name": "", "size": 123},
+                ]
+            }
+
+    class Session:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def get(self, url, **kwargs):
+            assert url.endswith("/api/tags")
+            return Response()
+
+    monkeypatch.setattr("egg_companion.adapters.omnius.aiohttp.ClientSession", Session)
+    client = OmniusClient(OmniusConfig(model="test", voice_model="test"))
+
+    catalog = asyncio.run(client.model_catalog())
+
+    assert catalog == [
+        {
+            "name": "robit/ornith-1.5:9b",
+            "size": 6550814941,
+            "family": "qwen35",
+            "parameter_size": "9.0B",
+            "quantization_level": "Q4_K_M",
+            "capabilities": ["completion", "tools", "vision"],
+        }
+    ]
+
+
 def test_audio_classifier_health_accepts_structured_503_readiness(monkeypatch) -> None:
     class Response:
         status = 503
