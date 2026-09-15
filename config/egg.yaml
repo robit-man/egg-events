@@ -149,6 +149,59 @@ omnius:
   # One labeled local contact sheet avoids four independent VLM image-prefill passes.
   visual_contact_sheet_size: 768
 
+# Qwen Omni adapter (robit.ollama.omni-adapter.v1), supervised separately by
+# https://github.com/robit-man/qwen-omni-adapters. It fronts the logical
+# robit/ornith-1.5-omni:q4km tag with Qwen3-Omni comprehension and Qwen3-TTS
+# speech, and Egg uses it for the perceptual work a genuinely multimodal model
+# does better than the current path:
+#   * speech and non-speech sound separated at the model boundary, so room
+#     noise can never be promoted into something the user said;
+#   * environmental audio described in language instead of only a fixed
+#     521-class AudioSet taxonomy (the YAMNet classifier still supplies the
+#     numbers Egg gates on -- the description is additive evidence);
+#   * bounded video understanding, which has no equivalent elsewhere here.
+# Every route falls back to the existing Omnius path when the adapter is
+# absent, unhealthy, or in its failure cooldown, so enabling this can only add
+# capability. Start it with scripts/bootstrap-omni-adapters.sh.
+omni_adapter:
+  enabled: false
+  base_url: http://127.0.0.1:8910
+  model: robit/ornith-1.5-omni:q4km
+  # The same tag on purpose. The logical tag's standard layers *are* the
+  # Ornith language model -- `ollama show --modelfile` gives it and
+  # robit/ornith-1.5:9b byte-identical base and projector blobs -- so the
+  # language model is already baked in and nothing loads beside it. Ollama
+  # keys a loaded runner by tag name, though, so naming a second tag would
+  # still load a second resident copy of the same weights.
+  language_model: robit/ornith-1.5-omni:q4km
+  # With the adapter enabled, repoint omnius.model and omnius.vision_model at
+  # language_model as well, so Egg's chat, Egg's vision, and the adapter's
+  # language stage all address one Ollama runner. This device runs
+  # OLLAMA_MAX_LOADED_MODELS=1: two names for the same weights would evict
+  # each other on every alternating call.
+  share_ollama_slot: true
+  timeout_seconds: 45
+  speech_timeout_seconds: 90
+  video_timeout_seconds: 180
+  # A passed health probe is trusted for 30s so ordinary turns do not pay an
+  # extra round trip, and a failure parks the adapter for 60s so a stopped
+  # service costs one timeout rather than one per spoken turn.
+  health_ttl_seconds: 30
+  failure_cooldown_seconds: 60
+  # One GPU lane: Egg already shares this Jetson between vision, ASR,
+  # language, and speech.
+  max_concurrent_requests: 1
+  keep_alive: 30m
+  transcription_enabled: true
+  audio_scene_enabled: true
+  # Qwen3-TTS replaces Supertonic only when this is set; leave it false to
+  # keep the existing voice and use the adapter for perception alone.
+  speech_enabled: false
+  # voice_reference_path: data/voice-reference.wav
+  video_fps: 2.0
+  video_max_frames: 48
+  video_include_audio: true
+
 attention:
   max_targets: 1
   track_ttl_seconds: 10

@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from egg_companion.adapters.omni import OmniAdapterClient
 from egg_companion.adapters.omnius import OmniusClient
 from egg_companion.adapters.audio import read_respeaker_direction
 from egg_companion.adapters.system_service import SystemServiceClient
@@ -254,7 +255,27 @@ async def audit_hardware(config: EggConfig) -> list[AuditCheck]:
                 config.audio.doa_serial_device,
             )
         )
-    omnius = OmniusClient(config.omnius)
+    omni_adapter = OmniAdapterClient(config.omni_adapter)
+    if config.omni_adapter.enabled:
+        try:
+            await omni_adapter.health()
+            contract = await omni_adapter.contract()
+            checks.append(
+                AuditCheck(
+                    "omni-adapter",
+                    "pass",
+                    f"{omni_adapter.status()['base_url']} {contract.get('schema')} "
+                    f"{config.omni_adapter.model}",
+                )
+            )
+        except Exception as error:
+            # The adapter is an enhancement over the Omnius perception paths,
+            # so an unavailable adapter degrades Egg rather than stopping it.
+            checks.append(AuditCheck("omni-adapter", "warn", _error_detail(error)))
+        else:
+            for model in (config.omni_adapter.model, config.omni_adapter.language_model):
+                checks.append(await _command_check(f"omni-model:{model}", ["ollama", "show", model]))
+    omnius = OmniusClient(config.omnius, omni_adapter)
     omnius_ready = False
     try:
         await omnius.health()

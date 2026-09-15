@@ -104,6 +104,82 @@ The Jetson hardware matrix, current Omnius failure analysis, persistent-worker d
 
 Every admitted utterance now supplies a durable context ID to its audio evidence, visual/web tool invocations, retrieval influences, user corrections, preferred-name bindings, learned-object labels, audio classifications, and agent action evidence. The Voice page renders those as live tags on the same historical turn—for example `ASR-boundary vision ✓`, `memory recall ×4`, `remembered name: Troy`, `label updated: amber mug`, or `Speech 67%`. Late asynchronous evidence updates the existing message in place and survives daemon restarts; it does not reset the page or create a second fake heard turn.
 
+## Qwen Omni adapter
+
+Egg can route its perceptual stages through the [Qwen Omni
+adapter](https://github.com/robit-man/qwen-omni-adapters), a separately
+supervised runtime that fronts one logical Ollama tag —
+`robit/ornith-1.5-omni:q4km` — with Qwen3-Omni comprehension and Qwen3-TTS
+speech. It is off by default (`omni_adapter.enabled`), and every route through
+it falls back to the existing Omnius path, so enabling it can only add
+capability.
+
+What the adapter answers better than the current path:
+
+- **Speech versus sound, separated at the model boundary.** One comprehension
+  pass returns `<speech_transcript>` and `<audio_observation>` as distinct
+  tagged evidence. Egg has always refused to let room noise become something
+  the user said; this makes the model itself responsible for the split instead
+  of a downstream heuristic. Untagged output is treated as acoustic
+  observation, never as a transcript, and the resulting transcript still faces
+  the same grounding gate as the Omnius ASR path — the quality bar for what Egg
+  acts on does not depend on the backend.
+- **Environmental audio in language.** A tagged observation describes ambience,
+  activity, timing, and uncertainty. The YAMNet classifier still supplies the
+  numeric AudioSet scores Egg gates `sound_event` entities on; the description
+  is additive evidence under `observation`, not a replacement.
+- **Bounded video understanding**, with frame sampling and optional use of the
+  clip's own audio track.
+- **Qwen3-TTS speech** at 24 kHz, including a request-local voice reference for
+  cloning (`voice_reference_path`).
+
+### One model, one Ollama slot
+
+The logical tag carries the language model in its standard layers: `ollama show
+--modelfile` gives `robit/ornith-1.5-omni:q4km` and `robit/ornith-1.5:9b`
+byte-identical base and projector blobs, and `ollama show` reports the omni tag
+as a 9.0B model with completion, vision, tools, and thinking. Nothing has to be
+loaded beside it.
+
+Ollama keys a loaded runner by tag *name*, though, and this device runs
+`OLLAMA_MAX_LOADED_MODELS=1`. Two names for the same weights would evict each
+other on every alternating call — exactly the multi-second reload churn
+documented on `OmniusConfig.model_num_ctx`. So when the adapter is enabled,
+`omni_adapter.share_ollama_slot` (on by default) repoints `omnius.model` and
+`omnius.vision_model` at the same tag, and Egg's chat, Egg's vision, and the
+adapter's language stage all address one runner.
+
+### Availability
+
+The adapter runs as its own systemd user service because it owns two llama.cpp
+workers with their own GPU residency and lifetime. `OmniAdapterClient` holds a
+health gate with a failure cooldown: a passed probe is trusted for
+`health_ttl_seconds`, and a failure parks the adapter for
+`failure_cooldown_seconds` so a stopped service costs one timeout rather than
+one per spoken turn. Status appears in the dashboard state payload under
+`omni_adapter` and as the `omni-adapter` startup audit check, which warns
+rather than fails.
+
+### Install
+
+```bash
+scripts/bootstrap-omni-adapters.sh     # clone, build, pull, install the service
+# then set omni_adapter.enabled: true in config/egg.yaml and restart
+```
+
+The script pulls `robit/ornith-1.5-omni:q4km` (34 GB: a 6.1 GiB Ornith 1.5 9B
+base, an 18.5 GiB Qwen3-Omni-30B-A3B comprehension component, and a 1.4 GiB
+Qwen3-TTS component), builds llama.cpp with CUDA kernels pinned to this SoC,
+and installs `egg-omni-adapters.service` on loopback with no public tunnel.
+`scripts/bootstrap-jetson.sh` re-runs it automatically once the adapter is
+enabled in config.
+
+Those weights total roughly 26 GiB before any KV cache. That is comfortable on
+a 64 GB AGX Orin and **tight on a 32 GB module** alongside Egg's own vision
+stack; see the adapter's
+[arm64 and NVIDIA Jetson](https://github.com/robit-man/qwen-omni-adapters/blob/main/docs/arm-jetson.md)
+notes for the full budget.
+
 ## ASR-boundary visual conversation
 
 At the acoustic end of every admitted utterance—before transcription enters its queue—Egg freezes every configured camera frame that is within the transport freshness bound. The snapshot stores each camera ID, its actual capture time, the utterance boundary, and the contemporaneous detector observation. No transcript phrase, detector category, person-box size, or hand-authored camera score selects a frame. The realtime dialogue model owns the `vision` tool decision. When selected, all frozen frames are sent together to local Ornith; its bounded result names supporting camera IDs, pixel-grounded observations, confidence, and uncertainty. The answer, exact JPEG evidence, frame ledger, model ID, and conversation context ID are retained together. A later camera frame can never silently replace the one associated with the question.
@@ -232,6 +308,7 @@ Bootstrap also enables `egg-runtime-update.timer`. Every six hours, with a rando
 - YOLOE + SAM + CLIP + face embeddings: `egg_companion/adapters/vision.py`
 - ReSpeaker DOA JSON-lines serial protocol: `egg_companion/adapters/audio.py`
 - Omnius chat/ASR/TTS REST API: `egg_companion/adapters/omnius.py`
+- Qwen Omni adapter (`robit.ollama.omni-adapter.v1`): `egg_companion/adapters/omni.py`
 - Optional external event bridge: `egg_companion/adapters/system_service.py`
 
 Omnius owns chat, voice warm-up, and TTS; `egg-whisper.service` owns ASR on port `11436`, and `OmniusClient` composes both voice catalogs for the dashboard. TTS WAV is delivered to the local speaker through `aplay`. A separate event bridge remains optional for external system integrations.

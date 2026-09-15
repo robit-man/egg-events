@@ -196,11 +196,17 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
         else:
             telemetry = {"cameras": []}
             identities, identity_summary, dreams, objects, memory = [], {}, {}, [], {}
+        omni_adapter = (
+            runtime._omni_adapter.status()
+            if isinstance(runtime, CompanionRuntime)
+            else {"enabled": config.omni_adapter.enabled, "healthy": False}
+        )
         return web.json_response({
             "runtime": state["runtime"],
             "checks": [{"name": check.name, "status": check.status, "detail": check.detail} for check in state["checks"]],
             "readiness": readiness.snapshot(),
             "omnius": str(config.omnius.base_url),
+            "omni_adapter": omni_adapter,
             "telemetry": telemetry,
             "identities": identities,
             "identity_summary": identity_summary,

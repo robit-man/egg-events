@@ -160,6 +160,34 @@ ensure_ollama_models() {
   done
 }
 
+omni_adapter_enabled() {
+  "$venv_python" - "$workspace_dir/config/egg.yaml" <<'EGG_OMNI_PY'
+import sys
+
+import yaml
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+except OSError:
+    raise SystemExit(1)
+adapter = config.get("omni_adapter") or {}
+raise SystemExit(0 if adapter.get("enabled") else 1)
+EGG_OMNI_PY
+}
+
+ensure_omni_adapter() {
+  # The Qwen Omni adapter is a separate supervised runtime and a multi-gigabyte
+  # model pull, so it is provisioned only for a deployment that has actually
+  # enabled it. scripts/bootstrap-omni-adapters.sh installs it on demand.
+  if ! omni_adapter_enabled; then
+    echo "omni_adapter is disabled in config/egg.yaml; skipping the Qwen Omni adapter."
+    echo "Enable it with: scripts/bootstrap-omni-adapters.sh"
+    return 0
+  fi
+  "$workspace_dir/scripts/bootstrap-omni-adapters.sh"
+}
+
 ensure_gpu_pm_guard
 
 if ! "$venv_python" - <<'PY'
@@ -217,6 +245,7 @@ if [[ ! -s "$pose_model" ]]; then
 fi
 "$venv_python" "$workspace_dir/scripts/install_dream_identity_model.py"
 ensure_ollama_models
+ensure_omni_adapter
 EGG_RESPEAKER_PYTHON="$venv_python" "$workspace_dir/scripts/configure-respeaker-aec.sh"
 "$venv_python" -m egg_companion --config "$workspace_dir/config/egg.yaml" audit
 ensure_companion_service

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from glob import glob
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class CameraConfig(BaseModel):
@@ -200,6 +203,81 @@ class OmniusConfig(BaseModel):
     visual_snapshot_max_age_seconds: float = Field(default=2.5, gt=0, le=15)
     visual_snapshot_max_cameras: int = Field(default=4, ge=1, le=16)
     visual_contact_sheet_size: int = Field(default=768, ge=512, le=1536)
+
+
+class OmniAdapterConfig(BaseModel):
+    """Qwen Omni adapter (``robit.ollama.omni-adapter.v1``) routing.
+
+    The adapter is a separately supervised process from
+    https://github.com/robit-man/qwen-omni-adapters that fronts one logical
+    Ollama tag with Qwen3-Omni comprehension and Qwen3-TTS speech. Egg uses it
+    for the perceptual stages that benefit from a genuinely multimodal model:
+    speech and non-speech sound separated at the model boundary, environmental
+    audio described in language rather than a fixed 521-class taxonomy, bounded
+    video understanding, and 24 kHz speech with an optional voice reference.
+
+    Every capability below is individually switchable and every one falls back
+    to the existing Omnius path when the adapter is absent or unhealthy, so
+    enabling this never removes a capability Egg already had.
+    """
+
+    enabled: bool = False
+    base_url: HttpUrl = "http://127.0.0.1:8910"
+    # The logical Omni tag. Its comprehension and TTS components live in the
+    # tag's custom sidecar layer, and its *standard* layers are the Ornith
+    # language model itself -- stock Ollama runs the tag directly for text,
+    # vision, and tools.
+    model: str = "robit/ornith-1.5-omni:q4km"
+    # Deliberately the same tag. `robit/ornith-1.5-omni:q4km` and
+    # `robit/ornith-1.5:9b` resolve to byte-identical base and projector blobs
+    # -- verified with `ollama show --modelfile` on this device -- so the
+    # language model is already baked into the logical tag and nothing has to
+    # be loaded beside it. Ollama keys a loaded runner by tag *name*, though,
+    # so naming a second tag would still load a second resident copy of the
+    # same weights; with OLLAMA_MAX_LOADED_MODELS=1 the two evict each other on
+    # every alternating call. One tag, one slot. See `share_ollama_slot`.
+    language_model: str = "robit/ornith-1.5-omni:q4km"
+    # Point Egg's own chat and vision calls at `language_model` too, so the
+    # companion, the vision path, and the adapter's language stage all address
+    # one Ollama runner. Turning this off is only correct on a host that can
+    # afford several models resident at once; on this single-slot device it
+    # reintroduces exactly the multi-second reload churn documented on
+    # OmniusConfig.model_num_ctx.
+    share_ollama_slot: bool = True
+    bearer_token_env: str | None = None
+    # Comprehension of a bounded speech segment on the integrated Jetson GPU.
+    timeout_seconds: float = Field(default=45, gt=0, le=300)
+    speech_timeout_seconds: float = Field(default=90, gt=0, le=600)
+    video_timeout_seconds: float = Field(default=180, gt=0, le=900)
+    health_timeout_seconds: float = Field(default=3, gt=0, le=30)
+    # A passed health probe is trusted for this long, so ordinary turns do not
+    # pay an extra round trip before every perception call.
+    health_ttl_seconds: float = Field(default=30, gt=0, le=600)
+    # After a failure the adapter is skipped entirely for this long. Without
+    # it, a stopped adapter would add its full connection timeout to every
+    # spoken turn instead of failing over to Omnius immediately.
+    failure_cooldown_seconds: float = Field(default=60, ge=0, le=3600)
+    # Egg shares one GPU between vision, ASR, language, and speech. More than
+    # one in-flight adapter request only queues work behind a spoken turn.
+    max_concurrent_requests: int = Field(default=1, ge=1, le=4)
+    keep_alive: str = "30m"
+
+    # Capability routing. Each falls back to the existing path when disabled.
+    transcription_enabled: bool = True
+    audio_scene_enabled: bool = True
+    speech_enabled: bool = False
+
+    # Qwen3-TTS voice selection. `voice_reference_path` is a local WAV used as
+    # a request-local speaker embedding for cloning.
+    voice: str | None = None
+    voice_language: str | None = None
+    voice_style: str | None = None
+    voice_reference_path: str | None = None
+
+    # Video sampling bounds for describe_video.
+    video_fps: float = Field(default=2.0, gt=0, le=30)
+    video_max_frames: int = Field(default=48, ge=1, le=1024)
+    video_include_audio: bool = True
 
 
 class SystemServiceConfig(BaseModel):
@@ -599,6 +677,7 @@ class EggConfig(BaseModel):
         default_factory=AudioComprehensionConfig
     )
     omnius: OmniusConfig
+    omni_adapter: OmniAdapterConfig = Field(default_factory=OmniAdapterConfig)
     system_service: SystemServiceConfig | None = None
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
@@ -628,6 +707,46 @@ class EggConfig(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("camera ids must be unique")
         return cameras
+
+    @model_validator(mode="after")
+    def share_one_ollama_slot(self) -> EggConfig:
+        """Address one Ollama runner when the Omni adapter is enabled.
+
+        The logical Omni tag carries the Ornith language model in its standard
+        layers, so `robit/ornith-1.5-omni:q4km` and `robit/ornith-1.5:9b` are
+        the same weights under two names. Ollama keys a loaded runner by name,
+        and this device runs OLLAMA_MAX_LOADED_MODELS=1, so leaving Egg's chat
+        and vision on one name while the adapter's language stage uses the
+        other makes every alternating call a full multi-second model reload --
+        the exact failure OmniusConfig.model_num_ctx documents.
+
+        Reconciling them here rather than asking the operator to keep three
+        settings in sync keeps that footgun closed by default.
+        """
+
+        if not self.omni_adapter.enabled or not self.omni_adapter.share_ollama_slot:
+            return self
+        shared = self.omni_adapter.language_model
+        changed = {
+            field: getattr(self.omnius, field)
+            for field in ("model", "vision_model")
+            if getattr(self.omnius, field) != shared
+        }
+        if changed:
+            logger.info(
+                "omni_adapter.share_ollama_slot: repointing %s at %s so Egg and the "
+                "adapter's language stage share one Ollama runner",
+                ", ".join(f"omnius.{field}={value}" for field, value in changed.items()),
+                shared,
+            )
+            object.__setattr__(
+                self,
+                "omnius",
+                self.omnius.model_copy(
+                    update={field: shared for field in changed}
+                ),
+            )
+        return self
 
 
 def _device_sort_key(source: str) -> tuple[int, str]:

@@ -1,0 +1,450 @@
+"""Contract and fallback tests for the Qwen Omni adapter integration.
+
+The adapter is an enhancement layered over Egg's existing Omnius perception
+paths, so these tests care about two things above all: that speech and
+non-speech acoustic evidence stay separated, and that every route degrades to
+the Omnius path instead of losing a capability.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import wave
+
+import numpy as np
+import pytest
+
+from egg_companion.adapters.omni import (
+    ADAPTER_SCHEMA,
+    OmniAdapterClient,
+    OmniAdapterError,
+    OmniAdapterUnavailable,
+    normalize_input_wav,
+)
+from egg_companion.adapters.omnius import OmniusClient
+from egg_companion.config import EggConfig, OmniAdapterConfig, OmniusConfig
+
+
+def _wav(
+    *, sample_rate: int = 16000, channels: int = 1, width: int = 2, seconds: float = 1.0
+) -> bytes:
+    frames = int(sample_rate * seconds)
+    tone = np.sin(
+        2 * np.pi * 220 * np.arange(frames * channels) / sample_rate
+    ) * 0.4
+    if width == 2:
+        payload = (tone * 32767).astype("<i2").tobytes()
+    else:
+        payload = ((tone * 127) + 128).astype(np.uint8).tobytes()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as target:
+        target.setnchannels(channels)
+        target.setsampwidth(width)
+        target.setframerate(sample_rate)
+        target.writeframes(payload)
+    return buffer.getvalue()
+
+
+def _client(**overrides) -> OmniAdapterClient:
+    config = OmniAdapterConfig(enabled=True, **overrides)
+    client = OmniAdapterClient(config)
+    # Skip the health probe; each test drives _post directly.
+    client._healthy_until = float("inf")
+    return client
+
+
+def _adapter_response(
+    *,
+    content: str = "",
+    observation: str | None = None,
+    transcript: str | None = None,
+    audio_observation: str | None = None,
+    audio: dict[str, str] | None = None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {"schema": ADAPTER_SCHEMA, "route": ["comprehension"]}
+    if observation is not None:
+        metadata["observation"] = observation
+    if transcript is not None:
+        metadata["input_transcript"] = transcript
+    if audio_observation is not None:
+        metadata["audio_observation"] = audio_observation
+    message: dict[str, object] = {"role": "assistant", "content": content}
+    if audio is not None:
+        message["audio"] = audio
+    return {"message": message, "adapter": metadata}
+
+
+# -- wire contract -------------------------------------------------------
+
+
+def test_perception_requests_are_comprehension_only_and_never_speak() -> None:
+    """A perception pass must not run the language model or synthesize audio."""
+
+    client = _client()
+    sent: list[dict[str, object]] = []
+
+    async def capture(payload, *, timeout_seconds):
+        sent.append(payload)
+        return _adapter_response(
+            observation="<speech_transcript>turn the light on</speech_transcript>"
+            "<audio_observation>a fan hums steadily</audio_observation>"
+        )
+
+    client._post = capture
+    asyncio.run(client.perceive_audio(_wav()))
+
+    payload = sent[0]
+    assert payload["omni"] == {
+        "schema": ADAPTER_SCHEMA,
+        "task": "describe",
+        "include_audio_from_video": True,
+    }
+    assert payload["stream"] is False
+    assert payload["speech_mode"] == "never"
+    assert payload["response_modalities"] == ["text"]
+    assert payload["think"] is False
+    assert "speech" not in payload
+    assert payload["messages"][0]["audios"][0]["mime_type"] == "audio/wav"
+
+
+def test_perception_separates_speech_from_non_speech_evidence() -> None:
+    client = _client()
+
+    async def respond(payload, *, timeout_seconds):
+        return _adapter_response(
+            observation=(
+                "<speech_transcript>put the kettle on</speech_transcript>"
+                "<audio_observation>a door closes, then a dog barks twice"
+                "</audio_observation>"
+            )
+        )
+
+    client._post = respond
+    result = asyncio.run(client.perceive_audio(_wav()))
+
+    assert result["transcript"] == "put the kettle on"
+    assert result["audio_observation"] == "a door closes, then a dog barks twice"
+
+
+def test_server_parsed_tags_take_priority_over_local_parsing() -> None:
+    client = _client()
+
+    async def respond(payload, *, timeout_seconds):
+        return _adapter_response(
+            observation="<speech_transcript>ignored</speech_transcript>",
+            transcript="authoritative",
+            audio_observation="rain on a window",
+        )
+
+    client._post = respond
+    result = asyncio.run(client.perceive_audio(_wav()))
+
+    assert result["transcript"] == "authoritative"
+    assert result["audio_observation"] == "rain on a window"
+
+
+def test_untagged_output_is_acoustic_evidence_not_a_transcript() -> None:
+    """Never attribute an unlabeled description to a speaker."""
+
+    client = _client()
+
+    async def respond(payload, *, timeout_seconds):
+        return _adapter_response(observation="Traffic passes outside the window.")
+
+    client._post = respond
+    result = asyncio.run(client.perceive_audio(_wav()))
+
+    assert result["transcript"] is None
+    assert result["audio_observation"] == "Traffic passes outside the window."
+
+
+def test_sound_only_audio_yields_no_transcript() -> None:
+    client = _client()
+
+    async def respond(payload, *, timeout_seconds):
+        return _adapter_response(
+            observation=(
+                "<speech_transcript></speech_transcript>"
+                "<audio_observation>a siren passes</audio_observation>"
+            )
+        )
+
+    client._post = respond
+    result = asyncio.run(client.perceive_audio(_wav()))
+
+    assert result["transcript"] is None
+    assert result["audio_observation"] == "a siren passes"
+
+
+def test_synthesis_requests_speech_and_returns_a_wav() -> None:
+    import base64
+
+    client = _client(speech_enabled=True, voice="F4", voice_language="en")
+    sent: list[dict[str, object]] = []
+    wav = _wav(sample_rate=24000)
+
+    async def respond(payload, *, timeout_seconds):
+        sent.append(payload)
+        return _adapter_response(
+            content="hello",
+            audio={"data": base64.b64encode(wav).decode("ascii")},
+        )
+
+    client._post = respond
+    assert asyncio.run(client.synthesize("hello")) == wav
+
+    payload = sent[0]
+    assert payload["omni"]["task"] == "synthesize"
+    assert payload["speech_mode"] == "always"
+    assert payload["response_modalities"] == ["text", "audio"]
+    assert payload["speech"] == {"voice": "F4", "language": "en"}
+
+
+def test_synthesis_rejects_a_response_without_audio() -> None:
+    client = _client(speech_enabled=True)
+
+    async def respond(payload, *, timeout_seconds):
+        return _adapter_response(content="hello")
+
+    client._post = respond
+    with pytest.raises(OmniAdapterError):
+        asyncio.run(client.synthesize("hello"))
+
+
+def test_video_requests_carry_bounded_sampling() -> None:
+    client = _client(video_fps=1.5, video_max_frames=12, video_include_audio=False)
+    sent: list[dict[str, object]] = []
+
+    async def respond(payload, *, timeout_seconds):
+        sent.append(payload)
+        return _adapter_response(
+            observation="<visual_observation>A person waves.</visual_observation>"
+        )
+
+    client._post = respond
+    # A minimal MP4 signature is enough: encoding is local, validation is remote.
+    result = asyncio.run(client.describe_video(b"\x00\x00\x00\x18ftypmp42"))
+
+    sampling = sent[0]["messages"][0]["videos"][0]["sampling"]
+    assert sampling == {"fps": 1.5, "max_frames": 12, "include_audio": False}
+    assert sent[0]["omni"]["include_audio_from_video"] is False
+    assert result["visual_observation"] == "A person waves."
+
+
+# -- audio normalization -------------------------------------------------
+
+
+def test_contract_audio_passes_through_untouched() -> None:
+    audio = _wav()
+    assert normalize_input_wav(audio) is audio
+
+
+def test_off_contract_audio_is_converted_to_16k_mono_pcm16() -> None:
+    converted = normalize_input_wav(_wav(sample_rate=48000, channels=2, seconds=0.5))
+
+    with wave.open(io.BytesIO(converted), "rb") as source:
+        assert source.getframerate() == 16000
+        assert source.getnchannels() == 1
+        assert source.getsampwidth() == 2
+        assert source.getnframes() == pytest.approx(8000, abs=2)
+
+
+def test_a_non_wav_payload_is_refused_before_leaving_the_device() -> None:
+    with pytest.raises(OmniAdapterError):
+        normalize_input_wav(b"not a wav at all")
+
+
+# -- health gating -------------------------------------------------------
+
+
+def test_a_disabled_adapter_is_unavailable_without_any_request() -> None:
+    client = OmniAdapterClient(OmniAdapterConfig(enabled=False))
+
+    with pytest.raises(OmniAdapterUnavailable):
+        asyncio.run(client._ensure_available())
+
+
+def test_a_failure_parks_the_adapter_for_its_cooldown() -> None:
+    """A stopped adapter must cost one timeout, not one per spoken turn."""
+
+    client = OmniAdapterClient(OmniAdapterConfig(enabled=True))
+    probes = 0
+
+    async def failing_health():
+        nonlocal probes
+        probes += 1
+        raise OSError("connection refused")
+
+    client.health = failing_health
+    for _ in range(3):
+        with pytest.raises(OmniAdapterUnavailable):
+            asyncio.run(client._ensure_available())
+
+    assert probes == 1
+    assert client.status()["cooling_down"] is True
+    assert client.status()["healthy"] is False
+
+
+# -- OmniusClient routing and fallback -----------------------------------
+
+
+def _omnius(omni: OmniAdapterClient | None) -> OmniusClient:
+    return OmniusClient(OmniusConfig(model="test", voice_model="test"), omni)
+
+
+def _speech_evidence() -> dict[str, object]:
+    return {"speech_detected": True, "source_rms": 0.09, "minimum_rms": 0.01}
+
+
+def test_transcription_prefers_the_adapter_and_records_its_backend() -> None:
+    adapter = _client()
+
+    async def perceive(wav_audio):
+        return {
+            "transcript": "open the blinds please",
+            "audio_observation": "a clock ticks",
+            "model": "robit/ornith-1.5-omni:q4km",
+            "backend": "qwen3-omni",
+        }
+
+    adapter.perceive_audio = perceive
+    client = _omnius(adapter)
+
+    transcript = asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert transcript == "open the blinds please"
+    assert client.last_transcription_metadata["backend"] == "qwen3-omni"
+    assert client.last_transcription_metadata["accepted"] is True
+    # Room sound is kept apart from what the user said.
+    assert client.last_audio_observation["observation"] == "a clock ticks"
+
+
+def test_an_unavailable_adapter_falls_back_to_the_omnius_asr_path() -> None:
+    adapter = _client()
+
+    async def perceive(wav_audio):
+        raise OmniAdapterUnavailable("adapter is down")
+
+    adapter.perceive_audio = perceive
+    client = _omnius(adapter)
+    calls: list[bytes] = []
+
+    async def omnius_path(wav_audio, evidence, language):
+        calls.append(wav_audio)
+        return "fallback transcript"
+
+    client._transcribe_via_omnius = omnius_path
+
+    transcript = asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert transcript == "fallback transcript"
+    assert len(calls) == 1
+
+
+def test_the_adapter_transcript_still_faces_the_grounding_gate() -> None:
+    """The quality bar for what Egg acts on must not depend on the backend."""
+
+    adapter = _client()
+
+    async def perceive(wav_audio):
+        return {
+            "transcript": "Allah Allah Allah Allah Allah Allah Allah Allah",
+            "audio_observation": None,
+            "model": "robit/ornith-1.5-omni:q4km",
+            "backend": "qwen3-omni",
+        }
+
+    adapter.perceive_audio = perceive
+    client = _omnius(adapter)
+
+    transcript = asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert transcript is None
+    assert client.last_transcription_metadata["accepted"] is False
+    assert client.last_transcription_metadata["rejection_reason"] is not None
+
+
+def test_a_stale_audio_observation_never_survives_the_next_turn() -> None:
+    adapter = _client()
+    client = _omnius(adapter)
+    client.last_audio_observation = {"observation": "a previous siren"}
+
+    async def perceive(wav_audio):
+        raise OmniAdapterUnavailable("adapter is down")
+
+    adapter.perceive_audio = perceive
+
+    async def omnius_path(wav_audio, evidence, language):
+        return "fresh transcript"
+
+    client._transcribe_via_omnius = omnius_path
+    asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert client.last_audio_observation == {}
+
+
+def test_speech_routes_to_the_adapter_only_when_it_is_enabled() -> None:
+    adapter = _client(speech_enabled=False)
+    calls: list[str] = []
+
+    async def synthesize(text):
+        calls.append(text)
+        return b"RIFFomni"
+
+    adapter.synthesize = synthesize
+    client = _omnius(adapter)
+    client._synthesize_via_omnius = lambda text: None
+
+    adapter.config = adapter.config.model_copy(update={"speech_enabled": True})
+    assert asyncio.run(client.synthesize("hello")) == b"RIFFomni"
+    assert calls == ["hello"]
+
+
+# -- single Ollama slot --------------------------------------------------
+
+
+def _config(**adapter_overrides) -> EggConfig:
+    return EggConfig.model_validate(
+        {
+            "audio": {"input_device": "default"},
+            "omnius": {
+                "model": "robit/ornith-1.5:9b",
+                "vision_model": "robit/ornith-1.5:9b",
+                "voice_model": "supertonic",
+            },
+            "omni_adapter": adapter_overrides,
+        }
+    )
+
+
+def test_enabling_the_adapter_points_every_call_at_one_ollama_tag() -> None:
+    """Two names for identical weights would evict each other on this device."""
+
+    config = _config(enabled=True)
+
+    assert config.omni_adapter.language_model == "robit/ornith-1.5-omni:q4km"
+    assert config.omnius.model == "robit/ornith-1.5-omni:q4km"
+    assert config.omnius.vision_model == "robit/ornith-1.5-omni:q4km"
+
+
+def test_a_disabled_adapter_leaves_the_existing_tags_alone() -> None:
+    config = _config(enabled=False)
+
+    assert config.omnius.model == "robit/ornith-1.5:9b"
+    assert config.omnius.vision_model == "robit/ornith-1.5:9b"
+
+
+def test_slot_sharing_can_be_declined_for_a_multi_model_host() -> None:
+    config = _config(enabled=True, share_ollama_slot=False)
+
+    assert config.omnius.model == "robit/ornith-1.5:9b"
+    assert config.omni_adapter.language_model == "robit/ornith-1.5-omni:q4km"

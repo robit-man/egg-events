@@ -20,6 +20,11 @@ import aiohttp
 import numpy as np
 
 from egg_companion.config import OmniusConfig
+from egg_companion.adapters.omni import (
+    OmniAdapterClient,
+    OmniAdapterError,
+    OmniAdapterUnavailable,
+)
 from egg_companion.cognition.dialogue import (
     InterruptionDecision,
     parse_interruption_decision,
@@ -40,8 +45,16 @@ class OmniusClient:
         "Avoid stock phrases, emojis, and greetings."
     )
 
-    def __init__(self, config: OmniusConfig) -> None:
+    def __init__(
+        self, config: OmniusConfig, omni: OmniAdapterClient | None = None
+    ) -> None:
         self.config = config
+        # Optional Qwen Omni adapter. When present and healthy it answers the
+        # perceptual stages it is genuinely better at -- speech/sound
+        # separation, environmental audio in language, Qwen3-TTS speech --
+        # and every one of those calls falls back to the Omnius path below on
+        # any failure, so attaching it never removes an existing capability.
+        self._omni = omni
         self._conversation: list[dict[str, str]] = []
         self._system_prompt: str = self._DEFAULT_SYSTEM_PROMPT
         # Conversational gate: used by chat/reply calls. Background VLM calls
@@ -61,6 +74,10 @@ class OmniusClient:
         self._asr_gate = asyncio.Lock()
         self._ocr_gate = asyncio.Lock()
         self.last_transcription_metadata: dict[str, object] = {}
+        # Non-speech acoustic evidence from the most recent Omni perception
+        # pass. It is deliberately kept apart from the transcript: room sound
+        # is never something the user said.
+        self.last_audio_observation: dict[str, object] = {}
         self._voice_catalog_cache: dict[str, object] | None = None
         self._voice_catalog_cached_at = 0.0
 
@@ -2044,6 +2061,11 @@ class OmniusClient:
         acoustic = self._wav_acoustic_evidence(wav_audio)
         if not acoustic or float(acoustic.get("duration") or 0) <= 0:
             raise ValueError("audio comprehension requires a valid WAV payload")
+        # Qwen3-Omni describes the scene in language -- ambience, activity,
+        # temporal change, uncertainty -- which a fixed 521-class taxonomy
+        # cannot express. It is additive evidence alongside the classifier's
+        # numbers, never a replacement for them.
+        observation = await self._describe_audio_scene_via_omni(wav_audio)
         temporary_path = ""
         try:
             with tempfile.NamedTemporaryFile(
@@ -2076,7 +2098,7 @@ class OmniusClient:
             )
         if parsed is None:
             raise RuntimeError("Omnius audio_analyze returned invalid YAMNet output")
-        return {
+        result: dict[str, object] = {
             "classifications": parsed["classifications"],
             "total_classes": parsed.get("total_classes", 521),
             "duration_seconds": parsed.get("duration_s", acoustic.get("duration")),
@@ -2087,6 +2109,29 @@ class OmniusClient:
             "semantic_quality": "grounded classifier",
             "mock_evidence_discarded": True,
         }
+        if observation:
+            result["observation"] = observation
+            result["observation_model"] = self._omni.config.model if self._omni else None
+            result["observation_backend"] = "qwen3-omni"
+        return result
+
+    async def _describe_audio_scene_via_omni(self, wav_audio: bytes) -> str | None:
+        """Return Qwen3-Omni's non-speech description of a clip, or None.
+
+        Environmental comprehension runs on a bounded background queue, so a
+        missing or unhealthy adapter degrades the description away without
+        touching the classifier evidence the caller actually gates on.
+        """
+
+        if self._omni is None or not self._omni.config.audio_scene_enabled:
+            return None
+        try:
+            return await self._omni.describe_audio(wav_audio)
+        except OmniAdapterUnavailable as error:
+            logger.debug("Omni adapter audio description unavailable: %s", error)
+        except OmniAdapterError as error:
+            logger.warning("Omni adapter audio description failed: %s", error)
+        return None
 
     async def _call_audio_classifier(
         self, args: dict[str, object], *, timeout_seconds: float
@@ -2236,6 +2281,10 @@ class OmniusClient:
         acoustic_evidence: dict[str, object] | None = None,
         language: str = "auto",
     ) -> str | None:
+        # Clear before any path runs, not inside one of them: whatever answers
+        # this turn, the previous turn's room sound must not be left behind to
+        # be read as currently audible.
+        self.last_audio_observation = {}
         evidence = {
             **self._wav_acoustic_evidence(wav_audio),
             **dict(acoustic_evidence or {}),
@@ -2252,6 +2301,25 @@ class OmniusClient:
                 "rejection_reason": acoustic_rejection,
             }
             return None
+        if self._omni is not None and self._omni.config.transcription_enabled:
+            try:
+                return await self._transcribe_via_omni(wav_audio, evidence)
+            except OmniAdapterUnavailable as error:
+                logger.debug("Omni adapter transcription unavailable: %s", error)
+            except OmniAdapterError as error:
+                logger.warning("Omni adapter transcription failed: %s", error)
+        return await self._transcribe_via_omnius(wav_audio, evidence, language)
+
+    async def _transcribe_via_omnius(
+        self, wav_audio: bytes, evidence: dict[str, object], language: str
+    ) -> str | None:
+        """Transcribe through the Omnius ASR service.
+
+        This is the path Egg has always used and the one every Omni route
+        falls back to, so it stays complete and independent rather than
+        becoming a degraded branch of the adapter path.
+        """
+
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         headers = {**self._headers(), "Content-Type": "audio/wav"}
         async with self._asr_gate:
@@ -2280,10 +2348,64 @@ class OmniusClient:
             "acoustic": evidence,
             "accepted": rejection_reason is None,
             "rejection_reason": rejection_reason,
+            "backend": "omnius-asr",
         }
         if rejection_reason is not None:
             return None
         return text.strip()
+
+    async def _transcribe_via_omni(
+        self, wav_audio: bytes, evidence: dict[str, object]
+    ) -> str | None:
+        """Transcribe through Qwen3-Omni, keeping speech and sound separate.
+
+        One comprehension pass returns the verbatim transcript and the
+        non-speech acoustic observation under distinct tags, so a passing
+        siren can never be promoted into something the user said. The
+        resulting transcript still passes the same grounding gate as the
+        Omnius ASR path -- these checks run on transcript text and the
+        segment metadata they need is optional -- because the quality bar
+        for what Egg is willing to act on must not depend on the backend.
+        """
+
+        assert self._omni is not None
+        perceived = await self._omni.perceive_audio(wav_audio)
+        transcript = perceived.get("transcript")
+        text = transcript.strip() if isinstance(transcript, str) else ""
+        observation = perceived.get("audio_observation")
+        self.last_audio_observation = (
+            {
+                "observation": observation,
+                "backend": perceived.get("backend"),
+                "model": perceived.get("model"),
+                "captured_with_transcript": bool(text),
+            }
+            if isinstance(observation, str) and observation.strip()
+            else {}
+        )
+        payload = {
+            "text": text,
+            "duration": evidence.get("duration"),
+            "language": evidence.get("requested_language"),
+            "segments": [],
+        }
+        rejection_reason = self.transcription_rejection_reason(payload, evidence)
+        if not text:
+            rejection_reason = "empty transcript"
+        self.last_transcription_metadata = {
+            "duration": evidence.get("duration"),
+            "language": evidence.get("requested_language"),
+            "segments": [],
+            "acoustic": evidence,
+            "accepted": rejection_reason is None,
+            "rejection_reason": rejection_reason,
+            "backend": "qwen3-omni",
+            "model": perceived.get("model"),
+            "audio_observation": observation if self.last_audio_observation else None,
+        }
+        if rejection_reason is not None:
+            return None
+        return text
 
     @staticmethod
     def transcription_is_grounded(
@@ -4170,6 +4292,18 @@ class OmniusClient:
         return {"consistent": consistent, "confidence": float(confidence), "reason": reason.strip()}
 
     async def synthesize(self, text: str) -> bytes:
+        if self._omni is not None and self._omni.config.speech_enabled:
+            try:
+                return await self._omni.synthesize(text)
+            except OmniAdapterUnavailable as error:
+                logger.debug("Omni adapter speech unavailable: %s", error)
+            except OmniAdapterError as error:
+                logger.warning("Omni adapter speech failed: %s", error)
+        return await self._synthesize_via_omnius(text)
+
+    async def _synthesize_via_omnius(self, text: str) -> bytes:
+        """Synthesize through the Omnius voice service (Supertonic)."""
+
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(

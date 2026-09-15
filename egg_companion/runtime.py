@@ -36,6 +36,7 @@ from egg_companion.adapters.audio import (
 )
 from egg_companion.adapters.camera import CameraStream
 from egg_companion.adapters.depth import DepthEstimator
+from egg_companion.adapters.omni import OmniAdapterClient
 from egg_companion.adapters.omnius import OmniusClient
 from egg_companion.adapters.speaker import Speaker
 from egg_companion.adapters.system_service import SystemServiceClient
@@ -216,7 +217,11 @@ class CompanionRuntime:
         self._segmenter = UtteranceSegmenter(config.audio, config.transcription)
         self._waveform_capture = ReSpeakerWaveformCapture(config.audio)
         self._speaker = Speaker(config.audio)
-        self._omnius = OmniusClient(config.omnius)
+        # The Qwen Omni adapter is optional and independently supervised.
+        # Constructing it is free -- it opens no connection until a call --
+        # and every route through it falls back to Omnius on failure.
+        self._omni_adapter = OmniAdapterClient(config.omni_adapter)
+        self._omnius = OmniusClient(config.omnius, self._omni_adapter)
         self._conversation_turns = ConversationTurnController(history_limit=2000)
         self._last_system_prompt_assessment_at: float = 0.0
         self._system_service = SystemServiceClient(config.system_service) if config.system_service else None
