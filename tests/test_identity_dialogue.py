@@ -13,6 +13,9 @@ def _config() -> EggConfig:
         {
             "audio": {"input_device": "default", "doa_mode": "disabled"},
             "omnius": {"model": "test", "voice_model": "test"},
+            # These exercise the discrete-model stack, which omni mode
+            # deliberately silences.
+            "omni_adapter": {"mode": "traditional"},
             "identity": {"enabled": False},
             "object_learning": {"enabled": False},
             "memory": {"enabled": False},

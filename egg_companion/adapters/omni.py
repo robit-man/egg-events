@@ -188,15 +188,17 @@ class OmniAdapterClient:
 
         now = time.monotonic()
         return {
+            "mode": self.config.mode,
             "enabled": self.enabled,
             "base_url": self._base_url(),
             "model": self.config.model,
             "healthy": self.enabled and now < self._healthy_until,
             "cooling_down": now < self._cooldown_until,
             "last_error": self._last_error,
-            "transcription": self.config.transcription_enabled,
-            "audio_scene": self.config.audio_scene_enabled,
-            "speech": self.config.speech_enabled,
+            "transcription": self.config.uses_transcription,
+            "audio_scene": self.config.uses_audio_scene,
+            "video": self.config.uses_video,
+            "speech": self.config.uses_speech,
         }
 
     def _note_failure(self, error: BaseException) -> None:

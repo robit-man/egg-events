@@ -33,3 +33,6 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Vendored adapter runtime, cloned by scripts/bootstrap-omni-adapters.sh
+vendor/

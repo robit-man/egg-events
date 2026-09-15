@@ -47,7 +47,7 @@ def _wav(
 
 
 def _client(**overrides) -> OmniAdapterClient:
-    config = OmniAdapterConfig(enabled=True, **overrides)
+    config = OmniAdapterConfig(mode="omni", **overrides)
     client = OmniAdapterClient(config)
     # Skip the health probe; each test drives _post directly.
     client._healthy_until = float("inf")
@@ -258,8 +258,8 @@ def test_a_non_wav_payload_is_refused_before_leaving_the_device() -> None:
 # -- health gating -------------------------------------------------------
 
 
-def test_a_disabled_adapter_is_unavailable_without_any_request() -> None:
-    client = OmniAdapterClient(OmniAdapterConfig(enabled=False))
+def test_traditional_mode_is_unavailable_without_any_request() -> None:
+    client = OmniAdapterClient(OmniAdapterConfig(mode="traditional"))
 
     with pytest.raises(OmniAdapterUnavailable):
         asyncio.run(client._ensure_available())
@@ -268,7 +268,7 @@ def test_a_disabled_adapter_is_unavailable_without_any_request() -> None:
 def test_a_failure_parks_the_adapter_for_its_cooldown() -> None:
     """A stopped adapter must cost one timeout, not one per spoken turn."""
 
-    client = OmniAdapterClient(OmniAdapterConfig(enabled=True))
+    client = OmniAdapterClient(OmniAdapterConfig(mode="omni"))
     probes = 0
 
     async def failing_health():
@@ -426,25 +426,243 @@ def _config(**adapter_overrides) -> EggConfig:
     )
 
 
-def test_enabling_the_adapter_points_every_call_at_one_ollama_tag() -> None:
+def test_omni_is_the_default_mode() -> None:
+    config = _config()
+
+    assert config.omni_adapter.mode == "omni"
+    assert config.omni_adapter.enabled is True
+    assert config.omni_adapter.exclusive is True
+
+
+def test_omni_mode_points_every_call_at_one_ollama_tag() -> None:
     """Two names for identical weights would evict each other on this device."""
 
-    config = _config(enabled=True)
+    config = _config(mode="omni")
 
     assert config.omni_adapter.language_model == "robit/ornith-1.5-omni:q4km"
     assert config.omnius.model == "robit/ornith-1.5-omni:q4km"
     assert config.omnius.vision_model == "robit/ornith-1.5-omni:q4km"
 
 
-def test_a_disabled_adapter_leaves_the_existing_tags_alone() -> None:
-    config = _config(enabled=False)
+def test_traditional_mode_leaves_the_existing_tags_alone() -> None:
+    config = _config(mode="traditional")
 
     assert config.omnius.model == "robit/ornith-1.5:9b"
     assert config.omnius.vision_model == "robit/ornith-1.5:9b"
 
 
 def test_slot_sharing_can_be_declined_for_a_multi_model_host() -> None:
-    config = _config(enabled=True, share_ollama_slot=False)
+    config = _config(mode="omni", share_ollama_slot=False)
 
     assert config.omnius.model == "robit/ornith-1.5:9b"
     assert config.omni_adapter.language_model == "robit/ornith-1.5-omni:q4km"
+
+
+# -- exclusive omni: nothing else stays loaded ---------------------------
+
+
+def test_exclusive_omni_silences_every_other_discrete_model() -> None:
+    """One weights package means YOLOE, SAM, CLIP, pose, and face ONNX do not load."""
+
+    config = _config(mode="omni")
+
+    assert config.vision.enabled is False
+    assert config.identity.enabled is False
+    assert config.object_learning.enabled is False
+    assert config.occupancy.enabled is False
+    assert config.dreams.enabled is False
+    assert config.ocr.enabled is False
+
+
+def test_traditional_mode_keeps_the_whole_discrete_stack() -> None:
+    config = _config(mode="traditional")
+
+    assert config.vision.enabled is True
+    assert config.identity.enabled is True
+    assert config.ocr.enabled is True
+
+
+def test_omni_can_coexist_with_the_discrete_stack_when_asked() -> None:
+    config = _config(mode="omni", exclusive=False)
+
+    assert config.omni_adapter.enabled is True
+    assert config.vision.enabled is True
+    assert config.identity.enabled is True
+
+
+def test_a_legacy_enabled_flag_still_selects_the_mode() -> None:
+    """A stale `enabled: false` must not silently turn omni on."""
+
+    assert OmniAdapterConfig.model_validate({"enabled": False}).mode == "traditional"
+    assert OmniAdapterConfig.model_validate({"enabled": True}).mode == "omni"
+    # An explicit mode always wins over the legacy key.
+    assert (
+        OmniAdapterConfig.model_validate({"enabled": False, "mode": "omni"}).mode == "omni"
+    )
+
+
+def test_capability_pins_narrow_omni_mode_but_never_widen_traditional() -> None:
+    omni = OmniAdapterConfig(mode="omni", speech_enabled=False)
+    assert omni.uses_speech is False
+    assert omni.uses_transcription is True
+
+    traditional = OmniAdapterConfig(mode="traditional", speech_enabled=True)
+    assert traditional.uses_speech is False
+
+
+def test_exclusive_mode_reports_open_vocabulary_audio_without_yamnet() -> None:
+    """YAMNet is one of the discrete classifiers the single package replaces."""
+
+    adapter = _client()
+
+    async def describe(wav_audio):
+        return "a kettle whistles, then a cupboard closes"
+
+    adapter.describe_audio = describe
+    client = _omnius(adapter)
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError("exclusive omni mode must not call the YAMNet classifier")
+
+    client._call_audio_classifier = refuse
+    result = asyncio.run(client.analyze_audio_scene(_wav(seconds=2.0)))
+
+    assert result["classifications"] == []
+    assert result["taxonomy"] == "open-vocabulary"
+    assert result["backend"] == "qwen3-omni"
+    assert result["observation"] == "a kettle whistles, then a cupboard closes"
+
+
+# -- video comprehension -------------------------------------------------
+
+
+def _runtime(**adapter_overrides):
+    from egg_companion.runtime import CompanionRuntime
+
+    return CompanionRuntime(
+        EggConfig.model_validate(
+            {
+                "audio": {"input_device": "default", "doa_mode": "disabled"},
+                "omnius": {"model": "t", "voice_model": "t"},
+                "camera_discovery": {"enabled": False},
+                "memory": {"enabled": False},
+                "omni_adapter": adapter_overrides,
+            }
+        )
+    )
+
+
+def _fill_buffer(runtime, camera_id="cam0", frames=14, height=1080, width=1920):
+    rng = np.random.default_rng(0)
+    for index in range(frames):
+        runtime._buffer_video_frame(
+            camera_id,
+            rng.integers(0, 255, (height, width, 3), dtype=np.uint8),
+            index * 0.6,
+        )
+
+
+def test_clip_buffer_is_bounded_decimated_and_downscaled() -> None:
+    """A few seconds of full-resolution frames per camera would not be cheap."""
+
+    runtime = _runtime()
+    _fill_buffer(runtime)
+
+    buffer = runtime._video_buffers["cam0"]
+    # video_buffer_seconds 6.0 * video_fps 2.0
+    assert len(buffer) == 12
+    assert buffer[0][0].shape[:2] == (360, 640)
+
+
+def test_no_clip_is_buffered_in_traditional_mode() -> None:
+    runtime = _runtime(mode="traditional")
+    _fill_buffer(runtime)
+
+    assert runtime._video_buffers == {}
+
+
+def test_a_buffered_clip_encodes_to_an_mp4_with_its_own_evidence() -> None:
+    runtime = _runtime()
+    _fill_buffer(runtime, height=720, width=1280)
+
+    payload, evidence = runtime._encode_recent_clip("cam0")
+
+    assert payload[4:8] == b"ftyp"
+    assert evidence["camera_id"] == "cam0"
+    assert evidence["frames"] == 12
+    assert evidence["width"] == 640 and evidence["height"] % 2 == 0
+
+
+def test_an_empty_buffer_yields_no_clip_rather_than_an_error() -> None:
+    runtime = _runtime()
+
+    assert runtime._encode_recent_clip("cam0") is None
+    assert asyncio.run(runtime.describe_recent_video("cam0")) is None
+
+
+def test_video_comprehension_is_optional_evidence_when_the_adapter_is_down() -> None:
+    runtime = _runtime()
+    _fill_buffer(runtime)
+
+    async def unavailable(*args, **kwargs):
+        raise OmniAdapterUnavailable("adapter is down")
+
+    runtime._omni_adapter.describe_video = unavailable
+
+    assert asyncio.run(runtime.describe_recent_video("cam0")) is None
+
+
+def test_video_comprehension_returns_the_description_with_clip_metadata() -> None:
+    runtime = _runtime()
+    _fill_buffer(runtime)
+    seen: list[dict[str, object]] = []
+
+    async def describe(payload, **kwargs):
+        seen.append({"bytes": len(payload), **kwargs})
+        return {"visual_observation": "A person raises one hand.", "observation": "..."}
+
+    runtime._omni_adapter.describe_video = describe
+    result = asyncio.run(runtime.describe_recent_video("cam0", "what just happened"))
+
+    assert result["visual_observation"] == "A person raises one hand."
+    assert result["clip"]["camera_id"] == "cam0"
+    assert seen[0]["prompt"] == "what just happened"
+
+
+def test_the_video_tool_is_advertised_only_when_it_can_be_executed() -> None:
+    def names(mode: str) -> list[str]:
+        client = OmniusClient(
+            OmniusConfig(model="t", voice_model="t"),
+            OmniAdapterClient(OmniAdapterConfig(mode=mode)),
+        )
+        return [item["function"]["name"] for item in client._realtime_tool_definitions()]
+
+    assert "watch_recent_camera_motion" in names("omni")
+    assert "watch_recent_camera_motion" not in names("traditional")
+
+
+def test_the_video_tool_call_normalizes_into_a_video_marker() -> None:
+    client = OmniusClient(
+        OmniusConfig(model="t", voice_model="t"),
+        OmniAdapterClient(OmniAdapterConfig(mode="omni")),
+    )
+
+    marker = client._finalize_realtime_message(
+        {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "watch_recent_camera_motion",
+                        "arguments": '{"question":"what did they just do","camera_id":"cam0"}',
+                    }
+                }
+            ]
+        },
+        allow_tool_requests=True,
+    )
+
+    call = OmniusClient.parse_realtime_tool_call(marker)
+    assert call is not None
+    assert call["tool"] == "video"
+    assert call["arguments"]["camera_id"] == "cam0"
+    assert call["arguments"]["question"] == "what did they just do"

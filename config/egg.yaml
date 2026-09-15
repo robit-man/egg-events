@@ -164,7 +164,22 @@ omnius:
 # absent, unhealthy, or in its failure cooldown, so enabling this can only add
 # capability. Start it with scripts/bootstrap-omni-adapters.sh.
 omni_adapter:
-  enabled: false
+  # omni      = the single weights package answers everything (default)
+  # traditional = the previous stack: YOLOE/SAM/CLIP vision, the CUDA Whisper
+  #               ASR service, the YAMNet classifier, and Supertonic speech
+  mode: omni
+  # In omni mode, silence every other discrete model rather than leaving it
+  # resident. Image and language understanding come from the logical tag
+  # through Ollama; audio, video, and speech from its sidecar. This also
+  # switches off the capabilities that exist only to consume discrete-model
+  # output (identity galleries, object learning, voxel occupancy, local OCR,
+  # identity dreams) rather than running them against an empty detector.
+  # Set false only on a host with memory for both stacks at once.
+  exclusive: true
+  # The adapter starts with the companion; it is not a sidecar you start by
+  # hand. Switching mode back to `traditional` and restarting restores the
+  # previous stack exactly.
+  autostart: true
   base_url: http://127.0.0.1:8910
   model: robit/ornith-1.5-omni:q4km
   # The same tag on purpose. The logical tag's standard layers *are* the
@@ -192,11 +207,12 @@ omni_adapter:
   # language, and speech.
   max_concurrent_requests: 1
   keep_alive: 30m
-  transcription_enabled: true
-  audio_scene_enabled: true
-  # Qwen3-TTS replaces Supertonic only when this is set; leave it false to
-  # keep the existing voice and use the adapter for perception alone.
-  speech_enabled: false
+  # Per-capability pins. Unset, each follows `mode`; set one to false to keep
+  # that single capability on the traditional path.
+  # transcription_enabled: true
+  # audio_scene_enabled: true
+  # video_enabled: true
+  # speech_enabled: true
   # voice_reference_path: data/voice-reference.wav
   video_fps: 2.0
   video_max_frames: 48

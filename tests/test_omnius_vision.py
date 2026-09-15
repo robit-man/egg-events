@@ -894,7 +894,9 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     assert OmniusClient.parse_realtime_tool_request(marker) == "ocr"
     assert any(
         item["function"]["name"] == "read_current_camera_text"
-        for item in OmniusClient._realtime_tool_definitions()
+        for item in OmniusClient(
+            OmniusConfig(model="test", voice_model="test")
+        )._realtime_tool_definitions()
     )
     assert OmniusClient.parse_realtime_tool_request("[[TOOL:MEMORY]]") == "memory"
     assert OmniusClient.parse_realtime_tool_handoff("[[TOOL:MEMORY|my keys]]") == (
@@ -908,7 +910,9 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     }
     assert any(
         item["function"]["name"] == "recall_object_memory"
-        for item in OmniusClient._realtime_tool_definitions()
+        for item in OmniusClient(
+            OmniusConfig(model="test", voice_model="test")
+        )._realtime_tool_definitions()
     )
     timed_memory_marker = OmniusClient._realtime_tool_marker(
         "memory",
@@ -928,7 +932,9 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     }
     recall_schema = next(
         item["function"]
-        for item in OmniusClient._realtime_tool_definitions()
+        for item in OmniusClient(
+            OmniusConfig(model="test", voice_model="test")
+        )._realtime_tool_definitions()
         if item["function"]["name"] == "recall_object_memory"
     )
     assert {"since", "until"} <= set(recall_schema["parameters"]["properties"])
@@ -952,7 +958,9 @@ def test_realtime_tool_signals_are_exact_and_semantic_only() -> None:
     }
     assert any(
         item["function"]["name"] == "read_past_camera_text"
-        for item in OmniusClient._realtime_tool_definitions()
+        for item in OmniusClient(
+            OmniusConfig(model="test", voice_model="test")
+        )._realtime_tool_definitions()
     )
 
 

@@ -67,6 +67,11 @@ class CameraDiscoveryConfig(BaseModel):
 
 
 class VisionConfig(BaseModel):
+    # The local discrete-model perception stack: YOLOE detection/segmentation,
+    # YOLO pose, SAM, CLIP, and the ONNX face detector/recognizer. Omni mode
+    # switches this off wholesale -- see OmniAdapterConfig.exclusive -- because
+    # the point of the single weights package is that none of these load.
+    enabled: bool = True
     detector_model: str = "models/yoloe-11s-seg-pf.pt"
     pose_model: str = "models/yolo11n-pose.pt"
     clip_model: str = "ViT-B-32"
@@ -221,7 +226,22 @@ class OmniAdapterConfig(BaseModel):
     enabling this never removes a capability Egg already had.
     """
 
-    enabled: bool = False
+    # The one switch. `omni` routes perception and speech through the all-in-one
+    # package; `traditional` keeps the Omnius ASR service, the YAMNet
+    # classifier, and Supertonic TTS. Individual capabilities below can still
+    # be pinned, but the mode is what an operator is expected to change.
+    mode: Literal["omni", "traditional"] = "omni"
+    # The whole point of omni mode: one weights package answers everything, so
+    # every other discrete model is silenced rather than left resident. That
+    # means no YOLOE/SAM/CLIP/pose/face ONNX stack, no separate Whisper ASR, no
+    # Supertonic voice, and no YAMNet classifier -- image and video
+    # understanding come from the logical tag, audio and speech from its
+    # sidecar. On a 32 GB module this is not only cleaner, it is the only way
+    # the comprehension component fits at all.
+    #
+    # Set false to run the adapter *beside* the existing stack, which needs a
+    # host with memory for both.
+    exclusive: bool = True
     base_url: HttpUrl = "http://127.0.0.1:8910"
     # The logical Omni tag. Its comprehension and TTS components live in the
     # tag's custom sidecar layer, and its *standard* layers are the Ornith
@@ -262,10 +282,28 @@ class OmniAdapterConfig(BaseModel):
     max_concurrent_requests: int = Field(default=1, ge=1, le=4)
     keep_alive: str = "30m"
 
-    # Capability routing. Each falls back to the existing path when disabled.
-    transcription_enabled: bool = True
-    audio_scene_enabled: bool = True
-    speech_enabled: bool = False
+    # Start the adapter service alongside the companion, so `omni` mode is
+    # self-contained rather than depending on an operator having started a
+    # second unit by hand.
+    autostart: bool = True
+    autostart_unit: str = "egg-omni-adapters.service"
+    autostart_timeout_seconds: float = Field(default=900, ge=0, le=3600)
+    # Separate model services that exclusive omni mode makes redundant. The
+    # CUDA Whisper container holds its own ASR weights on the same unified
+    # memory the comprehension component needs, and omni mode transcribes from
+    # the single package instead.
+    silence_units: list[str] = Field(
+        default_factory=lambda: ["egg-whisper.service"]
+    )
+
+    # Per-capability pins. None follows `mode`; True/False override it, which is
+    # how a host runs (say) Qwen3-TTS speech while leaving comprehension on the
+    # traditional path. Each capability independently falls back to the Omnius
+    # path whenever the adapter cannot answer.
+    transcription_enabled: bool | None = None
+    audio_scene_enabled: bool | None = None
+    video_enabled: bool | None = None
+    speech_enabled: bool | None = None
 
     # Qwen3-TTS voice selection. `voice_reference_path` is a local WAV used as
     # a request-local speaker embedding for cloning.
@@ -274,10 +312,56 @@ class OmniAdapterConfig(BaseModel):
     voice_style: str | None = None
     voice_reference_path: str | None = None
 
-    # Video sampling bounds for describe_video.
+    # Video sampling bounds for describe_video, and the rolling per-camera clip
+    # buffer the `video` tool draws from. Frames are downscaled before
+    # buffering: a few seconds of full-resolution frames per camera would cost
+    # more memory than the comprehension it feeds.
     video_fps: float = Field(default=2.0, gt=0, le=30)
     video_max_frames: int = Field(default=48, ge=1, le=1024)
     video_include_audio: bool = True
+    video_buffer_seconds: float = Field(default=6.0, gt=0, le=30)
+    video_buffer_max_width: int = Field(default=640, ge=160, le=1920)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_enabled_flag(cls, data: object) -> object:
+        """Map a pre-`mode` `enabled:` boolean onto the mode switch.
+
+        `enabled` is now derived from `mode`. Pydantic would otherwise ignore
+        the stale key and silently turn omni on for a deployment that had
+        explicitly turned the adapter off, which is the one migration outcome
+        nobody wants.
+        """
+
+        if isinstance(data, dict) and "enabled" in data:
+            data = dict(data)
+            legacy = data.pop("enabled")
+            if isinstance(legacy, bool):
+                data.setdefault("mode", "omni" if legacy else "traditional")
+        return data
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode == "omni"
+
+    def _capability(self, pinned: bool | None) -> bool:
+        return self.enabled if pinned is None else (pinned and self.enabled)
+
+    @property
+    def uses_transcription(self) -> bool:
+        return self._capability(self.transcription_enabled)
+
+    @property
+    def uses_audio_scene(self) -> bool:
+        return self._capability(self.audio_scene_enabled)
+
+    @property
+    def uses_video(self) -> bool:
+        return self._capability(self.video_enabled)
+
+    @property
+    def uses_speech(self) -> bool:
+        return self._capability(self.speech_enabled)
 
 
 class SystemServiceConfig(BaseModel):
@@ -707,6 +791,48 @@ class EggConfig(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("camera ids must be unique")
         return cameras
+
+    @model_validator(mode="after")
+    def silence_discrete_models_in_omni_mode(self) -> EggConfig:
+        """In exclusive omni mode, load nothing but the single weights package.
+
+        Egg's traditional stack keeps six independent model families resident
+        -- YOLOE, SAM, CLIP, YOLO pose, ONNX face detection/recognition, and
+        the identity-dream embedders -- plus a separate Whisper ASR service and
+        the Supertonic voice. Omni mode replaces all of them with one logical
+        Ollama tag: its standard layers answer language and image
+        understanding, its sidecar answers audio, video, and speech.
+
+        Leaving the discrete models loaded would defeat the purpose and, on a
+        32 GB module, leave no room for the 18.5 GiB comprehension component.
+        The capabilities that exist only as consumers of discrete-model output
+        -- identity galleries, object learning, voxel occupancy, local OCR,
+        identity dreams -- are switched off with it rather than left running
+        against an empty detector.
+        """
+
+        if not (self.omni_adapter.enabled and self.omni_adapter.exclusive):
+            return self
+        silenced: list[str] = []
+        for section, reason in (
+            ("vision", "YOLOE/SAM/CLIP/pose/face ONNX"),
+            ("identity", "face-gallery identity (needs the discrete face stack)"),
+            ("object_learning", "object library (needs discrete detections)"),
+            ("occupancy", "voxel occupancy (needs the depth subprocess)"),
+            ("dreams", "identity dreams (separate embedding models)"),
+            ("ocr", "local OCR models"),
+        ):
+            current = getattr(self, section)
+            if getattr(current, "enabled", False):
+                silenced.append(f"{section} ({reason})")
+                object.__setattr__(self, section, current.model_copy(update={"enabled": False}))
+        if silenced:
+            logger.info(
+                "omni_adapter.exclusive: the single weights package answers everything; "
+                "silenced %s",
+                "; ".join(silenced),
+            )
+        return self
 
     @model_validator(mode="after")
     def share_one_ollama_slot(self) -> EggConfig:

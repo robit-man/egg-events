@@ -621,6 +621,7 @@ class OmniusClient:
             arguments = decoded.get("arguments", {})
             if tool not in {
                 "vision",
+                "video",
                 "ocr",
                 "web_search",
                 "shell",
@@ -2063,9 +2064,33 @@ class OmniusClient:
             raise ValueError("audio comprehension requires a valid WAV payload")
         # Qwen3-Omni describes the scene in language -- ambience, activity,
         # temporal change, uncertainty -- which a fixed 521-class taxonomy
-        # cannot express. It is additive evidence alongside the classifier's
-        # numbers, never a replacement for them.
+        # cannot express.
         observation = await self._describe_audio_scene_via_omni(wav_audio)
+        if self._omni is not None and self._omni.config.exclusive and self._omni.enabled:
+            # Exclusive omni mode runs no second model: YAMNet is one of the
+            # discrete classifiers the single weights package replaces. Without
+            # its 521-class scores there are no numeric classifications, so the
+            # caller's confidence gate admits nothing and the description is the
+            # whole of the evidence -- which is the intended trade, not a
+            # silently degraded classifier result.
+            if observation is None:
+                raise RuntimeError(
+                    "omni audio comprehension returned no acoustic observation"
+                )
+            return {
+                "classifications": [],
+                "total_classes": 0,
+                "duration_seconds": acoustic.get("duration"),
+                "acoustic": acoustic,
+                "model": self._omni.config.model,
+                "backend": "qwen3-omni",
+                "taxonomy": "open-vocabulary",
+                "semantic_quality": "grounded comprehension",
+                "mock_evidence_discarded": True,
+                "observation": observation,
+                "observation_model": self._omni.config.model,
+                "observation_backend": "qwen3-omni",
+            }
         temporary_path = ""
         try:
             with tempfile.NamedTemporaryFile(
@@ -2123,7 +2148,7 @@ class OmniusClient:
         touching the classifier evidence the caller actually gates on.
         """
 
-        if self._omni is None or not self._omni.config.audio_scene_enabled:
+        if self._omni is None or not self._omni.config.uses_audio_scene:
             return None
         try:
             return await self._omni.describe_audio(wav_audio)
@@ -2301,7 +2326,7 @@ class OmniusClient:
                 "rejection_reason": acoustic_rejection,
             }
             return None
-        if self._omni is not None and self._omni.config.transcription_enabled:
+        if self._omni is not None and self._omni.config.uses_transcription:
             try:
                 return await self._transcribe_via_omni(wav_audio, evidence)
             except OmniAdapterUnavailable as error:
@@ -4292,7 +4317,7 @@ class OmniusClient:
         return {"consistent": consistent, "confidence": float(confidence), "reason": reason.strip()}
 
     async def synthesize(self, text: str) -> bytes:
-        if self._omni is not None and self._omni.config.speech_enabled:
+        if self._omni is not None and self._omni.config.uses_speech:
             try:
                 return await self._omni.synthesize(text)
             except OmniAdapterUnavailable as error:
@@ -4418,11 +4443,10 @@ class OmniusClient:
     def system_prompt(self) -> str:
         return self._system_prompt
 
-    @staticmethod
-    def _realtime_tool_definitions() -> list[dict[str, object]]:
+    def _realtime_tool_definitions(self) -> list[dict[str, object]]:
         """Return native function schemas; the model selects, Egg executes."""
 
-        return [
+        definitions: list[dict[str, object]] = [
             {
                 "type": "function",
                 "function": {
@@ -4617,6 +4641,46 @@ class OmniusClient:
                 },
             },
         ]
+        if self._omni is not None and self._omni.config.uses_video:
+            # Only offered when the Omni comprehension layer is actually
+            # answering: a still frame cannot say what just happened, and
+            # advertising a capability Egg cannot execute invites the model to
+            # request it and then be told it is unavailable.
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "watch_recent_camera_motion",
+                        "description": (
+                            "Watch the last few seconds of camera motion when the answer "
+                            "depends on what just happened rather than what is visible "
+                            "now -- a movement, a gesture, an action, or an order of "
+                            "events. Prefer inspect_current_camera for a still scene."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": (
+                                        "What happened over the recent window that needs "
+                                        "answering."
+                                    ),
+                                },
+                                "camera_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Exact camera ID from current context; omit to use "
+                                        "whichever view has a clip buffered."
+                                    ),
+                                },
+                            },
+                            "required": ["question"],
+                        },
+                    },
+                }
+            )
+        return definitions
 
     async def _realtime_chat(
         self,
@@ -4782,6 +4846,19 @@ class OmniusClient:
                             if isinstance(item, str) and item.strip()
                         ]
                 return self._realtime_tool_marker("ocr", normalized_arguments)
+            if name == "watch_recent_camera_motion":
+                question = arguments.get("question")
+                video_arguments: dict[str, object] = {
+                    "question": (
+                        " ".join(question.split())[:300]
+                        if isinstance(question, str) and question.strip()
+                        else "Describe what just happened in the recent camera motion."
+                    )
+                }
+                camera_id = arguments.get("camera_id")
+                if isinstance(camera_id, str) and camera_id.strip():
+                    video_arguments["camera_id"] = " ".join(camera_id.split())[:120]
+                return self._realtime_tool_marker("video", video_arguments)
             if name == "search_current_web":
                 query = arguments.get("query")
                 normalized = (

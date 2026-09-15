@@ -759,6 +759,9 @@ def test_realtime_model_intent_signal_routes_memory_recall_back_into_reply(tmp_p
 def test_realtime_model_intent_signal_routes_past_ocr_back_into_reply(tmp_path) -> None:
     async def scenario() -> None:
         payload = _runtime_config().model_dump()
+        # OCR is a discrete-model capability; omni mode silences it.
+        payload["omni_adapter"]["mode"] = "traditional"
+        payload["ocr"]["enabled"] = True
         payload["memory"].update(
             {
                 "enabled": True,
@@ -842,6 +845,9 @@ def test_realtime_model_intent_signal_routes_past_ocr_back_into_reply(tmp_path) 
 def test_realtime_model_intent_signal_routes_past_ocr_no_evidence_status(tmp_path) -> None:
     async def scenario() -> None:
         payload = _runtime_config().model_dump()
+        # OCR is a discrete-model capability; omni mode silences it.
+        payload["omni_adapter"]["mode"] = "traditional"
+        payload["ocr"]["enabled"] = True
         payload["memory"].update(
             {
                 "enabled": True,

@@ -106,15 +106,41 @@ Every admitted utterance now supplies a durable context ID to its audio evidence
 
 ## Qwen Omni adapter
 
-Egg can route its perceptual stages through the [Qwen Omni
-adapter](https://github.com/robit-man/qwen-omni-adapters), a separately
-supervised runtime that fronts one logical Ollama tag —
-`robit/ornith-1.5-omni:q4km` — with Qwen3-Omni comprehension and Qwen3-TTS
-speech. It is off by default (`omni_adapter.enabled`), and every route through
-it falls back to the existing Omnius path, so enabling it can only add
-capability.
+Egg runs in one of two perception modes, set by `omni_adapter.mode`:
 
-What the adapter answers better than the current path:
+| | `omni` (default) | `traditional` |
+|---|---|---|
+| Image + language | `robit/ornith-1.5-omni:q4km` through Ollama | same tag, plus YOLOE/SAM/CLIP/pose/face ONNX |
+| Detection, segmentation, embeddings | — | YOLOE, SAM, CLIP, YOLO pose, SFace/YuNet |
+| ASR | Qwen3-Omni comprehension | CUDA Whisper service on `:11436` |
+| Environmental audio | Qwen3-Omni, open vocabulary | YAMNet, 521-class AudioSet |
+| Video | Qwen3-Omni, bounded clip | — |
+| Speech | Qwen3-TTS, 24 kHz | Supertonic |
+| Depth / occupancy / OCR / identity dreams | — | separate models |
+
+**Omni mode is the point of the single weights package: nothing else loads.**
+With `omni_adapter.exclusive` (default true), Egg silences the whole discrete
+stack rather than leaving it resident — no YOLOE, SAM, CLIP, pose, or face
+ONNX, no separate Whisper container, no YAMNet, no Supertonic. The
+capabilities that exist only to consume discrete-model output (identity
+galleries, object learning, voxel occupancy, local OCR, identity dreams) are
+switched off with it rather than left running against an empty detector. On a
+32 GB module this is not just cleaner — it is the only way the 18.5 GiB
+comprehension component fits at all.
+
+Switching back is one line (`mode: traditional`) plus a restart; the
+traditional stack returns exactly as it was, because omni mode *stops*
+services rather than disabling them. Individual capabilities can also be
+pinned (`speech_enabled: false` keeps Supertonic while comprehension stays on
+omni), and every route independently falls back to the Omnius path when the
+adapter cannot answer.
+
+The adapter starts **with the companion** — `_maintain_omni_adapter` brings up
+`egg-omni-adapters.service` and keeps it up, and `egg-companion.service`
+declares `Wants=`/`After=` on it — so it is part of Egg, not a sidecar you
+start by hand.
+
+What the adapter answers better than the traditional path:
 
 - **Speech versus sound, separated at the model boundary.** One comprehension
   pass returns `<speech_transcript>` and `<audio_observation>` as distinct
@@ -128,8 +154,14 @@ What the adapter answers better than the current path:
   activity, timing, and uncertainty. The YAMNet classifier still supplies the
   numeric AudioSet scores Egg gates `sound_event` entities on; the description
   is additive evidence under `observation`, not a replacement.
-- **Bounded video understanding**, with frame sampling and optional use of the
-  clip's own audio track.
+- **Bounded video understanding.** Egg keeps a rolling, downscaled per-camera
+  clip (`video_buffer_seconds` × `video_fps`, capped at
+  `video_buffer_max_width`) — the only place in the runtime that retains motion
+  over time. The realtime model can call `watch_recent_camera_motion` when the
+  answer depends on what just *happened* rather than what is visible now; the
+  clip is encoded to MP4 and answered by the comprehension layer, with its
+  camera ID, frame count, fps, and span carried alongside as authoritative
+  metadata. The tool is advertised only when it can actually be executed.
 - **Qwen3-TTS speech** at 24 kHz, including a request-local voice reference for
   cloning (`voice_reference_path`).
 
@@ -164,8 +196,11 @@ rather than fails.
 
 ```bash
 scripts/bootstrap-omni-adapters.sh     # clone, build, pull, install the service
-# then set omni_adapter.enabled: true in config/egg.yaml and restart
 ```
+
+`scripts/bootstrap-jetson.sh` runs it automatically whenever
+`omni_adapter.mode` is `omni`, so a normal provision brings the adapter with
+it.
 
 The script pulls `robit/ornith-1.5-omni:q4km` (34 GB: a 6.1 GiB Ornith 1.5 9B
 base, an 18.5 GiB Qwen3-Omni-30B-A3B comprehension component, and a 1.4 GiB

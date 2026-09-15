@@ -49,8 +49,12 @@ ensure_companion_service() {
   cat > "$unit_dir/egg-companion.service" <<EOF
 [Unit]
 Description=Egg embodied companion runtime and dashboard
-After=network-online.target omnius-daemon.service egg-whisper.service pulseaudio.service sound.target
-Wants=network-online.target omnius-daemon.service egg-whisper.service pulseaudio.service
+After=network-online.target omnius-daemon.service egg-whisper.service egg-omni-adapters.service pulseaudio.service sound.target
+# The Qwen Omni adapter starts with the companion rather than being a sidecar
+# an operator starts by hand. Wants, not Requires: omni mode degrades to the
+# traditional stack if the adapter cannot start, and traditional mode ignores
+# the unit entirely.
+Wants=network-online.target omnius-daemon.service egg-whisper.service egg-omni-adapters.service pulseaudio.service
 
 [Service]
 Type=simple
@@ -160,7 +164,7 @@ ensure_ollama_models() {
   done
 }
 
-omni_adapter_enabled() {
+omni_mode_selected() {
   "$venv_python" - "$workspace_dir/config/egg.yaml" <<'EGG_OMNI_PY'
 import sys
 
@@ -172,17 +176,22 @@ try:
 except OSError:
     raise SystemExit(1)
 adapter = config.get("omni_adapter") or {}
-raise SystemExit(0 if adapter.get("enabled") else 1)
+# `mode` is the switch; a pre-`mode` `enabled:` boolean still selects it.
+mode = adapter.get("mode")
+if mode is None:
+    legacy = adapter.get("enabled")
+    mode = "omni" if legacy is None or legacy else "traditional"
+raise SystemExit(0 if mode == "omni" else 1)
 EGG_OMNI_PY
 }
 
 ensure_omni_adapter() {
-  # The Qwen Omni adapter is a separate supervised runtime and a multi-gigabyte
-  # model pull, so it is provisioned only for a deployment that has actually
-  # enabled it. scripts/bootstrap-omni-adapters.sh installs it on demand.
-  if ! omni_adapter_enabled; then
-    echo "omni_adapter is disabled in config/egg.yaml; skipping the Qwen Omni adapter."
-    echo "Enable it with: scripts/bootstrap-omni-adapters.sh"
+  # In omni mode the adapter is not optional: it owns ASR, environmental audio,
+  # video comprehension, and speech, so the companion cannot perceive without
+  # it. Provision it here so the unit exists before egg-companion wants it.
+  if ! omni_mode_selected; then
+    echo "omni_adapter.mode is 'traditional'; keeping the discrete-model stack."
+    echo "Switch with: mode: omni in config/egg.yaml"
     return 0
   fi
   "$workspace_dir/scripts/bootstrap-omni-adapters.sh"
