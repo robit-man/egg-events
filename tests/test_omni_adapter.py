@@ -180,7 +180,12 @@ def test_sound_only_audio_yields_no_transcript() -> None:
 def test_synthesis_requests_speech_and_returns_a_wav() -> None:
     import base64
 
-    client = _client(speech_enabled=True, voice="F4", voice_language="en")
+    client = _client(
+        speech_enabled=True,
+        voice="F4",
+        voice_language="en",
+        voice_profile_path="/nonexistent/voice-profile.json",
+    )
     sent: list[dict[str, object]] = []
     wav = _wav(sample_rate=24000)
 
@@ -666,3 +671,220 @@ def test_the_video_tool_call_normalizes_into_a_video_marker() -> None:
     assert call["tool"] == "video"
     assert call["arguments"]["camera_id"] == "cam0"
     assert call["arguments"]["question"] == "what did they just do"
+
+
+# -- voice presets carried over from the adapter's own profile -----------
+
+
+def _profile(tmp_path) -> str:
+    import json as _json
+
+    voices = tmp_path / "voices"
+    voices.mkdir()
+    # Distinguishable references, so selecting a preset is actually observable.
+    (voices / "female_voice.wav").write_bytes(_wav(seconds=0.25))
+    (voices / "default_voice.wav").write_bytes(_wav(seconds=0.5))
+    profile = tmp_path / "voice-profile.json"
+    profile.write_text(
+        _json.dumps(
+            {
+                "schema": "robit.omni.voice-profile.v1",
+                "language": "en",
+                "presets": [
+                    {"id": "female", "speaker_file": "voices/female_voice.wav", "default": True},
+                    {"id": "male", "speaker_file": "voices/default_voice.wav"},
+                ],
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.9,
+                "seed": 42,
+                "max_frames": 512,
+            }
+        )
+    )
+    return str(profile)
+
+
+def test_the_profile_default_preset_is_the_voice_egg_speaks_with(tmp_path) -> None:
+    client = _client(voice_profile_path=_profile(tmp_path))
+
+    speech = client._speech_settings()
+
+    assert speech["voice"] == "female"
+    assert speech["language"] == "en"
+    assert speech["temperature"] == 0.7
+    assert speech["seed"] == 42
+    assert speech["max_frames"] == 512
+    assert speech["speaker_audio"]
+
+
+def test_a_named_preset_selects_its_own_reference(tmp_path) -> None:
+    path = _profile(tmp_path)
+    female = _client(voice_profile_path=path, voice_preset="female")._speech_settings()
+    male = _client(voice_profile_path=path, voice_preset="male")._speech_settings()
+
+    assert male["voice"] == "male"
+    assert male["speaker_audio"] != female["speaker_audio"]
+
+
+def test_an_unknown_preset_falls_back_to_the_profile_default(tmp_path) -> None:
+    client = _client(voice_profile_path=_profile(tmp_path), voice_preset="nonexistent")
+
+    assert client._speech_settings()["voice"] == "female"
+
+
+def test_config_overrides_win_over_the_profile(tmp_path) -> None:
+    client = _client(
+        voice_profile_path=_profile(tmp_path), voice_temperature=0.1, voice_seed=7
+    )
+
+    speech = client._speech_settings()
+    assert speech["temperature"] == 0.1
+    assert speech["seed"] == 7
+    # Untouched values still come from the profile.
+    assert speech["top_k"] == 40
+
+
+def test_a_missing_profile_degrades_to_backend_defaults() -> None:
+    client = _client(voice_profile_path="/nonexistent/voice-profile.json")
+
+    assert client._speech_settings() == {}
+
+
+# -- streamed speech -----------------------------------------------------
+
+
+def _ndjson_chunks(events: list[dict[str, object]]) -> list[bytes]:
+    import json as _json
+
+    return [(_json.dumps(event) + "\n").encode() for event in events]
+
+
+def _audio_delta(sequence: int, pcm: bytes) -> dict[str, object]:
+    import base64 as _b64
+
+    return {
+        "type": "audio_delta",
+        "audio": {
+            "sequence": sequence,
+            "block": 0,
+            "blocks": 1,
+            "encoding": "base64",
+            "data": _b64.b64encode(pcm).decode(),
+        },
+    }
+
+
+class _FakeStream:
+    """Minimal stand-in for aiohttp's streamed response body."""
+
+    def __init__(self, lines: list[bytes], status: int = 200) -> None:
+        self.status = status
+        self.content = self
+        self._lines = lines
+
+    def __aiter__(self):
+        async def iterator():
+            for line in self._lines:
+                yield line
+
+        return iterator()
+
+    async def text(self) -> str:
+        return ""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args) -> None:
+        return None
+
+
+def test_streamed_speech_yields_pcm_windows_in_order(monkeypatch) -> None:
+    import egg_companion.adapters.omni as module
+
+    client = _client()
+    lines = _ndjson_chunks(
+        [
+            {"type": "stage", "stage": "tts", "blocks": 1},
+            _audio_delta(0, b"\x01\x00" * 40),
+            _audio_delta(1, b"\x02\x00" * 40),
+            {"type": "audio_end", "samples": 80},
+            {"type": "final", "response": {}},
+        ]
+    )
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            return _FakeStream(lines)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _Session())
+
+    async def collect() -> list[bytes]:
+        return [chunk async for chunk in client.stream_speech("hello")]
+
+    chunks = asyncio.run(collect())
+
+    assert chunks == [b"\x01\x00" * 40, b"\x02\x00" * 40]
+    wav = OmniAdapterClient.pcm_to_wav(b"".join(chunks))
+    with wave.open(io.BytesIO(wav), "rb") as source:
+        assert source.getframerate() == 24000
+        assert source.getnchannels() == 1
+
+
+def test_a_lost_pcm_window_fails_loudly_rather_than_concatenating(monkeypatch) -> None:
+    """A gap means audio was lost; joining across it yields a subtly wrong utterance."""
+
+    import egg_companion.adapters.omni as module
+
+    client = _client()
+    lines = _ndjson_chunks([_audio_delta(0, b"\x01\x00" * 8), _audio_delta(2, b"\x02\x00" * 8)])
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            return _FakeStream(lines)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _Session())
+
+    async def collect() -> list[bytes]:
+        return [chunk async for chunk in client.stream_speech("hello")]
+
+    with pytest.raises(OmniAdapterError, match="lost a window"):
+        asyncio.run(collect())
+
+
+def test_a_stream_error_event_surfaces_as_an_adapter_error(monkeypatch) -> None:
+    import egg_companion.adapters.omni as module
+
+    client = _client()
+    lines = _ndjson_chunks([{"type": "error", "error": "tts worker died"}])
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            return _FakeStream(lines)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _Session())
+
+    async def collect() -> list[bytes]:
+        return [chunk async for chunk in client.stream_speech("hello")]
+
+    with pytest.raises(OmniAdapterError, match="tts worker died"):
+        asyncio.run(collect())

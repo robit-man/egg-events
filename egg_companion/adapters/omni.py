@@ -33,11 +33,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import re
 import time
 import wave
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -158,6 +160,7 @@ class OmniAdapterClient:
         self._cooldown_until = 0.0
         self._last_error: str | None = None
         self._contract: dict[str, Any] | None = None
+        self._voice_profile_cache: tuple[dict[str, Any], Path] | dict[str, Any] | None = None
         # The adapter admits a bounded number of concurrent GPU lanes and Egg
         # shares its GPU with vision, ASR, and the language model. One in-flight
         # comprehension request at a time keeps an environmental-audio job from
@@ -487,27 +490,216 @@ class OmniAdapterClient:
 
     # -- speech ----------------------------------------------------------
 
-    def _speech_settings(self) -> dict[str, Any]:
-        speech: dict[str, Any] = {}
-        if self.config.voice:
-            speech["voice"] = self.config.voice
-        if self.config.voice_language:
-            speech["language"] = self.config.voice_language
-        if self.config.voice_style:
-            speech["style"] = self.config.voice_style
-        reference = self.config.voice_reference_path
-        if reference:
-            path = Path(reference).expanduser()
+    def _voice_profile(self) -> tuple[dict[str, Any], Path] | None:
+        """Load the adapter's own voice profile, so Egg speaks its presets.
+
+        The adapter checkout ships the same ``voice-profile.json`` the portal
+        uses. Reading it here is what makes Egg's default voice the project's
+        Female preset rather than whatever the backend happens to pick.
+        """
+
+        if self._voice_profile_cache is not None:
+            return self._voice_profile_cache or None
+        path = Path(self.config.voice_profile_path).expanduser()
+        try:
+            profile = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            logger.info("voice profile is unavailable (%s); using backend defaults", error)
+            self._voice_profile_cache = {}
+            return None
+        if not isinstance(profile, dict):
+            self._voice_profile_cache = {}
+            return None
+        self._voice_profile_cache = (profile, path.parent)
+        return self._voice_profile_cache
+
+    def _selected_preset(
+        self, profile: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        presets = profile.get("presets")
+        if not isinstance(presets, list):
+            return None
+        candidates = [item for item in presets if isinstance(item, dict)]
+        requested = self.config.voice_preset
+        if requested:
+            for preset in candidates:
+                if str(preset.get("id") or "").casefold() == requested.casefold():
+                    return preset
+            logger.warning(
+                "voice preset %r is not in %s; using the profile default",
+                requested,
+                self.config.voice_profile_path,
+            )
+        for preset in candidates:
+            if preset.get("default"):
+                return preset
+        return candidates[0] if candidates else None
+
+    def _speaker_reference(self) -> bytes | None:
+        """Return the speaker WAV to clone, preferring an explicit override."""
+
+        override = self.config.voice_reference_path
+        if override:
+            path = Path(override).expanduser()
             try:
-                raw = path.read_bytes()
+                return path.read_bytes()
             except OSError as error:
                 raise OmniAdapterError(
                     f"voice reference is unreadable: {path}: {error}"
                 ) from error
+        loaded = self._voice_profile()
+        if loaded is None:
+            return None
+        profile, root = loaded
+        preset = self._selected_preset(profile)
+        speaker_file = (preset or {}).get("speaker_file") or profile.get("speaker_file")
+        if not isinstance(speaker_file, str) or not speaker_file:
+            return None
+        path = (root / speaker_file).expanduser()
+        try:
+            return path.read_bytes()
+        except OSError as error:
+            logger.warning("voice preset reference is unreadable: %s: %s", path, error)
+            return None
+
+    def _speech_settings(self) -> dict[str, Any]:
+        speech: dict[str, Any] = {}
+        loaded = self._voice_profile()
+        profile = loaded[0] if loaded else {}
+        preset = self._selected_preset(profile) if profile else None
+        # Profile values first, explicit config second: the profile carries the
+        # project's tuned sampling, config exists to deviate from it.
+        for key, profile_key, override in (
+            ("language", "language", self.config.voice_language),
+            ("temperature", "temperature", self.config.voice_temperature),
+            ("top_k", "top_k", self.config.voice_top_k),
+            ("top_p", "top_p", self.config.voice_top_p),
+            ("seed", "seed", self.config.voice_seed),
+            ("max_frames", "max_frames", self.config.voice_max_frames),
+        ):
+            value = override if override is not None else profile.get(profile_key)
+            if value is not None:
+                speech[key] = value
+        voice = self.config.voice or (preset or {}).get("id")
+        if voice:
+            speech["voice"] = voice
+        if self.config.voice_style:
+            speech["style"] = self.config.voice_style
+        reference = self._speaker_reference()
+        if reference:
             speech["speaker_audio"] = base64.b64encode(
-                normalize_input_wav(raw)
+                normalize_input_wav(reference)
             ).decode("ascii")
         return speech
+
+    async def stream_speech(self, text: str) -> AsyncIterator[bytes]:
+        """Yield Qwen3-TTS decoder PCM windows as they are produced.
+
+        This is the portal's NDJSON extension (`/api/chat/stream`), not the
+        portable v1 route. It exists for one reason: the backend emits about
+        160 ms of PCM per decoder window, so playback can start on the first
+        window instead of after the whole utterance has been generated.
+
+        Chunks are 24 kHz mono PCM16 with no WAV header, in order. The stream's
+        sequence numbers are continuous across blocks and are checked here: a
+        gap means audio was lost, and silently concatenating across it would
+        produce a subtly wrong utterance rather than an obvious failure.
+        """
+
+        spoken = text.strip()
+        if not spoken:
+            raise OmniAdapterError("synthesis requires non-empty text")
+        payload = self._request(
+            task="synthesize",
+            messages=[{"role": "user", "content": spoken}],
+            response_modalities=["text", "audio"],
+            speech_mode="always",
+            speech=self._speech_settings(),
+        )
+        payload["stream"] = True
+        await self._ensure_available()
+        timeout = aiohttp.ClientTimeout(
+            total=self.config.speech_timeout_seconds,
+            sock_read=self.config.speech_timeout_seconds,
+        )
+        expected = 0
+        produced = False
+        try:
+            async with self._gate:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{self._base_url()}/api/chat/stream",
+                        json=payload,
+                        headers=self._headers(),
+                    ) as response:
+                        if response.status >= 400:
+                            detail = (await response.text())[:500]
+                            raise OmniAdapterError(
+                                f"Omni adapter stream HTTP {response.status}: {detail}"
+                            )
+                        async for raw in response.content:
+                            line = raw.strip()
+                            if not line:
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except ValueError as error:
+                                raise OmniAdapterError(
+                                    "Omni adapter stream returned invalid NDJSON"
+                                ) from error
+                            if not isinstance(event, dict):
+                                continue
+                            kind = event.get("type")
+                            if kind == "error":
+                                raise OmniAdapterError(
+                                    f"Omni adapter stream failed: {event.get('error')}"
+                                )
+                            if kind != "audio_delta":
+                                continue
+                            audio = event.get("audio")
+                            if not isinstance(audio, dict) or not audio.get("data"):
+                                continue
+                            sequence = audio.get("sequence")
+                            if isinstance(sequence, int) and sequence != expected:
+                                raise OmniAdapterError(
+                                    "Omni adapter PCM stream lost a window: expected "
+                                    f"sequence {expected}, received {sequence}"
+                                )
+                            expected += 1
+                            try:
+                                chunk = base64.b64decode(str(audio["data"]), validate=True)
+                            except (ValueError, TypeError) as error:
+                                raise OmniAdapterError(
+                                    "Omni adapter PCM window is not valid base64"
+                                ) from error
+                            if len(chunk) % 2:
+                                raise OmniAdapterError(
+                                    "Omni adapter PCM window ended on a partial sample"
+                                )
+                            if chunk:
+                                produced = True
+                                yield chunk
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            self._note_failure(error)
+            raise OmniAdapterUnavailable(
+                f"Omni adapter speech stream failed: {self._last_error}"
+            ) from error
+        if not produced:
+            raise OmniAdapterError("Omni adapter stream returned no audio")
+
+    @staticmethod
+    def pcm_to_wav(pcm: bytes, sample_rate: int = OUTPUT_SAMPLE_RATE_HZ) -> bytes:
+        """Wrap streamed PCM windows in the WAV container callers expect."""
+
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(sample_rate)
+            target.writeframes(pcm)
+        return output.getvalue()
 
     async def synthesize(self, text: str) -> bytes:
         """Synthesize ``text`` with Qwen3-TTS and return a 24 kHz mono WAV."""

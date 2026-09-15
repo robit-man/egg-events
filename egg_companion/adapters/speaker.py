@@ -4,11 +4,11 @@ import asyncio
 import io
 import time
 import wave
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
 from egg_companion.config import AudioConfig
-
 
 PlaybackOutcome = Literal["completed", "interrupted"]
 
@@ -184,6 +184,140 @@ class Speaker:
                 self._active = None
             if active.settled is not None:
                 active.settled.set()
+
+    async def play_pcm_stream(
+        self,
+        chunks: AsyncIterator[bytes],
+        *,
+        playback_id: str,
+        sample_rate: int = 24000,
+    ) -> PlaybackResult:
+        """Play decoder PCM windows as they arrive, not after the last one.
+
+        The streaming TTS backend emits roughly 160 ms of PCM per window, so
+        starting playback on the first window is the difference between speech
+        beginning in a few hundred milliseconds and beginning after a whole
+        generation.
+
+        Interruption and tail-resume keep working: every window is also
+        accumulated, so an interrupted stream still leaves a complete WAV of
+        everything synthesized so far for `_paused` to resume from. The
+        duration is not known in advance here -- it is whatever was produced --
+        so resume is measured from elapsed playback time exactly as it is for a
+        complete WAV.
+        """
+
+        if self._starting is not None or self._active is not None:
+            raise RuntimeError("speaker already owns an active playback")
+        starting = _StartingPlayback(
+            playback_id=playback_id,
+            source_audio=b"",
+            start_seconds=0.0,
+            duration_seconds=0.0,
+            settled=asyncio.Event(),
+        )
+        self._starting = starting
+        process = await asyncio.create_subprocess_exec(
+            "aplay", "-q",
+            "-D", self.config.output_device,
+            "-t", "raw", "-f", "S16_LE", "-r", str(sample_rate), "-c", "1",
+            "-",
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        active = _ActivePlayback(
+            playback_id=playback_id,
+            source_audio=b"",
+            process=process,
+            started_at=time.monotonic(),
+            start_seconds=0.0,
+            duration_seconds=0.0,
+            interrupted=starting.interrupted,
+            resume_seconds=starting.resume_seconds,
+            settled=starting.settled,
+        )
+        self._active = active
+        if self._starting is starting:
+            self._starting = None
+        self._paused = None
+        pcm = bytearray()
+        try:
+            try:
+                async for chunk in chunks:
+                    if active.interrupted:
+                        break
+                    pcm.extend(chunk)
+                    active.source_audio = self._wrap_pcm(bytes(pcm), sample_rate)
+                    active.duration_seconds = len(pcm) / (2 * sample_rate)
+                    process.stdin.write(chunk)
+                    await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # aplay exited early -- treat it as the end of playback rather
+                # than a synthesis failure; the outcome below still reports it.
+                pass
+            finally:
+                if process.stdin is not None and not process.stdin.is_closing():
+                    try:
+                        process.stdin.close()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+            duration = len(pcm) / (2 * sample_rate)
+            active.duration_seconds = duration
+            if active.interrupted and process.returncode is None:
+                process.terminate()
+            try:
+                _, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=self.config.playback_timeout_seconds
+                )
+            except asyncio.TimeoutError as error:
+                process.kill()
+                await process.wait()
+                raise RuntimeError("streamed audio playback timed out") from error
+            if active.interrupted:
+                self._paused = _PausedPlayback(
+                    playback_id=playback_id,
+                    source_audio=active.source_audio,
+                    resume_seconds=active.resume_seconds,
+                    duration_seconds=duration,
+                )
+                return PlaybackResult(
+                    playback_id,
+                    "interrupted",
+                    max(0.0, active.resume_seconds),
+                    active.resume_seconds,
+                    duration,
+                )
+            exit_code = process.returncode
+            if exit_code:
+                detail = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+                raise RuntimeError(f"streamed audio playback exited with {exit_code}: {detail}")
+            self._paused = None
+            return PlaybackResult(playback_id, "completed", duration, duration, duration)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            self._paused = None
+            raise
+        finally:
+            if self._active is active:
+                self._active = None
+            if active.settled is not None:
+                active.settled.set()
+
+    @staticmethod
+    def _wrap_pcm(pcm: bytes, sample_rate: int) -> bytes:
+        payload = io.BytesIO()
+        with wave.open(payload, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(sample_rate)
+            target.writeframes(pcm)
+        return payload.getvalue()
 
     async def interrupt(self, playback_id: str) -> PlaybackResult | None:
         active = self._active

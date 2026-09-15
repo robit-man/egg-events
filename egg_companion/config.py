@@ -305,12 +305,30 @@ class OmniAdapterConfig(BaseModel):
     video_enabled: bool | None = None
     speech_enabled: bool | None = None
 
-    # Qwen3-TTS voice selection. `voice_reference_path` is a local WAV used as
-    # a request-local speaker embedding for cloning.
+    # Qwen3-TTS voice selection. The adapter checkout ships the same
+    # `voice-profile.json` the portal uses, so Egg speaks with the project's
+    # own Female/Male presets rather than an unrelated default. `voice_preset`
+    # names a preset id from that file; unset uses the one marked default.
+    # `voice_reference_path` overrides the preset with any local WAV, which is
+    # the request-local speaker embedding Qwen3-TTS clones from.
+    voice_profile_path: str = "vendor/qwen-omni-adapters/portal/voice-profile.json"
+    voice_preset: str | None = None
     voice: str | None = None
     voice_language: str | None = None
     voice_style: str | None = None
     voice_reference_path: str | None = None
+    # Synthesis sampling. None follows the voice profile, which is where the
+    # project's tuned values live.
+    voice_temperature: float | None = Field(default=None, ge=0, le=2)
+    voice_top_k: int | None = Field(default=None, ge=1, le=200)
+    voice_top_p: float | None = Field(default=None, gt=0, le=1)
+    voice_seed: int | None = None
+    voice_max_frames: int | None = Field(default=None, ge=1, le=4096)
+    # Stream decoder PCM windows and start playback on the first one, instead
+    # of waiting for the whole utterance to synthesize. This is the portal's
+    # behaviour and it is the difference between speech starting in a few
+    # hundred milliseconds and starting after a full generation.
+    stream_speech: bool = True
 
     # Video sampling bounds for describe_video, and the rolling per-camera clip
     # buffer the `video` tool draws from. Frames are downscaled before
