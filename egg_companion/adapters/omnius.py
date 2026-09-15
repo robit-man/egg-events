@@ -13,6 +13,7 @@ import tempfile
 import time
 import wave
 import zlib
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -78,6 +79,14 @@ class OmniusClient:
         # pass. It is deliberately kept apart from the transcript: room sound
         # is never something the user said.
         self.last_audio_observation: dict[str, object] = {}
+        # Bounded sound-only observations awaiting the next spoken turn. A
+        # capture that contained no speech still heard something worth knowing
+        # -- a door, a kettle, someone else arriving -- but it must not trigger
+        # a reply on its own. The portal's rule is carried over exactly: keep at
+        # most a handful, and hand them to the next actual spoken turn as
+        # context. Older entries fall off rather than accumulating into a
+        # stale account of the room.
+        self._audio_context: deque[dict[str, object]] = deque(maxlen=6)
         self._voice_catalog_cache: dict[str, object] | None = None
         self._voice_catalog_cached_at = 0.0
 
@@ -2398,6 +2407,7 @@ class OmniusClient:
         transcript = perceived.get("transcript")
         text = transcript.strip() if isinstance(transcript, str) else ""
         observation = perceived.get("audio_observation")
+        has_observation = isinstance(observation, str) and bool(observation.strip())
         self.last_audio_observation = (
             {
                 "observation": observation,
@@ -2405,9 +2415,19 @@ class OmniusClient:
                 "model": perceived.get("model"),
                 "captured_with_transcript": bool(text),
             }
-            if isinstance(observation, str) and observation.strip()
+            if has_observation
             else {}
         )
+        if has_observation and not text:
+            # Sound only: comprehension ran, nothing was said. Retain it for the
+            # next spoken turn instead of answering it -- a passing siren is
+            # not a request.
+            self._audio_context.append(
+                {
+                    "observation": str(observation).strip(),
+                    "heard_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         payload = {
             "text": text,
             "duration": evidence.get("duration"),
@@ -2431,6 +2451,24 @@ class OmniusClient:
         if rejection_reason is not None:
             return None
         return text
+
+    def consume_audio_context(self) -> list[dict[str, object]]:
+        """Return and clear the sound-only observations awaiting a spoken turn.
+
+        Consuming is destructive on purpose: these describe what was audible
+        *before* this turn, and replaying them into a later one would present
+        stale room sound as currently audible.
+        """
+
+        pending = list(self._audio_context)
+        self._audio_context.clear()
+        return pending
+
+    @property
+    def pending_audio_context(self) -> list[dict[str, object]]:
+        """Peek at retained sound-only observations without consuming them."""
+
+        return list(self._audio_context)
 
     @staticmethod
     def transcription_is_grounded(

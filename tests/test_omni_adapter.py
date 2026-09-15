@@ -888,3 +888,75 @@ def test_a_stream_error_event_surfaces_as_an_adapter_error(monkeypatch) -> None:
 
     with pytest.raises(OmniAdapterError, match="tts worker died"):
         asyncio.run(collect())
+
+
+# -- sound-only captures are context, never a request --------------------
+
+
+def _perceiving(adapter, transcript, observation):
+    async def perceive(wav_audio):
+        return {
+            "transcript": transcript,
+            "audio_observation": observation,
+            "model": "robit/ornith-1.5-omni:q4km",
+            "backend": "qwen3-omni",
+        }
+
+    adapter.perceive_audio = perceive
+
+
+def test_a_sound_only_capture_is_retained_and_never_answered() -> None:
+    adapter = _client()
+    client = _omnius(adapter)
+    _perceiving(adapter, None, "a door closes down the hall")
+
+    transcript = asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert transcript is None
+    assert client.pending_audio_context[0]["observation"] == "a door closes down the hall"
+
+
+def test_retained_sound_observations_are_bounded() -> None:
+    adapter = _client()
+    client = _omnius(adapter)
+    for index in range(9):
+        _perceiving(adapter, None, f"sound {index}")
+        asyncio.run(
+            client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+        )
+
+    retained = client.pending_audio_context
+    assert len(retained) == 6
+    # The oldest fall off rather than accumulating a stale account of the room.
+    assert retained[0]["observation"] == "sound 3"
+    assert retained[-1]["observation"] == "sound 8"
+
+
+def test_consuming_the_audio_context_clears_it() -> None:
+    """Replaying them later would present stale room sound as currently audible."""
+
+    adapter = _client()
+    client = _omnius(adapter)
+    _perceiving(adapter, None, "a kettle whistles")
+    asyncio.run(client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence()))
+
+    assert len(client.consume_audio_context()) == 1
+    assert client.consume_audio_context() == []
+    assert client.pending_audio_context == []
+
+
+def test_a_spoken_turn_does_not_retain_its_own_sound_as_pending_context() -> None:
+    adapter = _client()
+    client = _omnius(adapter)
+    _perceiving(adapter, "put the kettle on", "a kettle whistles")
+
+    transcript = asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert transcript == "put the kettle on"
+    # It belongs to this turn's evidence, not to the queue awaiting a later one.
+    assert client.pending_audio_context == []
+    assert client.last_audio_observation["observation"] == "a kettle whistles"

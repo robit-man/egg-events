@@ -9454,6 +9454,27 @@ class CompanionRuntime:
                     f"; recent grounded environmental audio: {heard} "
                     "(Omnius YAMNet/AudioSet classifier)"
                 )
+            observation = comprehension.get("observation")
+            if isinstance(observation, str) and observation.strip():
+                audio += (
+                    "; environmental audio description: "
+                    f"{' '.join(observation.split())[:400]} (Qwen3-Omni comprehension)"
+                )
+        # Sound-only captures since the last spoken turn. These were heard but
+        # deliberately not answered; they are context for what is being said
+        # now, never something the speaker said.
+        retained = self._omnius.consume_audio_context()
+        if retained:
+            sounds = "; ".join(
+                " ".join(str(item.get("observation") or "").split())[:200]
+                for item in retained
+                if item.get("observation")
+            )
+            if sounds:
+                audio += (
+                    f"; sounds heard since the last spoken turn (not speech, not a "
+                    f"request): {sounds}"
+                )
         return (
             f"stable scene inventory: {objects}; semantic cues: {', '.join(labels) or 'none'}"
             f"{directions}{people}{audio}"
