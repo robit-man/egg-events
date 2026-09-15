@@ -1193,11 +1193,15 @@ class CompanionRuntime:
                     announced = False
                     started_at = time.monotonic()
                 elapsed = time.monotonic() - started_at
-                if config.autostart and await self._start_omni_adapter_unit():
-                    # The adapter loads multi-gigabyte weights; give the unit
-                    # its full startup budget before calling the mode degraded.
-                    pass
-                elif elapsed > config.autostart_timeout_seconds:
+                if config.autostart:
+                    # The adapter loads multi-gigabyte weights, so this is a
+                    # nudge rather than a retry loop; the unit's own startup
+                    # budget governs how long it may take.
+                    await self._start_omni_adapter_unit()
+                if elapsed > config.autostart_timeout_seconds:
+                    # Warn on the timeout whether or not a start was attempted:
+                    # a unit that starts and never becomes ready is exactly the
+                    # case worth saying out loud.
                     logger.warning(
                         "omni adapter has not become ready in %.0fs; perception stays on "
                         "the traditional stack until it does: %s",
