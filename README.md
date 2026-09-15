@@ -162,8 +162,27 @@ What the adapter answers better than the traditional path:
   clip is encoded to MP4 and answered by the comprehension layer, with its
   camera ID, frame count, fps, and span carried alongside as authoritative
   metadata. The tool is advertised only when it can actually be executed.
-- **Qwen3-TTS speech** at 24 kHz, including a request-local voice reference for
-  cloning (`voice_reference_path`).
+- **Qwen3-TTS speech** at 24 kHz, streamed, with the project's own voices. Egg
+  reads the adapter's `voice-profile.json` — the same file the portal serves —
+  so it speaks with the Female preset by default, Male is selectable by id, and
+  the profile's tuned sampling (temperature, top-k/p, seed, frame cap) travels
+  with it. `voice_reference_path` overrides the preset with any local WAV for
+  cloning.
+
+  Speech is streamed rather than generated-then-played: the backend emits about
+  160 ms of PCM per decoder window, and `Speaker.play_pcm_stream` feeds those
+  straight into `aplay` so audio starts on the first window. Sequence numbers
+  are checked, not assumed — a gap means audio was lost, and concatenating
+  across it would produce a subtly wrong utterance instead of an obvious
+  failure. Barge-in and tail-resume are preserved: every window is also
+  accumulated, so an interrupted stream still leaves a complete WAV to resume
+  from.
+
+- **Sound that is not speech.** A capture with no speech in it still heard
+  something worth knowing, but it is not a request. Sound-only observations
+  accumulate in a bounded queue and reach the *next* spoken turn as explicitly
+  labelled context; consuming them is destructive, because replaying them later
+  would present stale room sound as currently audible.
 
 ### One model, one Ollama slot
 
