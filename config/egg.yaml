@@ -168,12 +168,13 @@ omni_adapter:
   # traditional = the previous stack: YOLOE/SAM/CLIP vision, the CUDA Whisper
   #               ASR service, the YAMNet classifier, and Supertonic speech
   mode: omni
-  # Egg's replies still come from Omnius -> Ollama (omnius.base_url), so the
-  # 15.6 GiB Ollama runner is always needed. Qwen3-Omni comprehension is
-  # another 16.8 GiB, and on this 30 GiB module the two cannot coexist. Until
-  # Egg's chat path itself moves to the adapter, comprehension-backed
-  # capabilities stay off and the adapter supplies speech, which does fit.
-  exclusive: false
+  # ASR, environmental audio, video and vision all come from the omni package.
+  # The discrete stack is silenced -- no YOLOE/SAM/CLIP, no Whisper container,
+  # no YAMNet -- both because that is the point and because its memory is
+  # needed elsewhere. Egg's replies still come from Omnius -> Ollama, so the
+  # residency manager swaps Ollama and the 16.8 GiB comprehension worker in
+  # and out around each turn.
+  exclusive: true
   # The adapter starts with the companion; it is not a sidecar you start by
   # hand. Switching mode back to `traditional` and restarting restores the
   # previous stack exactly.
@@ -208,9 +209,9 @@ omni_adapter:
   # Every capability on the single package. Unset would follow `mode` anyway;
   # they are explicit so a reader can see there is no hidden fallback path.
   speech_enabled: true
-  transcription_enabled: false
-  audio_scene_enabled: false
-  video_enabled: false
+  transcription_enabled: true
+  audio_scene_enabled: true
+  video_enabled: true
   # voice_reference_path: data/voice-reference.wav
   video_fps: 2.0
   video_max_frames: 48

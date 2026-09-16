@@ -2341,10 +2341,29 @@ class OmniusClient:
         if self._omni is not None and self._omni.config.uses_transcription:
             try:
                 return await self._transcribe_via_omni(wav_audio, evidence)
-            except OmniAdapterUnavailable as error:
-                logger.debug("Omni adapter transcription unavailable: %s", error)
-            except OmniAdapterError as error:
-                logger.warning("Omni adapter transcription failed: %s", error)
+            except (OmniAdapterUnavailable, OmniAdapterError) as error:
+                if self._omni.config.exclusive:
+                    # Exclusive omni means exactly that: the Whisper weights
+                    # are not loaded and must not be, so there is nothing to
+                    # fall back to. Losing the turn is the honest outcome --
+                    # quietly reviving the stack this mode exists to replace
+                    # is not.
+                    logger.warning(
+                        "omni transcription failed and exclusive mode forbids "
+                        "the Whisper fallback; dropping this utterance: %s",
+                        error,
+                    )
+                    self.last_transcription_metadata = {
+                        "duration": evidence.get("duration"),
+                        "language": evidence.get("requested_language"),
+                        "segments": [],
+                        "acoustic": evidence,
+                        "accepted": False,
+                        "rejection_reason": f"omni transcription unavailable: {error}",
+                        "backend": "qwen3-omni",
+                    }
+                    return None
+                logger.warning("omni transcription failed, using Whisper: %s", error)
         return await self._transcribe_via_omnius(wav_audio, evidence, language)
 
     async def _transcribe_via_omnius(
@@ -4367,6 +4386,13 @@ class OmniusClient:
                 # reporting healthy is indistinguishable from a bug.
                 self.last_speech_backend = "omnius-fallback"
                 self.last_speech_fallback_reason = str(error)
+                if self._omni.config.exclusive:
+                    # Same rule as transcription: the old voice is not a
+                    # quieter version of this mode, it is the thing this mode
+                    # replaces. Say nothing rather than say it in the wrong
+                    # voice.
+                    logger.warning("omni speech failed in exclusive mode: %s", error)
+                    raise
                 logger.warning(
                     "speech fell back to %s: %s", self.config.voice_model, error
                 )

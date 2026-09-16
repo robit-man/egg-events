@@ -38,7 +38,7 @@ def _manager(monkeypatch, available: float, **kwargs) -> WeightResidencyManager:
     """A manager over a simulated memory pool that shrinks as things load."""
 
     monkeypatch.setattr(residency, "available_memory_gib", lambda: available)
-    return WeightResidencyManager(total_gib=30.0, **kwargs)
+    return WeightResidencyManager(total_gib=30.0, settle_seconds=0, **kwargs)
 
 
 def test_a_component_that_fits_is_loaded(monkeypatch) -> None:
@@ -88,7 +88,7 @@ def test_a_lower_priority_component_is_evicted_to_make_room(monkeypatch) -> None
     state = {"language": True}
     pool = {"free": 6.0}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: pool["free"])
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
 
     async def unload_language() -> None:
         state["language"] = False
@@ -112,7 +112,7 @@ def test_a_pinned_component_is_never_evicted(monkeypatch) -> None:
 
     state = {"tts": True}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 5.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
     manager.register(_component("tts", 4.0, state, priority=0))
     manager.register(_component("comprehension", 16.8, state, priority=10))
 
@@ -132,7 +132,7 @@ def test_eviction_prefers_the_cheapest_to_bring_back(monkeypatch) -> None:
     state = {"low": True, "high": True}
     pool = {"free": 4.0}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: pool["free"])
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=1.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=1.0, settle_seconds=0)
     evicted: list[str] = []
 
     def make(name: str, priority: int, frees: float) -> Component:
@@ -163,7 +163,7 @@ def test_an_already_loaded_component_is_not_reloaded(monkeypatch) -> None:
     state = {"comprehension": True}
     loads = {"count": 0}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 1.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
 
     async def load() -> None:
         loads["count"] += 1
@@ -185,7 +185,7 @@ def test_an_already_loaded_component_is_not_reloaded(monkeypatch) -> None:
 def test_a_load_that_hangs_is_refused_rather_than_waited_on_forever(monkeypatch) -> None:
     state: dict[str, bool] = {}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
 
     async def never_finishes() -> None:
         await asyncio.sleep(60)
@@ -242,7 +242,7 @@ def test_an_impossible_request_evicts_nothing(monkeypatch) -> None:
 
     state = {"comprehension": True}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 4.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
     evicted: list[str] = []
 
     async def unload() -> None:
@@ -270,7 +270,7 @@ def test_an_idle_component_is_released(monkeypatch) -> None:
 
     state = {"comprehension": True}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 4.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
     component = _component(
         "comprehension", 16.8, state, idle_release_seconds=0.05
     )
@@ -292,7 +292,7 @@ def test_an_idle_component_is_released(monkeypatch) -> None:
 def test_a_pinned_component_is_never_released_as_idle(monkeypatch) -> None:
     state = {"comprehension": True}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
     manager.register(
         _component("comprehension", 16.8, state, idle_release_seconds=0.01)
     )
@@ -311,7 +311,7 @@ def test_a_component_without_an_idle_window_is_held(monkeypatch) -> None:
 
     state = {"language": True}
     monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0, settle_seconds=0)
     manager.register(_component("language", 15.6, state, idle_release_seconds=0))
 
     async def scenario() -> None:
@@ -322,3 +322,34 @@ def test_a_component_without_an_idle_window_is_held(monkeypatch) -> None:
         assert state["language"] is True
 
     asyncio.run(scenario())
+
+
+def test_memory_released_during_the_settle_window_avoids_eviction(monkeypatch) -> None:
+    """A worker that just exited frees its pages asynchronously on Tegra."""
+
+    state = {"language": True}
+    readings = iter([4.0, 4.0, 25.0, 25.0, 25.0])
+    monkeypatch.setattr(
+        residency, "available_memory_gib", lambda: next(readings, 25.0)
+    )
+    manager = WeightResidencyManager(
+        total_gib=30.0, reserve_gib=3.0, settle_seconds=2.0
+    )
+    evicted: list[str] = []
+
+    async def unload() -> None:
+        evicted.append("language")
+
+    language = _component("language", 15.6, state, priority=0)
+    language.unload = unload
+    manager.register(language)
+    manager.register(_component("comprehension", 16.7, state, priority=10))
+
+    async def scenario() -> None:
+        async with manager.require("comprehension"):
+            pass
+
+    asyncio.run(scenario())
+    # The memory arrived while settling, so nothing had to be torn down.
+    assert evicted == []
+    assert state["language"] is True

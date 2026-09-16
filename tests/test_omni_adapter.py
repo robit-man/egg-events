@@ -328,7 +328,8 @@ def test_transcription_prefers_the_adapter_and_records_its_backend() -> None:
 
 
 def test_an_unavailable_adapter_falls_back_to_the_omnius_asr_path() -> None:
-    adapter = _client()
+    # Non-exclusive: the Whisper weights are loaded and may be used.
+    adapter = _client(exclusive=False)
 
     async def perceive(wav_audio):
         raise OmniAdapterUnavailable("adapter is down")
@@ -1087,7 +1088,7 @@ def test_a_resident_component_is_pinned_for_the_request(monkeypatch) -> None:
 def test_a_speech_fallback_is_recorded(monkeypatch) -> None:
     """The voice changing with nothing logged is indistinguishable from a bug."""
 
-    adapter = _client(speech_enabled=True)
+    adapter = _client(speech_enabled=True, exclusive=False)
 
     async def refuse(text):
         raise OmniAdapterUnavailable("omni_speech cannot be made resident")
@@ -1145,4 +1146,72 @@ def test_speech_reserves_worker_headroom_before_attempting(monkeypatch) -> None:
     client._post = unreachable
 
     with pytest.raises(OmniAdapterUnavailable, match="headroom"):
+        asyncio.run(client.synthesize("hello"))
+
+
+# -- exclusive means exclusive ------------------------------------------
+
+
+def test_exclusive_mode_never_revives_whisper(monkeypatch) -> None:
+    """The Whisper weights are not loaded in this mode and must not be."""
+
+    adapter = _client(exclusive=True)
+
+    async def fail(wav_audio):
+        raise OmniAdapterUnavailable("comprehension is not resident")
+
+    adapter.perceive_audio = fail
+    client = _omnius(adapter)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("exclusive omni must not fall back to Whisper")
+
+    client._transcribe_via_omnius = forbidden
+
+    transcript = asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    )
+
+    assert transcript is None
+    meta = client.last_transcription_metadata
+    assert meta["accepted"] is False
+    assert "omni transcription unavailable" in meta["rejection_reason"]
+
+
+def test_non_exclusive_mode_still_falls_back_to_whisper() -> None:
+    adapter = _client(exclusive=False)
+
+    async def fail(wav_audio):
+        raise OmniAdapterUnavailable("comprehension is not resident")
+
+    adapter.perceive_audio = fail
+    client = _omnius(adapter)
+
+    async def whisper(wav_audio, evidence, language):
+        return "heard by whisper"
+
+    client._transcribe_via_omnius = whisper
+
+    assert asyncio.run(
+        client.transcribe(_wav(seconds=2.0), acoustic_evidence=_speech_evidence())
+    ) == "heard by whisper"
+
+
+def test_exclusive_mode_never_revives_supertonic() -> None:
+    """Say nothing rather than say it in the voice this mode replaces."""
+
+    adapter = _client(exclusive=True, speech_enabled=True)
+
+    async def fail(text):
+        raise OmniAdapterUnavailable("speech worker cannot be seated")
+
+    adapter.synthesize = fail
+    client = _omnius(adapter)
+
+    async def forbidden(text):
+        raise AssertionError("exclusive omni must not fall back to Supertonic")
+
+    client._synthesize_via_omnius = forbidden
+
+    with pytest.raises(OmniAdapterUnavailable):
         asyncio.run(client.synthesize("hello"))

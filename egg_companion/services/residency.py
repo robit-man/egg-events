@@ -115,12 +115,16 @@ class WeightResidencyManager:
         *,
         reserve_gib: float = 3.0,
         total_gib: float | None = None,
+        settle_seconds: float = 6.0,
     ) -> None:
         # Headroom the manager will not spend. The OS, page cache, and the
         # companion's own allocations move around underneath us; without a
         # reserve, a load that exactly fits at admission time is an OOM a
         # second later.
         self.reserve_gib = reserve_gib
+        # How long to let a just-released worker's memory settle before
+        # judging whether anything must be evicted.
+        self.settle_seconds = settle_seconds
         self.total_gib = total_gib if total_gib is not None else total_memory_gib()
         self._components: dict[str, Component] = {}
         self._lock = asyncio.Lock()
@@ -202,6 +206,16 @@ class WeightResidencyManager:
         needed = target.cost_gib + self.reserve_gib
         if available_memory_gib() >= needed:
             return
+
+        # A worker that just exited releases its memory asynchronously on
+        # Tegra: the pages are gone but MemAvailable has not caught up. Give
+        # that a moment before concluding anything, or a request arriving
+        # right after a transient spawn is refused against memory that is
+        # already free.
+        for _ in range(int(self.settle_seconds / 0.5)):
+            await asyncio.sleep(0.5)
+            if available_memory_gib() >= needed:
+                return
 
         candidates = [
             item

@@ -226,10 +226,13 @@ class ResidencyConfig(BaseModel):
     # Headroom the manager will not spend. The OS, page cache, and the
     # companion's own allocations move underneath a load that was sized at
     # admission time.
-    reserve_gib: float = Field(default=3.0, ge=0.5, le=16)
+    reserve_gib: float = Field(default=2.0, ge=0.5, le=16)
     # Qwen3-Omni comprehension at an 8K window. The most expensive to reload,
     # so it outranks everything else and is evicted last.
-    comprehension_cost_gib: float = Field(default=16.8, gt=0, le=64)
+    # Measured at a 4096 context: 16.7 GiB, against 16.8 at 8192. The KV is
+    # not the driver here, the weights are -- halving the window buys almost
+    # nothing, so do not expect context to be the lever for fitting this.
+    comprehension_cost_gib: float = Field(default=16.7, gt=0, le=64)
     comprehension_unit: str = "egg-omni-comprehension.service"
     comprehension_priority: int = 10
     comprehension_load_timeout_seconds: float = Field(default=420, gt=0, le=3600)
@@ -239,7 +242,9 @@ class ResidencyConfig(BaseModel):
     comprehension_idle_release_seconds: float = Field(default=180, ge=0, le=86400)
     # The Qwen3-TTS worker, which is non-persistent and so only holds this
     # while actually speaking.
-    speech_cost_gib: float = Field(default=4.0, gt=0, le=32)
+    # Measured while cloning: 6.4 GiB for the worker, not the 1.4 GiB of
+    # weights -- the speaker-embedding encoder is most of it.
+    speech_cost_gib: float = Field(default=6.4, gt=0, le=32)
     speech_unit: str = "egg-omni-adapters.service"
     speech_priority: int = 5
     speech_load_timeout_seconds: float = Field(default=300, gt=0, le=3600)
