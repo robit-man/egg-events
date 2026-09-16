@@ -1,0 +1,24 @@
+[Unit]
+Description=Qwen3-Omni comprehension worker for the Egg companion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@VENDOR_DIR@
+# Started and stopped on demand by the companion's residency manager, which
+# admits it only when its measured ~16.8 GiB genuinely fits. Do not enable
+# this unit: booting it unconditionally is what over-commits the module.
+ExecStart=@VENDOR_DIR@/vendor/llama.cpp/build/bin/llama-server \
+  -m @VENDOR_DIR@/runtime-data/components/comprehension-model.gguf \
+  --mmproj @VENDOR_DIR@/runtime-data/components/comprehension-projector.gguf \
+  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c 8192
+Restart=no
+TimeoutStopSec=60
+UMask=0077
+# A ceiling below the module's capacity: if the worker ever exceeds its
+# measured footprint, systemd kills it rather than the machine dying.
+MemoryMax=22G
+
+[Install]
+WantedBy=default.target
