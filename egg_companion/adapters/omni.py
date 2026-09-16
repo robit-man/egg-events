@@ -689,6 +689,52 @@ class OmniAdapterClient:
         if not produced:
             raise OmniAdapterError("Omni adapter stream returned no audio")
 
+    async def chat_with_speech(
+        self, messages: list[dict[str, Any]], *, think: bool = False
+    ) -> dict[str, object]:
+        """Answer a conversation and speak the reply in one adapter round trip.
+
+        The adapter routes language then TTS itself, so the spoken audio is
+        generated from exactly the text that is returned -- there is no window
+        in which a caller could play one reply while displaying another.
+        """
+
+        if not messages:
+            raise OmniAdapterError("chat requires at least one message")
+        payload = self._request(
+            task="chat",
+            messages=[
+                {"role": str(item.get("role") or "user"), "content": str(item.get("content") or "")}
+                for item in messages
+            ],
+            response_modalities=["text", "audio"],
+            speech_mode="always",
+            speech=self._speech_settings(),
+            think=think,
+        )
+        result = await self._post(
+            payload, timeout_seconds=self.config.speech_timeout_seconds
+        )
+        message = self._message(result)
+        text = str(message.get("content") or "").strip()
+        audio_envelope = message.get("audio")
+        audio: bytes | None = None
+        if isinstance(audio_envelope, dict) and audio_envelope.get("data"):
+            try:
+                decoded = base64.b64decode(str(audio_envelope["data"]), validate=True)
+            except (ValueError, TypeError) as error:
+                raise OmniAdapterError("spoken reply is not valid base64") from error
+            if not decoded.startswith(b"RIFF"):
+                raise OmniAdapterError("spoken reply is not a WAV payload")
+            audio = decoded
+        metadata = self._adapter_metadata(result)
+        return {
+            "text": text,
+            "audio": audio,
+            "route": list(metadata.get("route") or []),
+            "thinking": message.get("thinking"),
+        }
+
     @staticmethod
     def pcm_to_wav(pcm: bytes, sample_rate: int = OUTPUT_SAMPLE_RATE_HZ) -> bytes:
         """Wrap streamed PCM windows in the WAV container callers expect."""
