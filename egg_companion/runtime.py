@@ -1080,28 +1080,55 @@ class CompanionRuntime:
         import os
         import tempfile
 
-        import cv2
-
         frames = list(buffer)
         height, width = frames[0][0].shape[:2]
         span = max(frames[-1][1] - frames[0][1], 1e-3)
         fps = max(1.0, min(30.0, (len(frames) - 1) / span))
+        # Encode through ffmpeg rather than cv2.VideoWriter. OpenCV writes
+        # MPEG-4 Part 2 with the moov atom at the end of the file, which the
+        # comprehension backend cannot read: it pipes the clip to ffprobe,
+        # which cannot seek backwards. The adapter repairs such a clip by
+        # transcoding it, but producing a streamable H.264 clip here avoids
+        # paying for that second encode on every single video tool call.
         directory = tempfile.mkdtemp(prefix="egg-omni-clip-")
         path = os.path.join(directory, "clip.mp4")
         try:
-            writer = cv2.VideoWriter(
-                path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+            encoder = subprocess.Popen(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s", f"{width}x{height}", "-r", f"{fps:g}",
+                    "-i", "-",
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    path,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-            if not writer.isOpened():
-                return None
             try:
                 for image, _ in frames:
-                    writer.write(image)
+                    encoder.stdin.write(image.tobytes())
             finally:
-                writer.release()
+                # Closing stdin is what tells ffmpeg the stream ended; do it
+                # before waiting, and never hand the closed pipe to
+                # communicate(), which would try to flush it again.
+                if encoder.stdin is not None:
+                    encoder.stdin.close()
+                    encoder.stdin = None
+            error_output = encoder.stderr.read() if encoder.stderr else b""
+            encoder.wait(timeout=120)
+            if encoder.returncode:
+                logger.warning(
+                    "recent-clip encode failed for %s: %s",
+                    camera_id,
+                    error_output.decode("utf-8", errors="replace")[-300:],
+                )
+                return None
             with open(path, "rb") as handle:
                 payload = handle.read()
-        except OSError as error:
+        except (OSError, subprocess.SubprocessError) as error:
             logger.warning("recent-clip encode failed for %s: %s", camera_id, error)
             return None
         finally:
