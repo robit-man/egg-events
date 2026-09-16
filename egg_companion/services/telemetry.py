@@ -986,14 +986,40 @@ class RuntimeTelemetry:
                     "asr_rms_threshold": config.transcription.rms_threshold,
                     "asr_target_rms": config.audio.asr_target_rms,
                     "asr_max_gain": config.audio.asr_max_gain,
-                    "asr_model": config.transcription.asr_model,
+                    # Report the backend that actually serves each stage, not
+                    # the fallback field it would use if omni were off. Showing
+                    # "supertonic" while Qwen3-TTS is speaking is how an
+                    # upgrade looks like it never happened.
+                    "asr_model": (
+                        config.omni_adapter.model
+                        if config.omni_adapter.uses_transcription
+                        else config.transcription.asr_model
+                    ),
+                    "asr_backend": (
+                        "qwen3-omni"
+                        if config.omni_adapter.uses_transcription
+                        else "whisper"
+                    ),
                     "asr_language": config.transcription.asr_language,
                     "vad_aggressiveness": config.transcription.vad_aggressiveness,
                     "vad_input_gain": config.transcription.vad_input_gain,
                     "vad_min_voiced_rms": config.transcription.vad_min_voiced_rms,
                     "vad_min_contiguous_ms": config.transcription.vad_min_contiguous_ms,
-                    "tts_model": config.omnius.voice_model,
-                    "tts_voice": config.omnius.voice_name,
+                    "tts_model": (
+                        config.omni_adapter.model
+                        if config.omni_adapter.uses_speech
+                        else config.omnius.voice_model
+                    ),
+                    "tts_backend": (
+                        "qwen3-tts"
+                        if config.omni_adapter.uses_speech
+                        else config.omnius.voice_model
+                    ),
+                    "tts_voice": (
+                        (config.omni_adapter.voice_preset or "female")
+                        if config.omni_adapter.uses_speech
+                        else config.omnius.voice_name
+                    ),
                     "asr_input": f"ReSpeaker DSP ASR channel {config.audio.asr_channel}",
                     "barge_in_enabled": config.audio.barge_in_enabled,
                     "vad_hangover_ms": config.transcription.vad_hangover_ms,

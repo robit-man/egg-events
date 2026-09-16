@@ -168,12 +168,11 @@ omni_adapter:
   # traditional = the previous stack: YOLOE/SAM/CLIP vision, the CUDA Whisper
   #               ASR service, the YAMNet classifier, and Supertonic speech
   mode: omni
-  # Run the adapter beside the existing perception stack rather than replacing
-  # it. Measured on this 32 GB module (29.98 GiB usable): Qwen3-Omni
-  # comprehension is 16.8 GiB, and it cannot coexist with Ollama's language
-  # model, Qwen3-TTS and the companion -- that combination needs ~35 GiB and
-  # took the machine down. So speech comes from Qwen3-TTS while ASR, vision and
-  # environmental audio stay on the paths that fit.
+  # Egg's replies still come from Omnius -> Ollama (omnius.base_url), so the
+  # 15.6 GiB Ollama runner is always needed. Qwen3-Omni comprehension is
+  # another 16.8 GiB, and on this 30 GiB module the two cannot coexist. Until
+  # Egg's chat path itself moves to the adapter, comprehension-backed
+  # capabilities stay off and the adapter supplies speech, which does fit.
   exclusive: false
   # The adapter starts with the companion; it is not a sidecar you start by
   # hand. Switching mode back to `traditional` and restarting restores the
@@ -206,12 +205,8 @@ omni_adapter:
   # language, and speech.
   max_concurrent_requests: 1
   keep_alive: 30m
-  # Per-capability pins. Unset, each follows `mode`; set one to false to keep
-  # that single capability on the traditional path. Speech is the capability
-  # this host can afford from the adapter today: Qwen3-TTS is ~4 GiB and, with
-  # OMNI_TTS_PERSISTENT=0 on the service, only holds it while actually
-  # speaking. The three comprehension-backed capabilities need the 16.8 GiB
-  # Qwen3-Omni worker, so they stay off until the host can seat it.
+  # Every capability on the single package. Unset would follow `mode` anyway;
+  # they are explicit so a reader can see there is no hidden fallback path.
   speech_enabled: true
   transcription_enabled: false
   audio_scene_enabled: false
