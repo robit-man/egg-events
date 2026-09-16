@@ -133,6 +133,7 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
             # request can be routed to.
             ready=_http_ready("http://127.0.0.1:8901/health"),
             load_timeout_seconds=settings.comprehension_load_timeout_seconds,
+            idle_release_seconds=settings.comprehension_idle_release_seconds,
         )
     )
     manager.register(
@@ -143,6 +144,7 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
             priority=settings.speech_priority,
             ready=_http_ready(f"{adapter_base}/healthz"),
             load_timeout_seconds=settings.speech_load_timeout_seconds,
+            idle_release_seconds=settings.speech_idle_release_seconds,
         )
     )
     manager.register(

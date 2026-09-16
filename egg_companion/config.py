@@ -233,12 +233,19 @@ class ResidencyConfig(BaseModel):
     comprehension_unit: str = "egg-omni-comprehension.service"
     comprehension_priority: int = 10
     comprehension_load_timeout_seconds: float = Field(default=420, gt=0, le=3600)
+    # Release comprehension after this long unused. Holding 16.8 GiB while
+    # idle is indistinguishable from a leak to everything else on the module:
+    # it squats memory the language model needs and nothing asks it to leave.
+    comprehension_idle_release_seconds: float = Field(default=180, ge=0, le=86400)
     # The Qwen3-TTS worker, which is non-persistent and so only holds this
     # while actually speaking.
     speech_cost_gib: float = Field(default=4.0, gt=0, le=32)
     speech_unit: str = "egg-omni-adapters.service"
     speech_priority: int = 5
     speech_load_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    # The speech service is small and its TTS worker is already
+    # non-persistent, so it stays up by default.
+    speech_idle_release_seconds: float = Field(default=0, ge=0, le=86400)
     # Ollama serving the logical tag. Measured by unloading it and watching
     # MemAvailable: 15.6 GiB, not the 5.6 GiB `ollama ps` reports. On Tegra
     # the nvmap allocation is roughly 10 GiB beyond the reported model size,
@@ -250,6 +257,11 @@ class ResidencyConfig(BaseModel):
     # the guarantee.
     language_cost_gib: float = Field(default=15.6, gt=0, le=64)
     language_priority: int = 8
+    # Ollama manages its own keep-alive, so the manager only evicts it under
+    # pressure rather than on a timer.
+    language_idle_release_seconds: float = Field(default=0, ge=0, le=86400)
+    # How often the runtime sweeps for idle components.
+    sweep_interval_seconds: float = Field(default=30, gt=0, le=3600)
 
 
 class OmniAdapterConfig(BaseModel):

@@ -36,6 +36,7 @@ from egg_companion.adapters.audio import (
 )
 from egg_companion.adapters.camera import CameraStream
 from egg_companion.adapters.depth import DepthEstimator
+from egg_companion.services.residency import available_memory_gib
 from egg_companion.services.residency_wiring import build_residency_manager
 from egg_companion.adapters.omni import (
     OmniAdapterClient,
@@ -942,6 +943,7 @@ class CompanionRuntime:
             ("vision-readiness", self._maintain_vision),
             ("omnius-readiness", self._maintain_omnius),
             ("omni-adapter", self._maintain_omni_adapter),
+            ("weight-residency", self._sweep_idle_weights),
             ("attention", self._attend),
             ("environmental-cognition", self._process_environmental_cognition),
             ("audio-waveform", self._stream_waveform),
@@ -1181,6 +1183,33 @@ class CompanionRuntime:
                 return None
             return {**result, "clip": evidence}
         return None
+
+    async def _sweep_idle_weights(self) -> None:
+        """Release heavy components that have gone unused.
+
+        Without this a component loaded once stays resident forever: it squats
+        memory the next admission needs, and something outside the manager --
+        Ollama loading for a reply, say -- finds nothing left. Observed
+        directly: comprehension held 16.8 GiB long after its request finished
+        and the language model could no longer load at all.
+        """
+
+        if self._residency is None:
+            return
+        interval = self.config.residency.sweep_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                released = await self._residency.release_idle()
+            except Exception as error:
+                logger.warning("residency sweep failed: %s", error)
+                continue
+            if released:
+                logger.info(
+                    "residency: released idle %s; %.1f GiB now available",
+                    ", ".join(released),
+                    available_memory_gib(),
+                )
 
     async def _maintain_omni_adapter(self) -> None:
         """Bring up and keep up the Qwen Omni adapter as part of this runtime.

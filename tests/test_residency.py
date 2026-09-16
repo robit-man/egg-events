@@ -263,3 +263,62 @@ def test_an_impossible_request_evicts_nothing(monkeypatch) -> None:
         asyncio.run(scenario())
     assert evicted == []
     assert state["comprehension"] is True
+
+
+def test_an_idle_component_is_released(monkeypatch) -> None:
+    """Holding weights while idle is indistinguishable from a leak."""
+
+    state = {"comprehension": True}
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 4.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    component = _component(
+        "comprehension", 16.8, state, idle_release_seconds=0.05
+    )
+    manager.register(component)
+
+    async def scenario() -> None:
+        async with manager.require("comprehension"):
+            pass
+        # Still resident immediately after use.
+        assert await manager.release_idle() == []
+        assert state["comprehension"] is True
+        await asyncio.sleep(0.1)
+        assert await manager.release_idle() == ["comprehension"]
+        assert state["comprehension"] is False
+
+    asyncio.run(scenario())
+
+
+def test_a_pinned_component_is_never_released_as_idle(monkeypatch) -> None:
+    state = {"comprehension": True}
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager.register(
+        _component("comprehension", 16.8, state, idle_release_seconds=0.01)
+    )
+
+    async def scenario() -> None:
+        async with manager.require("comprehension"):
+            await asyncio.sleep(0.05)
+            assert await manager.release_idle() == []
+            assert state["comprehension"] is True
+
+    asyncio.run(scenario())
+
+
+def test_a_component_without_an_idle_window_is_held(monkeypatch) -> None:
+    """Zero means hold until evicted, for things that manage their own life."""
+
+    state = {"language": True}
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager.register(_component("language", 15.6, state, idle_release_seconds=0))
+
+    async def scenario() -> None:
+        async with manager.require("language"):
+            pass
+        await asyncio.sleep(0.05)
+        assert await manager.release_idle() == []
+        assert state["language"] is True
+
+    asyncio.run(scenario())

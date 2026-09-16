@@ -92,6 +92,11 @@ class Component:
     # reload should outrank the ones that are cheap to bring back.
     priority: int = 0
     load_timeout_seconds: float = 600.0
+    # Release after this long unused. A component that stays resident while
+    # idle is indistinguishable from a leak to everything else on the module:
+    # it squats memory another component needs and nothing ever asks it to
+    # leave. 0 means "hold until evicted".
+    idle_release_seconds: float = 0.0
 
     _in_use: int = field(default=0, init=False)
     _loaded_at: float = field(default=0.0, init=False)
@@ -122,6 +127,43 @@ class WeightResidencyManager:
 
     def register(self, component: Component) -> None:
         self._components[component.name] = component
+
+    async def release_idle(self) -> list[str]:
+        """Unload components that have gone unused past their idle window.
+
+        Called periodically by the runtime. Without it a component loaded once
+        stays resident forever and the next admission has to evict it the hard
+        way -- or fails because something outside the manager wanted that
+        memory first.
+        """
+
+        released: list[str] = []
+        async with self._lock:
+            for component in self._components.values():
+                if component.pinned or component.idle_release_seconds <= 0:
+                    continue
+                if component._last_used <= 0:
+                    continue
+                idle = time.monotonic() - component._last_used
+                if idle < component.idle_release_seconds:
+                    continue
+                try:
+                    if not await component.is_loaded():
+                        continue
+                    logger.info(
+                        "residency: releasing %s after %.0fs idle (%.1f GiB)",
+                        component.name,
+                        idle,
+                        component.cost_gib,
+                    )
+                    await component.unload()
+                    component._last_used = 0.0
+                    released.append(component.name)
+                except Exception as error:  # noqa: BLE001 - best effort
+                    logger.warning(
+                        "residency: could not release %s: %s", component.name, error
+                    )
+        return released
 
     def status(self) -> dict[str, object]:
         return {
@@ -268,6 +310,7 @@ def systemd_component(
     priority: int = 0,
     ready: Callable[[], Awaitable[bool]] | None = None,
     load_timeout_seconds: float = 600.0,
+    idle_release_seconds: float = 0.0,
 ) -> Component:
     """A component whose lifetime is a systemd user unit.
 
@@ -309,4 +352,5 @@ def systemd_component(
         is_loaded=is_loaded,
         priority=priority,
         load_timeout_seconds=load_timeout_seconds,
+        idle_release_seconds=idle_release_seconds,
     )
