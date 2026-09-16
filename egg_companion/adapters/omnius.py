@@ -34,6 +34,22 @@ from egg_companion.cognition.dialogue import (
 
 logger = logging.getLogger(__name__)
 
+# How the omni package identifies itself wherever a backend is named.
+OMNI_BACKEND = "qwen3-omni-adapter"
+
+
+def _as_availability(value: "dict[str, object] | bool | None") -> dict[str, object]:
+    """Normalise a readiness answer, tolerating a plain boolean."""
+
+    if isinstance(value, dict):
+        return value
+    ready = bool(value)
+    return {
+        "state": "ready" if ready else "unavailable",
+        "ready": ready,
+        "detail": None,
+    }
+
 
 class OmniusClient:
     _UNSAFE_LIVE_ASR_MODELS = {
@@ -215,7 +231,7 @@ class OmniusClient:
             and self._voice_catalog_cache is not None
             and time.monotonic() - self._voice_catalog_cached_at < 300
         ):
-            return {**self._voice_catalog_cache, "state": state}
+            return await self._omni_voice_view(self._voice_catalog_cache, state)
 
         timeout = aiohttp.ClientTimeout(total=90)
         base_url = str(self.config.base_url).rstrip("/")
@@ -296,17 +312,44 @@ class OmniusClient:
                     for model in models
                 ],
             }
-        # The Omnius catalog only knows Omnius' own backends. When the omni
-        # package is serving a stage, its model has to appear here or the UI
-        # selector cannot show what is actually loaded -- it would list
-        # Supertonic and Whisper while Qwen3 answers every request.
-        tts, asr = self._with_omni_catalog_entries(tts, asr)
         self._voice_catalog_cache = {"tts": tts, "asr": asr, "supertonic": supertonic}
         self._voice_catalog_cached_at = time.monotonic()
-        return {**self._voice_catalog_cache, "state": state}
+        return await self._omni_voice_view(self._voice_catalog_cache, state)
+
+    async def _omni_voice_view(
+        self, catalog: dict[str, object], state: dict[str, object]
+    ) -> dict[str, object]:
+        """Apply the omni view to a catalog that may have come from the cache.
+
+        Readiness changes far faster than the five-minute catalog cache, so
+        it is measured per request and stamped on the way out rather than
+        baked in. Doing this only on the cache-miss path left the voice page
+        reporting the stopped Whisper stage for up to five minutes at a
+        time, which is precisely the lie this is meant to prevent.
+        """
+
+        availability = (
+            await self._omni.availability()
+            if self._omni is not None and self._omni.enabled
+            else {"state": "disabled", "ready": False, "detail": None}
+        )
+        tts, asr = self._with_omni_catalog_entries(
+            dict(catalog.get("tts") or {}),  # type: ignore[arg-type]
+            dict(catalog.get("asr") or {}),  # type: ignore[arg-type]
+            availability,
+        )
+        return {
+            **catalog,
+            "tts": tts,
+            "asr": asr,
+            "state": self._with_omni_service_state(state, availability),
+        }
 
     def _with_omni_catalog_entries(
-        self, tts: dict[str, object], asr: dict[str, object]
+        self,
+        tts: dict[str, object],
+        asr: dict[str, object],
+        availability: dict[str, object] | bool | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         """Add the omni package to the catalog for whichever stages it serves.
 
@@ -319,12 +362,22 @@ class OmniusClient:
             return tts, asr
         config = self._omni.config
         exclusive = config.exclusive
+        # The voice page reads readiness off the selected entry. Without it
+        # the omni model always renders as "not ready", because the only
+        # other signal is the voice daemon's flag for the Whisper stage that
+        # omni mode stops on purpose.
+        availability = _as_availability(availability)
+        readiness = {
+            "weightsReady": bool(availability.get("ready")),
+            "state": availability.get("state"),
+            "detail": availability.get("detail"),
+        }
 
         if config.uses_speech:
             entry = {
                 "id": config.model,
                 "label": "Qwen3-TTS",
-                "backend": "qwen3-omni-adapter",
+                "backend": OMNI_BACKEND,
                 "enabled": True,
                 "isActive": True,
                 "voices": [
@@ -332,6 +385,7 @@ class OmniusClient:
                     for preset in self._omni_voice_presets()
                     if preset.get("id")
                 ],
+                "readiness": readiness,
             }
             existing = [
                 model
@@ -344,10 +398,11 @@ class OmniusClient:
             entry = {
                 "id": config.model,
                 "label": "Qwen3-Omni comprehension",
-                "backend": "qwen3-omni-adapter",
+                "backend": OMNI_BACKEND,
                 "isActive": True,
                 "liveEligible": True,
                 "liveReason": None,
+                "readiness": readiness,
             }
             existing = [
                 model
@@ -356,6 +411,52 @@ class OmniusClient:
             ]
             asr = {**asr, "models": [entry] + ([] if exclusive else existing)}
         return tts, asr
+
+    def _with_omni_service_state(
+        self, state: dict[str, object], availability: dict[str, object] | bool
+    ) -> dict[str, object]:
+        """Report the backend that actually serves each stage.
+
+        The voice daemon describes its own Whisper and Supertonic stages. In
+        omni mode those are stopped deliberately, so passing their state
+        through tells the voice page that ASR is not ready and that
+        Supertonic is speaking -- while Qwen3 is in fact doing both. Only
+        stages the omni package serves are rewritten; when it is not
+        exclusive and not serving, the daemon's own backends are genuinely
+        the ones answering and its state is left alone.
+        """
+
+        if self._omni is None or not self._omni.enabled:
+            return state
+        availability = _as_availability(availability)
+        serving = bool(availability.get("ready"))
+        phase = str(availability.get("state") or "")
+        config = self._omni.config
+        if not (serving or config.exclusive):
+            return state
+        merged = dict(state)
+        if config.uses_transcription:
+            merged.update(
+                {
+                    "asrEngineId": OMNI_BACKEND,
+                    "asrBackend": OMNI_BACKEND,
+                    "asrModelId": config.model,
+                    "asrReady": serving,
+                    "asrState": phase,
+                    "asrDetail": availability.get("detail"),
+                }
+            )
+        if config.uses_speech:
+            merged.update(
+                {
+                    "voiceBackend": OMNI_BACKEND,
+                    "voiceModelId": config.model,
+                    "voiceReady": serving,
+                    "voiceState": phase,
+                    "voiceDetail": availability.get("detail"),
+                }
+            )
+        return merged
 
     def _omni_voice_presets(self) -> list[dict[str, object]]:
         if self._omni is None:

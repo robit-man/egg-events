@@ -967,8 +967,16 @@ PAGE = r"""<!doctype html>
       $('#voice [name=voice_name]').disabled = !voices.length;
       const service = catalog.state || {};
       const selectedAsr = (catalog.asr?.models || []).find(model => model.id === $('#voice [name=asr_model]').value);
-      const asrReady = selectedAsr?.readiness?.weightsReady === true || service.asrReady === true;
-      $('#voice-service-state').innerHTML = `<span class="badge good">Daemon online</span><span class="badge ${asrReady ? 'good' : 'warn'}">ASR ${esc($('#voice [name=asr_model]').value || 'unknown')} ${asrReady ? 'ready' : 'not ready'}</span><span class="badge ${service.voiceReady ? 'good' : 'warn'}">TTS ${esc(service.voiceModelId || $('#voice [name=voice_model]').value || 'stopped')} ${service.voiceReady ? 'ready' : 'stopped'}</span>`;
+      // A managed stage that is released or loading is on standby, not
+      // broken: it answers when a turn asks for it. Showing that as a fault
+      // trains the reader to ignore the badge.
+      const asrInfo = selectedAsr?.readiness || {};
+      const asrReady = asrInfo.weightsReady === true || service.asrReady === true;
+      const phase = (state) => ({ready:'ready', standby:'on standby', unavailable:'not ready', disabled:'off'})[state] || null;
+      const asrPhaseLabel = phase(asrInfo.state || service.asrState) || (asrReady ? 'ready' : 'not ready');
+      const ttsPhaseLabel = phase(service.voiceState) || (service.voiceReady ? 'ready' : 'stopped');
+      const ttsReady = service.voiceReady === true;
+      $('#voice-service-state').innerHTML = `<span class="badge good">Daemon online</span><span class="badge ${asrReady ? 'good' : 'warn'}" title="${esc(asrInfo.detail || service.asrDetail || '')}">ASR ${esc($('#voice [name=asr_model]').value || 'unknown')} ${esc(asrPhaseLabel)}</span><span class="badge ${ttsReady ? 'good' : 'warn'}" title="${esc(service.voiceDetail || '')}">TTS ${esc(service.voiceModelId || $('#voice [name=voice_model]').value || 'stopped')} ${esc(ttsPhaseLabel)}</span>`;
       $('#voice-catalog-status').innerHTML = `<span class="badge">${esc(asr.length)} ASR models</span><span class="badge">${esc(tts.length)} TTS models</span><span class="badge">${esc(voices.length)} voices</span>`;
     }
 

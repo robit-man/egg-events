@@ -138,6 +138,16 @@ class WeightResidencyManager:
     def register(self, component: Component) -> None:
         self._components[component.name] = component
 
+    def manages(self, name: str) -> bool:
+        """Whether this component's lifecycle belongs to the manager.
+
+        A managed component that is not running is on standby -- released to
+        reclaim memory and loaded again on demand -- rather than broken, and
+        callers reporting status need to tell those two apart.
+        """
+
+        return name in self._components
+
     async def release_idle(self) -> list[str]:
         """Unload components that have gone unused past their idle window.
 

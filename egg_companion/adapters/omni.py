@@ -222,6 +222,16 @@ class OmniAdapterClient:
             "speech": self.config.uses_speech,
         }
 
+    def _clear_failure_state(self) -> None:
+        """Forget an earlier failure so the next call re-checks for itself.
+
+        Health is left unasserted rather than assumed: this clears the
+        cooldown, it does not claim the adapter is up.
+        """
+
+        self._cooldown_until = 0.0
+        self._healthy_until = 0.0
+
     def _note_failure(self, error: BaseException) -> None:
         """Park the adapter after a failure so turns stop paying its timeout."""
 
@@ -253,6 +263,63 @@ class OmniAdapterClient:
         self._cooldown_until = 0.0
         self._last_error = None
         return payload
+
+    async def probe(self) -> bool:
+        """Ask the adapter directly, ignoring the cached health window.
+
+        Routing deliberately has hysteresis: a healthy TTL keeps turns off
+        the timeout path, and a failure cooldown keeps them off an adapter
+        known to be down. That is right for choosing where to send work and
+        wrong for a status display, which has to show what is true now --
+        reusing the cache made the voice page report health for the whole
+        TTL after the adapter died, and failure for the whole cooldown after
+        it came back.
+
+        It says nothing about whether a worker's weights are resident: those
+        are load-on-demand, and a swap in progress is ordinary operation.
+        """
+
+        if not self.enabled:
+            return False
+        try:
+            await self.health()
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OmniAdapterError,
+            OSError,
+        ) as error:
+            # Deliberately not _note_failure: a status poll must not park the
+            # adapter. Letting it open the failure cooldown meant that merely
+            # looking at the voice page made the next turn refuse, and while
+            # the manager idle-releases this unit as a matter of course, the
+            # poll that saw it down would keep it down.
+            logger.debug("omni adapter probe failed: %s", error)
+            self._last_error = f"{type(error).__name__}: {error}"
+            return False
+        return True
+
+    async def availability(self, component: str = SPEECH_COMPONENT) -> dict[str, object]:
+        """How a status display should describe this stage.
+
+        Three states, because up-or-down is the wrong question for a managed
+        component. The residency manager stops the speech unit to reclaim
+        memory and starts it again on demand, so an adapter that is not
+        answering this second is usually on standby rather than broken. A
+        badge that goes red on every idle release teaches the reader to
+        ignore it just as surely as one that never goes red at all.
+        """
+
+        if not self.enabled:
+            return {"state": "disabled", "ready": False, "detail": None}
+        if await self.probe():
+            return {"state": "ready", "ready": True, "detail": None}
+        if self._residency is not None and self._residency.manages(component):
+            # Released or still loading. It answers when a turn asks for it;
+            # if admission genuinely fails, that turn records the reason here
+            # and the next poll reports unavailable.
+            return {"state": "standby", "ready": True, "detail": self._last_error}
+        return {"state": "unavailable", "ready": False, "detail": self._last_error}
 
     async def contract(self) -> dict[str, Any]:
         """Return the adapter's own versioned wire contract."""
@@ -393,15 +460,34 @@ class OmniAdapterClient:
             yield
             return
         try:
-            if component == self.SPEECH_COMPONENT:
-                # The TTS worker is non-persistent: the service being up says
-                # nothing about whether the worker can spawn. Reserve the room
-                # it actually needs, or fail over before the attempt rather
-                # than after it.
-                await self._residency.ensure_headroom(
-                    self.config.speech_headroom_gib, exclude=component
-                )
-            async with self._residency.require(component):
+            async with contextlib.AsyncExitStack() as stack:
+                if component != self.SPEECH_COMPONENT and self._residency.manages(
+                    self.SPEECH_COMPONENT
+                ):
+                    # Every task reaches the weights through the adapter
+                    # daemon, and that daemon is the unit the speech component
+                    # manages. Holding only the comprehension worker let the
+                    # manager evict the daemon to make room for it, tearing
+                    # down the HTTP server the very same request was about to
+                    # use -- which surfaced as the adapter being unreachable
+                    # moments after the manager reported a successful load.
+                    await stack.enter_async_context(
+                        self._residency.require(self.SPEECH_COMPONENT)
+                    )
+                elif component == self.SPEECH_COMPONENT:
+                    # The TTS worker is non-persistent: the service being up
+                    # says nothing about whether the worker can spawn. Reserve
+                    # the room it actually needs, or fail over before the
+                    # attempt rather than after it.
+                    await self._residency.ensure_headroom(
+                        self.config.speech_headroom_gib, exclude=component
+                    )
+                await stack.enter_async_context(self._residency.require(component))
+                # The manager has just brought this component up, which is
+                # newer information than any earlier failure. Without this the
+                # cooldown opened by the eviction outlived the reload and the
+                # turn was refused against an adapter that was already back.
+                self._clear_failure_state()
                 yield
         except ResidencyRefused as error:
             logger.info("omni %s is not resident and will not fit: %s", component, error)
