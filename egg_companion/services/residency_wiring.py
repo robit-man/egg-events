@@ -8,6 +8,8 @@ Egg's particular models.
 from __future__ import annotations
 
 import logging
+import re
+from pathlib import Path
 
 import aiohttp
 
@@ -106,6 +108,37 @@ def ollama_component(
     )
 
 
+def _warn_on_context_drift(settings) -> None:
+    """Complain if the unit's -c disagrees with what the manager budgets.
+
+    A worker started with a larger window than the manager sized is admitted
+    on a footprint it will exceed, and is then killed by its own cgroup cap
+    part-way through a turn -- which presents as the assistant disconnecting
+    rather than as a memory fault.
+    """
+
+    unit_path = (
+        Path.home() / ".config/systemd/user" / settings.comprehension_unit
+    )
+    try:
+        text = unit_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    match = re.search(r"-c\s+(\d+)", text)
+    if not match:
+        return
+    started_with = int(match.group(1))
+    if started_with != settings.comprehension_context_tokens:
+        logger.warning(
+            "residency: %s starts the comprehension worker with -c %d but the "
+            "budget assumes %d; regenerate the unit or the worker may be "
+            "OOM-killed mid-turn",
+            settings.comprehension_unit,
+            started_with,
+            settings.comprehension_context_tokens,
+        )
+
+
 def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
     """Register every heavy component this deployment can load.
 
@@ -120,6 +153,7 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
         return None
 
     manager = WeightResidencyManager(reserve_gib=settings.reserve_gib)
+    _warn_on_context_drift(settings)
     adapter_base = str(config.omni_adapter.base_url).rstrip("/")
 
     manager.register(

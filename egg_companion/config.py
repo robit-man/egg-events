@@ -234,6 +234,12 @@ class ResidencyConfig(BaseModel):
     # nothing, so do not expect context to be the lever for fitting this.
     comprehension_cost_gib: float = Field(default=16.7, gt=0, le=64)
     comprehension_unit: str = "egg-omni-comprehension.service"
+    # The context the comprehension worker is started with. The manager budgets
+    # against this, so the unit's -c must match it. They drifted once -- the
+    # manager sized a 4096 window while the unit ran 8192 -- and the worker was
+    # OOM-killed by its own cgroup cap mid-utterance, which looked from outside
+    # like the assistant simply disconnecting.
+    comprehension_context_tokens: int = Field(default=4096, ge=1024, le=131072)
     comprehension_priority: int = 10
     comprehension_load_timeout_seconds: float = Field(default=420, gt=0, le=3600)
     # Release comprehension after this long unused. Holding 16.8 GiB while

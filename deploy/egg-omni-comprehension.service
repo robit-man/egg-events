@@ -7,18 +7,23 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=@VENDOR_DIR@
 # Started and stopped on demand by the companion's residency manager, which
-# admits it only when its measured ~16.8 GiB genuinely fits. Do not enable
+# admits it only when its measured footprint genuinely fits. Do not enable
 # this unit: booting it unconditionally is what over-commits the module.
+#
+# The context here must match residency.comprehension_context_tokens, which is
+# what the manager budgets against. They drifted once -- the manager sized a
+# 4096 window while this ran 8192 -- and the worker was OOM-killed mid-turn.
 ExecStart=@VENDOR_DIR@/vendor/llama.cpp/build/bin/llama-server \
   -m @VENDOR_DIR@/runtime-data/components/comprehension-model.gguf \
   --mmproj @VENDOR_DIR@/runtime-data/components/comprehension-projector.gguf \
-  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c 8192
+  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c 4096
 Restart=no
 TimeoutStopSec=60
 UMask=0077
-# A ceiling below the module's capacity: if the worker ever exceeds its
-# measured footprint, systemd kills it rather than the machine dying.
-MemoryMax=22G
+# Above the measured footprint with room for the load-time peak. The residency
+# manager is what prevents over-commit; this is only a backstop, and a cap that
+# kills the worker mid-utterance is worse than no cap at all.
+MemoryMax=26G
 
 [Install]
 WantedBy=default.target
