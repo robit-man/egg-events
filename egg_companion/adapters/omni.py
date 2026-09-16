@@ -229,10 +229,14 @@ class OmniAdapterClient:
         self._cooldown_until = time.monotonic() + self.config.failure_cooldown_seconds
         self._last_error = f"{type(error).__name__}: {error}"
 
-    async def health(self) -> dict[str, object]:
+    async def health(self, timeout_seconds: float | None = None) -> dict[str, object]:
         """Probe the adapter, raising on any failure. Used by the audit."""
 
-        timeout = aiohttp.ClientTimeout(total=self.config.health_timeout_seconds)
+        timeout = aiohttp.ClientTimeout(
+            total=timeout_seconds
+            if timeout_seconds is not None
+            else self.config.health_timeout_seconds
+        )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
                 f"{self._base_url()}/healthz", headers=self._headers()
@@ -389,6 +393,14 @@ class OmniAdapterClient:
             yield
             return
         try:
+            if component == self.SPEECH_COMPONENT:
+                # The TTS worker is non-persistent: the service being up says
+                # nothing about whether the worker can spawn. Reserve the room
+                # it actually needs, or fail over before the attempt rather
+                # than after it.
+                await self._residency.ensure_headroom(
+                    self.config.speech_headroom_gib, exclude=component
+                )
             async with self._residency.require(component):
                 yield
         except ResidencyRefused as error:

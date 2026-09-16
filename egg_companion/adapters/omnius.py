@@ -79,6 +79,9 @@ class OmniusClient:
         # pass. It is deliberately kept apart from the transcript: room sound
         # is never something the user said.
         self.last_audio_observation: dict[str, object] = {}
+        # Which backend actually spoke last, and why it was not the adapter.
+        self.last_speech_backend: str | None = None
+        self.last_speech_fallback_reason: str | None = None
         # Bounded sound-only observations awaiting the next spoken turn. A
         # capture that contained no speech still heard something worth knowing
         # -- a door, a kettle, someone else arriving -- but it must not trigger
@@ -4357,11 +4360,23 @@ class OmniusClient:
     async def synthesize(self, text: str) -> bytes:
         if self._omni is not None and self._omni.config.uses_speech:
             try:
-                return await self._omni.synthesize(text)
-            except OmniAdapterUnavailable as error:
-                logger.debug("Omni adapter speech unavailable: %s", error)
-            except OmniAdapterError as error:
-                logger.warning("Omni adapter speech failed: %s", error)
+                audio = await self._omni.synthesize(text)
+            except (OmniAdapterUnavailable, OmniAdapterError) as error:
+                # A downgrade the listener can hear must not be invisible: the
+                # voice changing with nothing logged and the adapter still
+                # reporting healthy is indistinguishable from a bug.
+                self.last_speech_backend = "omnius-fallback"
+                self.last_speech_fallback_reason = str(error)
+                logger.warning(
+                    "speech fell back to %s: %s", self.config.voice_model, error
+                )
+            else:
+                self.last_speech_backend = "qwen3-tts"
+                self.last_speech_fallback_reason = None
+                return audio
+        else:
+            self.last_speech_backend = self.config.voice_model
+            self.last_speech_fallback_reason = None
         return await self._synthesize_via_omnius(text)
 
     async def _synthesize_via_omnius(self, text: str) -> bytes:

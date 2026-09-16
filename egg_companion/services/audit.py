@@ -258,7 +258,9 @@ async def audit_hardware(config: EggConfig) -> list[AuditCheck]:
     omni_adapter = OmniAdapterClient(config.omni_adapter)
     if config.omni_adapter.enabled:
         try:
-            await omni_adapter.health()
+            await omni_adapter.health(
+                timeout_seconds=config.omni_adapter.audit_health_timeout_seconds
+            )
             contract = await omni_adapter.contract()
             checks.append(
                 AuditCheck(

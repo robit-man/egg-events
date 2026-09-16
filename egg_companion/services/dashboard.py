@@ -212,6 +212,14 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             "readiness": readiness.snapshot(),
             "omnius": str(config.omnius.base_url),
             "omni_adapter": omni_adapter,
+            "speech_backend": (
+                {
+                    "last": runtime._omnius.last_speech_backend,
+                    "fallback_reason": runtime._omnius.last_speech_fallback_reason,
+                }
+                if isinstance(runtime, CompanionRuntime)
+                else None
+            ),
             "residency": residency,
             "telemetry": telemetry,
             "identities": identities,

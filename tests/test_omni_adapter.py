@@ -1079,3 +1079,70 @@ def test_a_resident_component_is_pinned_for_the_request(monkeypatch) -> None:
     assert seen == [True]
     # And released afterwards.
     assert manager._components["omni_comprehension"].pinned is False
+
+
+# -- an audible downgrade must never be silent --------------------------
+
+
+def test_a_speech_fallback_is_recorded(monkeypatch) -> None:
+    """The voice changing with nothing logged is indistinguishable from a bug."""
+
+    adapter = _client(speech_enabled=True)
+
+    async def refuse(text):
+        raise OmniAdapterUnavailable("omni_speech cannot be made resident")
+
+    adapter.synthesize = refuse
+    client = _omnius(adapter)
+
+    async def omnius_path(text):
+        return b"RIFFsupertonic"
+
+    client._synthesize_via_omnius = omnius_path
+    assert asyncio.run(client.synthesize("hello")) == b"RIFFsupertonic"
+
+    assert client.last_speech_backend == "omnius-fallback"
+    assert "cannot be made resident" in client.last_speech_fallback_reason
+
+
+def test_a_successful_omni_utterance_records_its_backend() -> None:
+    adapter = _client(speech_enabled=True)
+
+    async def speak(text):
+        return b"RIFFomni"
+
+    adapter.synthesize = speak
+    client = _omnius(adapter)
+
+    assert asyncio.run(client.synthesize("hello")) == b"RIFFomni"
+    assert client.last_speech_backend == "qwen3-tts"
+    assert client.last_speech_fallback_reason is None
+
+
+def test_speech_reserves_worker_headroom_before_attempting(monkeypatch) -> None:
+    """The service being up is not the same as the worker fitting."""
+
+    from egg_companion.services import residency as residency_module
+    from egg_companion.services.residency import (
+        ResidencyRefused,
+        WeightResidencyManager,
+    )
+
+    monkeypatch.setattr(residency_module, "available_memory_gib", lambda: 2.8)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    # The service probes as loaded, but nothing can be reclaimed.
+    manager.register(
+        _residency_component("omni_speech", 4.0, loaded=True, fits=True)
+    )
+    client = OmniAdapterClient(
+        OmniAdapterConfig(mode="omni", speech_enabled=True), manager
+    )
+    client._healthy_until = float("inf")
+
+    async def unreachable(*args, **kwargs):
+        raise AssertionError("must not attempt speech without headroom")
+
+    client._post = unreachable
+
+    with pytest.raises(OmniAdapterUnavailable, match="headroom"):
+        asyncio.run(client.synthesize("hello"))

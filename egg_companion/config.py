@@ -322,8 +322,16 @@ class OmniAdapterConfig(BaseModel):
     # Comprehension of a bounded speech segment on the integrated Jetson GPU.
     timeout_seconds: float = Field(default=45, gt=0, le=300)
     speech_timeout_seconds: float = Field(default=90, gt=0, le=600)
+    # Room the non-persistent Qwen3-TTS worker needs to spawn. Reserved before
+    # each utterance, because the speech service being up is not the same as
+    # the worker fitting -- measured at ~4 GiB plus the manager's reserve.
+    speech_headroom_gib: float = Field(default=7.0, ge=1, le=32)
     video_timeout_seconds: float = Field(default=180, gt=0, le=900)
     health_timeout_seconds: float = Field(default=3, gt=0, le=30)
+    # The startup audit probes once, while the machine is at its busiest
+    # bringing every service up. Holding it to the per-turn budget reports a
+    # healthy adapter as degraded for no better reason than contention.
+    audit_health_timeout_seconds: float = Field(default=20, gt=0, le=120)
     # A passed health probe is trusted for this long, so ordinary turns do not
     # pay an extra round trip before every perception call.
     health_ttl_seconds: float = Field(default=30, gt=0, le=600)

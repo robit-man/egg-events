@@ -257,6 +257,56 @@ class WeightResidencyManager:
                 + (f" (pinned: {', '.join(pinned)})" if pinned else "")
             )
 
+    async def ensure_headroom(self, gib: float, *, exclude: str = "") -> None:
+        """Evict until ``gib`` is genuinely free, or refuse.
+
+        Some costs are not a component's residency but a transient spawn: the
+        TTS worker is non-persistent, so its service being up says nothing
+        about whether the ~4 GiB worker can start. Admission on the service
+        alone is how a request reaches a worker that cannot fit and silently
+        falls back.
+        """
+
+        async with self._lock:
+            if available_memory_gib() >= gib:
+                return
+            candidates = [
+                item
+                for item in await self._loaded_components()
+                if item.name != exclude and not item.pinned
+            ]
+            candidates.sort(key=lambda item: (item.priority, item._last_used))
+            reclaimable = sum(item.cost_gib for item in candidates)
+            if available_memory_gib() + reclaimable < gib:
+                raise ResidencyRefused(
+                    f"{gib:.1f} GiB of headroom is needed but only "
+                    f"{available_memory_gib():.1f} GiB is available and at most "
+                    f"{reclaimable:.1f} GiB can be reclaimed"
+                )
+            for candidate in candidates:
+                logger.info(
+                    "residency: evicting %s (%.1f GiB) to free %.1f GiB of headroom",
+                    candidate.name,
+                    candidate.cost_gib,
+                    gib,
+                )
+                try:
+                    await candidate.unload()
+                except Exception as error:  # noqa: BLE001 - best effort
+                    logger.warning(
+                        "residency: could not unload %s: %s", candidate.name, error
+                    )
+                    continue
+                for _ in range(20):
+                    if available_memory_gib() >= gib:
+                        return
+                    await asyncio.sleep(0.5)
+            if available_memory_gib() < gib:
+                raise ResidencyRefused(
+                    f"{gib:.1f} GiB of headroom could not be freed; "
+                    f"{available_memory_gib():.1f} GiB available"
+                )
+
     @contextlib.asynccontextmanager
     async def require(self, name: str) -> AsyncIterator[Component]:
         """Ensure ``name`` is resident for the duration of the block.
