@@ -1,0 +1,37 @@
+[Unit]
+Description=Qwen Omni adapter for the Egg companion
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@VENDOR_DIR@
+Environment=OMNI_REPO_ROOT=@VENDOR_DIR@
+Environment=OMNI_MODEL=robit/ornith-1.5-omni:q4km
+Environment=OMNI_LANGUAGE_MODEL=robit/ornith-1.5-omni:q4km
+Environment=OMNI_ADAPTER_PORT=8910
+Environment=OMNI_KEEP_CACHE=1
+# Qwen3-Omni comprehension is ~16.8 GiB resident. Measured on this 32 GB
+# module it cannot coexist with Ollama's language model, Qwen3-TTS and the
+# companion (needs ~37 GiB against 29.98 usable) -- it froze the machine.
+# Run speech only: the logical tag still serves language and vision through
+# Ollama, and Qwen3-TTS provides the voice.
+Environment=OMNI_ENABLE_COMPREHENSION=0
+Environment=OMNI_COMPREHENSION_URL=http://127.0.0.1:8901/v1/chat/completions
+# The TTS worker exits between utterances instead of staying resident, so its
+# ~4 GiB is only held while actually speaking.
+Environment=OMNI_TTS_PERSISTENT=0
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@VENDOR_DIR@/.venv/bin/qwen-omni-daemon serve --allow-direct-gpu --no-tunnel
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+UMask=0077
+# A hard ceiling so a misconfigured component is killed by systemd instead of
+# taking the whole machine down with it, as an unbounded load already did once.
+MemoryMax=12G
+MemorySwapMax=2G
+
+[Install]
+WantedBy=default.target

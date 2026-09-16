@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -47,6 +48,10 @@ import aiohttp
 import numpy as np
 
 from egg_companion.config import OmniAdapterConfig
+from egg_companion.services.residency import (
+    ResidencyRefused,
+    WeightResidencyManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +159,21 @@ def _tagged(pattern: re.Pattern[str], text: str) -> str | None:
 class OmniAdapterClient:
     """Speak ``robit.ollama.omni-adapter.v1`` to a local adapter server."""
 
-    def __init__(self, config: OmniAdapterConfig) -> None:
+    # Which registered component each route needs resident. The names match
+    # what the runtime registers with the residency manager.
+    COMPREHENSION_COMPONENT = "omni_comprehension"
+    SPEECH_COMPONENT = "omni_speech"
+
+    def __init__(
+        self,
+        config: OmniAdapterConfig,
+        residency: WeightResidencyManager | None = None,
+    ) -> None:
         self.config = config
+        # The parent manager that guarantees these weights fit before they are
+        # loaded. Without one the client behaves as before and assumes whoever
+        # started the adapter sized it.
+        self._residency = residency
         self._healthy_until = 0.0
         self._cooldown_until = 0.0
         self._last_error: str | None = None
@@ -358,6 +376,27 @@ class OmniAdapterClient:
             "data": base64.b64encode(wav_audio).decode("ascii"),
         }
 
+    @contextlib.asynccontextmanager
+    async def _resident(self, component: str) -> AsyncIterator[None]:
+        """Hold ``component`` resident for this request.
+
+        A refusal is surfaced as ``OmniAdapterUnavailable`` so it degrades
+        through the same fallback as an unhealthy adapter: not having the
+        capability this turn is recoverable, and an over-commit is not.
+        """
+
+        if self._residency is None:
+            yield
+            return
+        try:
+            async with self._residency.require(component):
+                yield
+        except ResidencyRefused as error:
+            logger.info("omni %s is not resident and will not fit: %s", component, error)
+            raise OmniAdapterUnavailable(
+                f"{component} cannot be made resident: {error}"
+            ) from error
+
     # -- perception ------------------------------------------------------
 
     async def perceive_audio(self, wav_audio: bytes) -> dict[str, object]:
@@ -381,7 +420,10 @@ class OmniAdapterClient:
                 }
             ],
         )
-        result = await self._post(payload, timeout_seconds=self.config.timeout_seconds)
+        async with self._resident(self.COMPREHENSION_COMPONENT):
+            result = await self._post(
+                payload, timeout_seconds=self.config.timeout_seconds
+            )
         metadata = self._adapter_metadata(result)
         observation = str(
             metadata.get("observation") or self._message(result).get("content") or ""
@@ -415,7 +457,10 @@ class OmniAdapterClient:
             messages=[{"role": "user", "content": "", "audios": [self._audio_envelope(audio)]}],
             require_speech=True,
         )
-        result = await self._post(payload, timeout_seconds=self.config.timeout_seconds)
+        async with self._resident(self.COMPREHENSION_COMPONENT):
+            result = await self._post(
+                payload, timeout_seconds=self.config.timeout_seconds
+            )
         metadata = self._adapter_metadata(result)
         transcript = metadata.get("input_transcript")
         if not isinstance(transcript, str) or not transcript.strip():
@@ -470,9 +515,10 @@ class OmniAdapterClient:
             ],
             include_audio_from_video=bool(resolved_audio),
         )
-        result = await self._post(
-            payload, timeout_seconds=self.config.video_timeout_seconds
-        )
+        async with self._resident(self.COMPREHENSION_COMPONENT):
+            result = await self._post(
+                payload, timeout_seconds=self.config.video_timeout_seconds
+            )
         metadata = self._adapter_metadata(result)
         observation = str(
             metadata.get("observation") or self._message(result).get("content") or ""
@@ -625,7 +671,9 @@ class OmniAdapterClient:
         expected = 0
         produced = False
         try:
-            async with self._gate:
+            # Pinned for the whole stream: weights must not be evicted between
+            # decoder windows, which would cut an utterance in half.
+            async with self._resident(self.SPEECH_COMPONENT), self._gate:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(
                         f"{self._base_url()}/api/chat/stream",
@@ -712,9 +760,10 @@ class OmniAdapterClient:
             speech=self._speech_settings(),
             think=think,
         )
-        result = await self._post(
-            payload, timeout_seconds=self.config.speech_timeout_seconds
-        )
+        async with self._resident(self.SPEECH_COMPONENT):
+            result = await self._post(
+                payload, timeout_seconds=self.config.speech_timeout_seconds
+            )
         message = self._message(result)
         text = str(message.get("content") or "").strip()
         audio_envelope = message.get("audio")
@@ -760,9 +809,10 @@ class OmniAdapterClient:
             speech_mode="always",
             speech=self._speech_settings(),
         )
-        result = await self._post(
-            payload, timeout_seconds=self.config.speech_timeout_seconds
-        )
+        async with self._resident(self.SPEECH_COMPONENT):
+            result = await self._post(
+                payload, timeout_seconds=self.config.speech_timeout_seconds
+            )
         audio = self._message(result).get("audio")
         if not isinstance(audio, dict) or not audio.get("data"):
             raise OmniAdapterError("Omni adapter returned no synthesized audio")

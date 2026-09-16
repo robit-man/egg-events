@@ -201,12 +201,18 @@ async def serve_dashboard(config: EggConfig, port: int) -> None:
             if isinstance(runtime, CompanionRuntime)
             else {"enabled": config.omni_adapter.enabled, "healthy": False}
         )
+        residency = (
+            runtime._residency.status()
+            if isinstance(runtime, CompanionRuntime) and runtime._residency is not None
+            else None
+        )
         return web.json_response({
             "runtime": state["runtime"],
             "checks": [{"name": check.name, "status": check.status, "detail": check.detail} for check in state["checks"]],
             "readiness": readiness.snapshot(),
             "omnius": str(config.omnius.base_url),
             "omni_adapter": omni_adapter,
+            "residency": residency,
             "telemetry": telemetry,
             "identities": identities,
             "identity_summary": identity_summary,

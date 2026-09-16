@@ -210,6 +210,48 @@ class OmniusConfig(BaseModel):
     visual_contact_sheet_size: int = Field(default=768, ge=512, le=1536)
 
 
+class ResidencyConfig(BaseModel):
+    """Memory budget for the heavy model components.
+
+    Unified memory has no separate VRAM to overflow into, so an over-commit
+    does not merely kill the offending process -- on this device it froze the
+    machine. The manager admits a component only when its measured cost plus
+    this reserve genuinely fits, and refuses otherwise.
+
+    The costs below are measured on a 32 GB AGX Orin, not derived from file
+    size: on Tegra the GPU allocation is not the weight file.
+    """
+
+    enabled: bool = True
+    # Headroom the manager will not spend. The OS, page cache, and the
+    # companion's own allocations move underneath a load that was sized at
+    # admission time.
+    reserve_gib: float = Field(default=3.0, ge=0.5, le=16)
+    # Qwen3-Omni comprehension at an 8K window. The most expensive to reload,
+    # so it outranks everything else and is evicted last.
+    comprehension_cost_gib: float = Field(default=16.8, gt=0, le=64)
+    comprehension_unit: str = "egg-omni-comprehension.service"
+    comprehension_priority: int = 10
+    comprehension_load_timeout_seconds: float = Field(default=420, gt=0, le=3600)
+    # The Qwen3-TTS worker, which is non-persistent and so only holds this
+    # while actually speaking.
+    speech_cost_gib: float = Field(default=4.0, gt=0, le=32)
+    speech_unit: str = "egg-omni-adapters.service"
+    speech_priority: int = 5
+    speech_load_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    # Ollama serving the logical tag. Measured by unloading it and watching
+    # MemAvailable: 15.6 GiB, not the 5.6 GiB `ollama ps` reports. On Tegra
+    # the nvmap allocation is roughly 10 GiB beyond the reported model size,
+    # and registering the reported figure makes the manager believe it cannot
+    # reclaim enough to admit anything larger.
+    #
+    # Registered so the budget accounts for Ollama even though Ollama owns its
+    # own lifetime -- an unregistered consumer of the same pool is a hole in
+    # the guarantee.
+    language_cost_gib: float = Field(default=15.6, gt=0, le=64)
+    language_priority: int = 8
+
+
 class OmniAdapterConfig(BaseModel):
     """Qwen Omni adapter (``robit.ollama.omni-adapter.v1``) routing.
 
@@ -780,6 +822,7 @@ class EggConfig(BaseModel):
     )
     omnius: OmniusConfig
     omni_adapter: OmniAdapterConfig = Field(default_factory=OmniAdapterConfig)
+    residency: ResidencyConfig = Field(default_factory=ResidencyConfig)
     system_service: SystemServiceConfig | None = None
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     activity: ActivityConfig = Field(default_factory=ActivityConfig)

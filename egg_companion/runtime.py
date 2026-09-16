@@ -36,6 +36,7 @@ from egg_companion.adapters.audio import (
 )
 from egg_companion.adapters.camera import CameraStream
 from egg_companion.adapters.depth import DepthEstimator
+from egg_companion.services.residency_wiring import build_residency_manager
 from egg_companion.adapters.omni import (
     OmniAdapterClient,
     OmniAdapterError,
@@ -224,7 +225,9 @@ class CompanionRuntime:
         # The Qwen Omni adapter is optional and independently supervised.
         # Constructing it is free -- it opens no connection until a call --
         # and every route through it falls back to Omnius on failure.
-        self._omni_adapter = OmniAdapterClient(config.omni_adapter)
+        # The parent manager: nothing heavy loads unless it demonstrably fits.
+        self._residency = build_residency_manager(config)
+        self._omni_adapter = OmniAdapterClient(config.omni_adapter, self._residency)
         self._omni_adapter_start_attempt = 0.0
         # Rolling, downscaled per-camera clips for the Omni video comprehension
         # path. A still frame cannot answer "what just happened"; this is the

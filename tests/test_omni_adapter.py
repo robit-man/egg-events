@@ -960,3 +960,122 @@ def test_a_spoken_turn_does_not_retain_its_own_sound_as_pending_context() -> Non
     # It belongs to this turn's evidence, not to the queue awaiting a later one.
     assert client.pending_audio_context == []
     assert client.last_audio_observation["observation"] == "a kettle whistles"
+
+
+# -- residency integration -----------------------------------------------
+
+
+def _refusing_manager():
+    """A manager that cannot admit anything."""
+
+    from egg_companion.services.residency import WeightResidencyManager
+
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager.register(
+        _residency_component("omni_comprehension", 16.8, loaded=False, fits=False)
+    )
+    manager.register(_residency_component("omni_speech", 4.0, loaded=False, fits=False))
+    return manager
+
+
+def _residency_component(name: str, cost: float, *, loaded: bool, fits: bool):
+    from egg_companion.services.residency import Component
+
+    state = {"loaded": loaded}
+
+    async def load() -> None:
+        if not fits:
+            raise AssertionError("must not attempt a load that cannot fit")
+        state["loaded"] = True
+
+    async def unload() -> None:
+        state["loaded"] = False
+
+    async def is_loaded() -> bool:
+        return state["loaded"]
+
+    return Component(
+        name=name, cost_gib=cost, load=load, unload=unload, is_loaded=is_loaded
+    )
+
+
+def test_a_refused_component_degrades_like_an_unhealthy_adapter(monkeypatch) -> None:
+    """Losing a capability this turn is recoverable; an over-commit is not."""
+
+    from egg_companion.services import residency as residency_module
+
+    monkeypatch.setattr(residency_module, "available_memory_gib", lambda: 1.0)
+    client = OmniAdapterClient(
+        OmniAdapterConfig(mode="omni"), _refusing_manager()
+    )
+    client._healthy_until = float("inf")
+
+    async def unreachable(*args, **kwargs):
+        raise AssertionError("the adapter must not be called without residency")
+
+    client._post = unreachable
+
+    with pytest.raises(OmniAdapterUnavailable, match="cannot be made resident"):
+        asyncio.run(client.perceive_audio(_wav()))
+
+
+def test_speech_is_refused_the_same_way(monkeypatch) -> None:
+    from egg_companion.services import residency as residency_module
+
+    monkeypatch.setattr(residency_module, "available_memory_gib", lambda: 1.0)
+    client = OmniAdapterClient(
+        OmniAdapterConfig(mode="omni", speech_enabled=True), _refusing_manager()
+    )
+    client._healthy_until = float("inf")
+
+    async def unreachable(*args, **kwargs):
+        raise AssertionError("the adapter must not be called without residency")
+
+    client._post = unreachable
+
+    with pytest.raises(OmniAdapterUnavailable):
+        asyncio.run(client.synthesize("hello"))
+
+
+def test_a_client_without_a_manager_behaves_as_before() -> None:
+    """Residency is optional; an unmanaged deployment is unchanged."""
+
+    client = _client()
+    calls: list[str] = []
+
+    async def respond(payload, *, timeout_seconds):
+        calls.append("posted")
+        return _adapter_response(observation="<speech_transcript>hi</speech_transcript>")
+
+    client._post = respond
+    result = asyncio.run(client.perceive_audio(_wav()))
+
+    assert result["transcript"] == "hi"
+    assert calls == ["posted"]
+
+
+def test_a_resident_component_is_pinned_for_the_request(monkeypatch) -> None:
+    """Weights must not be evicted mid-request."""
+
+    from egg_companion.services import residency as residency_module
+    from egg_companion.services.residency import WeightResidencyManager
+
+    monkeypatch.setattr(residency_module, "available_memory_gib", lambda: 25.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
+    manager.register(
+        _residency_component("omni_comprehension", 16.8, loaded=True, fits=True)
+    )
+    client = OmniAdapterClient(OmniAdapterConfig(mode="omni"), manager)
+    client._healthy_until = float("inf")
+    seen: list[bool] = []
+
+    async def respond(payload, *, timeout_seconds):
+        seen.append(manager._components["omni_comprehension"].pinned)
+        return _adapter_response(observation="<speech_transcript>hi</speech_transcript>")
+
+    client._post = respond
+    asyncio.run(client.perceive_audio(_wav()))
+
+    assert seen == [True]
+    # And released afterwards.
+    assert manager._components["omni_comprehension"].pinned is False
