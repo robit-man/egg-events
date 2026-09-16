@@ -552,6 +552,63 @@ class OmniAdapterClient:
             )
         return self._message(result)
 
+    def _portal_token(self) -> str:
+        """Read the token the daemon minted for this run of the portal.
+
+        It is rewritten on every daemon start, so it is read per call rather
+        than cached: the residency manager stops and starts that unit as a
+        matter of course, and a cached token would be stale from the first
+        eviction onwards.
+        """
+
+        path = Path(self.config.portal_token_path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raise OmniAdapterUnavailable(
+                f"omni portal token is unavailable at {path}: {error}"
+            ) from error
+
+    async def execute_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run one of the adapter's own tools and return its result.
+
+        These are the suite the portal carries -- web search and fetch,
+        document and session search, scratch memory, bounded arithmetic. Egg
+        keeps its own tool loop because most of its tools are cameras and
+        memory, so it runs these individually rather than handing the
+        conversation over to the portal's agentic loop.
+        """
+
+        token = self._portal_token()
+        base = str(self.config.portal_base_url).rstrip("/")
+        timeout = aiohttp.ClientTimeout(total=self.config.portal_timeout_seconds)
+        async with self._resident(self.SPEECH_COMPONENT):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{base}/api/tools/{name}/call",
+                        json={"arguments": arguments},
+                        headers={"Authorization": f"Bearer {token}"},
+                    ) as response:
+                        if response.status >= 400:
+                            detail = (await response.text())[:300]
+                            raise OmniAdapterError(
+                                f"omni tool {name} HTTP {response.status}: {detail}"
+                            )
+                        payload = await response.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+                raise OmniAdapterUnavailable(
+                    f"omni tool {name} is unreachable: {error}"
+                ) from error
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            raise OmniAdapterError(f"omni tool {name} returned no result object")
+        return result
+
     # -- perception ------------------------------------------------------
 
     async def perceive_audio(self, wav_audio: bytes) -> dict[str, object]:

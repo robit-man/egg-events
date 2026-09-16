@@ -2065,6 +2065,10 @@ class OmniusClient:
         normalized = " ".join(query.strip().split())
         if not normalized:
             raise ValueError("web search query is required")
+        if self._omni is not None and self._omni.config.silences_voice_daemon:
+            # The adapter carries this suite itself, so the daemon does not
+            # have to stay up merely to answer a question about the world.
+            return await self._omni_web_search(normalized, num_results)
         timeout = aiohttp.ClientTimeout(total=min(self.config.timeout_seconds, 20))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
@@ -2098,6 +2102,34 @@ class OmniusClient:
         if not isinstance(output, str) or not output.strip():
             raise RuntimeError("Omnius web_search returned no evidence")
         return output.strip()[:10000]
+
+    async def _omni_web_search(self, query: str, num_results: int) -> str:
+        """Search through the adapter's own tool harness.
+
+        Rendered to the same bounded evidence text the daemon returned, so
+        every caller downstream -- prompt assembly, provenance, the grounded
+        follow-up completion -- is unchanged by where the search ran.
+        """
+
+        result = await self._omni.execute_tool(
+            "web_search", {"query": query[:300], "max_results": max(1, min(int(num_results), 8))}
+        )
+        entries = result.get("results")
+        if not isinstance(entries, list) or not entries:
+            raise RuntimeError("omni web_search returned no evidence")
+        lines: list[str] = []
+        for entry in entries[: max(1, min(int(num_results), 8))]:
+            if not isinstance(entry, dict):
+                continue
+            title = " ".join(str(entry.get("title") or "").split())[:200]
+            url = str(entry.get("url") or "").strip()[:400]
+            snippet = " ".join(str(entry.get("snippet") or "").split())[:400]
+            if not (title or snippet):
+                continue
+            lines.append(f"- {title} ({url})" + (f": {snippet}" if snippet else ""))
+        if not lines:
+            raise RuntimeError("omni web_search returned no usable results")
+        return "\n".join(lines)[:10000]
 
     async def web_fetch(self, url: str, *, max_characters: int = 1700) -> str:
         """Read one public result page through Omnius's network policy."""
@@ -4987,35 +5019,32 @@ class OmniusClient:
                     },
                 }
             )
-        if not (self._omni is not None and self._omni.config.silences_voice_daemon):
-            # Web search executes inside the voice daemon. Offer it only when
-            # that daemon is running to execute it.
-            definitions.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search_current_web",
-                        "description": (
-                            "Search current online information and news. A broad request for "
-                            "the news has enough scope and uses a general current-headlines "
-                            "query."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": (
-                                        "Concise standalone search query with relative dates "
-                                        "resolved from supplied context."
-                                    ),
-                                }
-                            },
-                            "required": ["query"],
+        definitions.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_current_web",
+                    "description": (
+                        "Search current online information and news. A broad request for "
+                        "the news has enough scope and uses a general current-headlines "
+                        "query."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "Concise standalone search query with relative dates "
+                                    "resolved from supplied context."
+                                ),
+                            }
                         },
+                        "required": ["query"],
                     },
-                }
-            )
+                },
+            }
+        )
         return definitions
 
     async def _realtime_chat(

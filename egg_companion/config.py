@@ -381,6 +381,17 @@ class OmniAdapterConfig(BaseModel):
     # rather than offered as a function that cannot run.
     silence_voice_daemon: bool = True
     voice_daemon_unit: str = "omnius-daemon.service"
+    # The adapter's portal carries a tool harness lifted from Omnius -- web
+    # search, fetch and crawl, document and session search, scratch memory,
+    # bounded arithmetic. Egg drives its own tool loop, so it executes these
+    # one at a time; running them here is what lets the voice daemon go
+    # without taking web search with it.
+    portal_base_url: HttpUrl = HttpUrl("http://127.0.0.1:8920")
+    # The daemon mints a fresh portal token on every start and writes it here.
+    portal_token_path: str = (
+        "vendor/qwen-omni-adapters/runtime-data/state/access-token.txt"
+    )
+    portal_timeout_seconds: float = Field(default=45, gt=0, le=300)
 
     # Per-capability pins. None follows `mode`; True/False override it, which is
     # how a host runs (say) Qwen3-TTS speech while leaving comprehension on the

@@ -269,26 +269,54 @@ def test_the_voice_daemon_is_stopped_only_once_chat_left_it() -> None:
     assert omni_config(exclusive=False).omni_adapter.silences_voice_daemon is False
 
 
-def test_web_search_is_withdrawn_while_the_daemon_is_stopped() -> None:
-    """Never offer the model a function that cannot be executed."""
+def test_web_search_survives_stopping_the_daemon() -> None:
+    """The adapter carries the tool suite, so nothing is traded away.
+
+    These tools came from Omnius and run without loading any model, so the
+    adapter can execute them itself. Web search stays available with the
+    daemon stopped, rather than being withdrawn along with it.
+    """
 
     from egg_companion.adapters.omni import OmniAdapterClient
     from egg_companion.adapters.omnius import OmniusClient
 
-    def tool_names(config) -> set[str]:
-        client = OmniusClient(config.omnius, OmniAdapterClient(config.omni_adapter))
+    config = omni_config()
+    client = OmniusClient(config.omnius, OmniAdapterClient(config.omni_adapter))
+    names = {
+        definition["function"]["name"]
+        for definition in client._realtime_tool_definitions()
+    }
+    assert "search_current_web" in names
+
+
+def test_web_search_executes_on_the_adapter_when_the_daemon_is_stopped() -> None:
+    """And it must actually run there, not just be advertised."""
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+    from egg_companion.adapters.omnius import OmniusClient
+
+    config = omni_config()
+    adapter = OmniAdapterClient(config.omni_adapter)
+    client = OmniusClient(config.omnius, adapter)
+    called: dict[str, object] = {}
+
+    async def execute_tool(name, arguments):
+        called["name"] = name
+        called["arguments"] = arguments
         return {
-            definition["function"]["name"]
-            for definition in client._realtime_tool_definitions()
+            "results": [
+                {"title": "Starship", "url": "https://example.test/s", "snippet": "flew"},
+                {"title": "Launches", "url": "https://example.test/l", "snippet": ""},
+            ]
         }
 
-    stopped = tool_names(omni_config())
-    running = tool_names(omni_config(silence_voice_daemon=False))
+    adapter.execute_tool = execute_tool
+    evidence = asyncio.run(client.web_search("starship latest flight", num_results=4))
 
-    assert "search_current_web" not in stopped
-    assert "search_current_web" in running
-    # Everything Egg executes itself is offered either way.
-    assert {"inspect_current_camera", "read_current_camera_text"} <= stopped
+    assert called["name"] == "web_search"
+    assert called["arguments"]["query"] == "starship latest flight"
+    assert "https://example.test/s" in evidence
+    assert "flew" in evidence
 
 
 def test_replies_are_generated_through_the_adapter_in_omni_mode() -> None:
