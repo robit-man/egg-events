@@ -4768,7 +4768,13 @@ class OmniusClient:
         return self._system_prompt
 
     def _realtime_tool_definitions(self) -> list[dict[str, object]]:
-        """Return native function schemas; the model selects, Egg executes."""
+        """Return native function schemas; the model selects, Egg executes.
+
+        Only tools Egg can actually execute are offered. Web search runs in
+        the voice daemon, so while that daemon is stopped the function is
+        withdrawn rather than presented as a choice that fails after the
+        model has already committed a turn to it.
+        """
 
         definitions: list[dict[str, object]] = [
             {
@@ -4788,29 +4794,6 @@ class OmniusClient:
                             }
                         },
                         "required": ["question"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_current_web",
-                    "description": (
-                        "Search current online information and news. A broad request for the news "
-                        "has enough scope and uses a general current-headlines query."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": (
-                                    "Concise standalone search query with relative dates resolved "
-                                    "from supplied context."
-                                ),
-                            }
-                        },
-                        "required": ["query"],
                     },
                 },
             },
@@ -5004,6 +4987,35 @@ class OmniusClient:
                     },
                 }
             )
+        if not (self._omni is not None and self._omni.config.silences_voice_daemon):
+            # Web search executes inside the voice daemon. Offer it only when
+            # that daemon is running to execute it.
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_current_web",
+                        "description": (
+                            "Search current online information and news. A broad request for "
+                            "the news has enough scope and uses a general current-headlines "
+                            "query."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "Concise standalone search query with relative dates "
+                                        "resolved from supplied context."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                }
+            )
         return definitions
 
     async def _realtime_chat(
@@ -5040,6 +5052,18 @@ class OmniusClient:
             # the same model, context window, token cap, and native functions.
             "realtime": False,
         }
+        if self._omni is not None and self._omni.config.silences_discrete_voice:
+            message = await self._realtime_chat_via_adapter(
+                messages,
+                tools=payload["tools"] if allow_tool_requests else None,
+                think=bool(self.config.reasoning_enabled),
+                num_predict=token_limit,
+                on_delta=on_delta,
+            )
+            return self._finalize_realtime_message(
+                message, allow_tool_requests=allow_tool_requests
+            )
+
         url = f"{str(self.config.base_url).rstrip('/')}/v1/chat"
         if on_delta is not None:
             try:
@@ -5053,6 +5077,45 @@ class OmniusClient:
         else:
             message = await self._realtime_chat_once(url, payload, timeout)
         return self._finalize_realtime_message(message, allow_tool_requests=allow_tool_requests)
+
+    async def _realtime_chat_via_adapter(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: object,
+        think: bool,
+        num_predict: int,
+        on_delta: Callable[[str], None] | None,
+    ) -> dict[str, object]:
+        """Hold the conversation on the omni package alone.
+
+        Routing replies through the adapter reaches the same Ollama tag the
+        voice daemon would have used, so this loads no additional weights.
+        What it removes is the daemon from the conversation path, which is
+        what allows it to be stopped along with the Whisper and Supertonic
+        weights it keeps resident and offers no way to release.
+
+        Adapter v1 is non-streaming by contract. A caller that wanted deltas
+        gets the finished reply in a single callback rather than nothing, so
+        the live display still updates -- one step later than before.
+        """
+
+        # Same gate the daemon path held: one generation at a time, and the
+        # language weights charged to the budget for its duration.
+        async with self._language_lane(self._model_gate):
+            message = await self._omni.chat(
+                list(messages),
+                tools=tools if isinstance(tools, list) and tools else None,
+                think=think,
+                num_ctx=self.config.model_num_ctx,
+                num_predict=num_predict,
+                timeout_seconds=self.config.timeout_seconds,
+            )
+        if on_delta is not None:
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                on_delta(content)
+        return message
 
     async def _realtime_chat_once(
         self, url: str, payload: dict[str, object], timeout: aiohttp.ClientTimeout

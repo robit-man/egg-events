@@ -1033,6 +1033,18 @@ class CompanionRuntime:
         # 11436 that fails the whole readiness component and retries forever,
         # and the surest way to have the old stack creep back.
         discrete_voice = not self.config.omni_adapter.silences_discrete_voice
+        if self.config.omni_adapter.silences_voice_daemon:
+            # Stopped deliberately: polling it would fail forever. This
+            # component idles rather than returning, because the supervisor
+            # treats a component that finishes as one that crashed and
+            # restarts it in a tight loop.
+            logger.info(
+                "exclusive omni mode: the voice daemon is stopped; language, "
+                "speech and transcription all run on %s",
+                self.config.omni_adapter.model,
+            )
+            while True:
+                await asyncio.sleep(3600)
 
         await self._omnius.health()
         if discrete_voice:
@@ -1297,7 +1309,12 @@ class CompanionRuntime:
 
         if shutil.which("systemctl") is None:
             return
-        for unit in self.config.omni_adapter.silence_units:
+        units = list(self.config.omni_adapter.silence_units)
+        if self.config.omni_adapter.silences_voice_daemon:
+            # Safe only because replies now come from the adapter. See
+            # OmniAdapterConfig.silence_voice_daemon for what goes with it.
+            units.append(self.config.omni_adapter.voice_daemon_unit)
+        for unit in units:
             process = await asyncio.create_subprocess_exec(
                 "systemctl", "--user", "is-active", unit,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,

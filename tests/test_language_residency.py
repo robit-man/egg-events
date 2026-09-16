@@ -237,3 +237,82 @@ def test_engine_agnostic_guards_still_apply_to_omni() -> None:
         OmniusClient.transcription_rejection_reason(refused, evidence, engine=OMNI_BACKEND)
         == "no speech detected"
     )
+
+
+# -- only the omni weights, when omni is selected --------------------------
+
+
+def omni_config(**overrides):
+    return EggConfig.model_validate(
+        {
+            "audio": {"input_device": "default", "doa_mode": "disabled"},
+            "omnius": {"model": MODEL, "voice_model": "supertonic"},
+            "omni_adapter": {"mode": "omni", "model": MODEL, **overrides},
+            "identity": {"enabled": False},
+            "object_learning": {"enabled": False},
+            "memory": {"enabled": False},
+            "camera_discovery": {"enabled": False},
+        }
+    )
+
+
+def test_the_voice_daemon_is_stopped_only_once_chat_left_it() -> None:
+    """It holds Whisper and YAMNet resident and will not release them.
+
+    Stopping it is safe only because replies now come from the adapter, so
+    the two are separate settings rather than one implying the other.
+    """
+
+    assert omni_config().omni_adapter.silences_voice_daemon is True
+    assert omni_config(silence_voice_daemon=False).omni_adapter.silences_voice_daemon is False
+    # Not exclusive: the daemon is still the one answering, so it stays up.
+    assert omni_config(exclusive=False).omni_adapter.silences_voice_daemon is False
+
+
+def test_web_search_is_withdrawn_while_the_daemon_is_stopped() -> None:
+    """Never offer the model a function that cannot be executed."""
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+    from egg_companion.adapters.omnius import OmniusClient
+
+    def tool_names(config) -> set[str]:
+        client = OmniusClient(config.omnius, OmniAdapterClient(config.omni_adapter))
+        return {
+            definition["function"]["name"]
+            for definition in client._realtime_tool_definitions()
+        }
+
+    stopped = tool_names(omni_config())
+    running = tool_names(omni_config(silence_voice_daemon=False))
+
+    assert "search_current_web" not in stopped
+    assert "search_current_web" in running
+    # Everything Egg executes itself is offered either way.
+    assert {"inspect_current_camera", "read_current_camera_text"} <= stopped
+
+
+def test_replies_are_generated_through_the_adapter_in_omni_mode() -> None:
+    """With the daemon stopped, the adapter has to be the one answering."""
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+    from egg_companion.adapters.omnius import OmniusClient
+
+    config = omni_config()
+    adapter = OmniAdapterClient(config.omni_adapter)
+    client = OmniusClient(config.omnius, adapter)
+    seen: dict[str, object] = {}
+
+    async def chat(messages, **kwargs):
+        seen["messages"] = messages
+        seen.update(kwargs)
+        return {"role": "assistant", "content": "Hello, wonderful friend!"}
+
+    adapter.chat = chat
+    reply = asyncio.run(
+        client._realtime_chat([{"role": "user", "content": "hi"}], allow_tool_requests=False)
+    )
+
+    assert reply == "Hello, wonderful friend!"
+    assert seen["messages"] == [{"role": "user", "content": "hi"}]
+    # Reasoning stays off so tokens are not spent before the reply.
+    assert seen["think"] is False

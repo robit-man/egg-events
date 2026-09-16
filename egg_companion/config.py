@@ -368,6 +368,19 @@ class OmniAdapterConfig(BaseModel):
     silence_units: list[str] = Field(
         default_factory=lambda: ["egg-whisper.service"]
     )
+    # Stop the voice daemon too once the omni package answers language.
+    #
+    # The daemon keeps a Whisper worker and a YAMNet classifier resident --
+    # about 1.1 GiB of weights the single package replaces -- and exposes no
+    # way to release them short of stopping it. It is only safe to stop once
+    # replies are generated through the adapter, which is why this is separate
+    # from `exclusive` rather than implied by it.
+    #
+    # The cost is the daemon's own tool execution: `search_current_web` runs
+    # there, and is withdrawn from the model's choices while it is stopped
+    # rather than offered as a function that cannot run.
+    silence_voice_daemon: bool = True
+    voice_daemon_unit: str = "omnius-daemon.service"
 
     # Per-capability pins. None follows `mode`; True/False override it, which is
     # how a host runs (say) Qwen3-TTS speech while leaving comprehension on the
@@ -453,6 +466,12 @@ class OmniAdapterConfig(BaseModel):
     @property
     def uses_speech(self) -> bool:
         return self._capability(self.speech_enabled)
+
+    @property
+    def silences_voice_daemon(self) -> bool:
+        """Whether the voice daemon is stopped along with its weights."""
+
+        return self.silences_discrete_voice and self.silence_voice_daemon
 
     @property
     def silences_discrete_voice(self) -> bool:

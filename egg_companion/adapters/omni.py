@@ -49,6 +49,7 @@ import numpy as np
 
 from egg_companion.config import OmniAdapterConfig
 from egg_companion.services.residency import (
+    LANGUAGE_COMPONENT as _LANGUAGE_COMPONENT,
     ResidencyRefused,
     WeightResidencyManager,
 )
@@ -163,6 +164,7 @@ class OmniAdapterClient:
     # what the runtime registers with the residency manager.
     COMPREHENSION_COMPONENT = "omni_comprehension"
     SPEECH_COMPONENT = "omni_speech"
+    LANGUAGE_COMPONENT = _LANGUAGE_COMPONENT
 
     def __init__(
         self,
@@ -494,6 +496,61 @@ class OmniAdapterClient:
             raise OmniAdapterUnavailable(
                 f"{component} cannot be made resident: {error}"
             ) from error
+
+    # -- language --------------------------------------------------------
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        think: bool = False,
+        num_ctx: int | None = None,
+        num_predict: int | None = None,
+        temperature: float = 0.0,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Generate one reply through the adapter's language stage.
+
+        This exists so a conversation needs nothing but the single weights
+        package. The adapter reaches the same Ollama tag Egg used to address
+        through the voice daemon, so no additional weights are loaded -- but
+        the daemon stops being required to hold a conversation, which is what
+        lets it be stopped along with the Whisper and Supertonic weights it
+        keeps resident and never offers a way to release.
+
+        Returns the Ollama-shaped message, so ``tool_calls`` reach the caller
+        unchanged. Adapter v1 is non-streaming by contract, so a caller that
+        wants deltas gets the finished reply in one piece.
+        """
+
+        payload = self._request(
+            task="chat",
+            messages=messages,
+            think=think,
+            options={
+                key: value
+                for key, value in (
+                    ("num_ctx", num_ctx),
+                    ("num_predict", num_predict),
+                    ("temperature", temperature),
+                )
+                if value is not None
+            }
+            or None,
+        )
+        if tools:
+            payload["tools"] = tools
+        async with self._resident(self.LANGUAGE_COMPONENT):
+            result = await self._post(
+                payload,
+                timeout_seconds=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else self.config.timeout_seconds
+                ),
+            )
+        return self._message(result)
 
     # -- perception ------------------------------------------------------
 
