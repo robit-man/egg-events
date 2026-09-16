@@ -955,7 +955,14 @@ PAGE = r"""<!doctype html>
       selectOption('voice_model', tts, voice.tts_model);
       selectOption('asr_model', asr, voice.asr_model);
       const selected = $('#voice [name=voice_model]').value;
-      const voices = selected === 'supertonic' ? (catalog.supertonic?.options?.voices || []).map(id => ({id,label:id})) : [];
+      // Whichever backend is selected supplies its own voices; Supertonic's
+      // live in the catalog's settings block, the omni package ships its
+      // presets on the model entry.
+      const entry = (catalog.tts?.models || []).find(model => model.id === selected);
+      const voices = (entry?.voices?.length
+        ? entry.voices
+        : (selected === 'supertonic' ? (catalog.supertonic?.options?.voices || []) : [])
+      ).map(id => ({id, label: id}));
       selectOption('voice_name', voices, voice.tts_voice || catalog.supertonic?.settings?.voiceName);
       $('#voice [name=voice_name]').disabled = !voices.length;
       const service = catalog.state || {};

@@ -228,11 +228,23 @@ class OmniusClient:
             service_url: str = base_url,
             unavailable: dict[str, object] | None = None,
         ) -> dict[str, object]:
-            async with session.get(f"{service_url}{path}", headers=self._headers()) as response:
-                if response.status == 404 and unavailable is not None:
-                    return unavailable
-                response.raise_for_status()
-                payload = await response.json()
+            try:
+                async with session.get(
+                    f"{service_url}{path}", headers=self._headers()
+                ) as response:
+                    if response.status == 404 and unavailable is not None:
+                        return unavailable
+                    response.raise_for_status()
+                    payload = await response.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                if unavailable is None:
+                    raise
+                # A stopped service is a legitimate state, not a catalog
+                # failure. Exclusive omni mode deliberately stops the Whisper
+                # container, and letting its absence raise here took the whole
+                # voice page down with a 500.
+                logger.debug("voice catalog surface %s is unavailable: %s", path, error)
+                return unavailable
             if not isinstance(payload, dict):
                 raise RuntimeError(f"Omnius returned an invalid voice payload for {path}")
             return payload
@@ -241,7 +253,13 @@ class OmniusClient:
             tts, asr, supertonic, dedicated_asr_state = await asyncio.gather(
                 get_json(session, "/v1/voice/models"),
                 get_json(
-                    session, "/v1/voice/asr-models", service_url=asr_base_url
+                    session,
+                    "/v1/voice/asr-models",
+                    service_url=asr_base_url,
+                    # Exclusive omni mode stops the Whisper service on purpose;
+                    # an empty ASR catalog is the correct answer then, and the
+                    # omni entry is added below.
+                    unavailable={"models": []},
                 ),
                 get_json(
                     session,
@@ -278,9 +296,75 @@ class OmniusClient:
                     for model in models
                 ],
             }
+        # The Omnius catalog only knows Omnius' own backends. When the omni
+        # package is serving a stage, its model has to appear here or the UI
+        # selector cannot show what is actually loaded -- it would list
+        # Supertonic and Whisper while Qwen3 answers every request.
+        tts, asr = self._with_omni_catalog_entries(tts, asr)
         self._voice_catalog_cache = {"tts": tts, "asr": asr, "supertonic": supertonic}
         self._voice_catalog_cached_at = time.monotonic()
         return {**self._voice_catalog_cache, "state": state}
+
+    def _with_omni_catalog_entries(
+        self, tts: dict[str, object], asr: dict[str, object]
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Add the omni package to the catalog for whichever stages it serves.
+
+        In exclusive mode the discrete backends are not merely unselected --
+        their weights are not loaded at all -- so they are dropped rather than
+        offered as choices that would fail.
+        """
+
+        if self._omni is None or not self._omni.enabled:
+            return tts, asr
+        config = self._omni.config
+        exclusive = config.exclusive
+
+        if config.uses_speech:
+            entry = {
+                "id": config.model,
+                "label": "Qwen3-TTS",
+                "backend": "qwen3-omni-adapter",
+                "enabled": True,
+                "isActive": True,
+                "voices": [
+                    preset.get("id")
+                    for preset in self._omni_voice_presets()
+                    if preset.get("id")
+                ],
+            }
+            existing = [
+                model
+                for model in (tts.get("models") or [])
+                if isinstance(model, dict) and model.get("id") != config.model
+            ]
+            tts = {**tts, "models": [entry] + ([] if exclusive else existing)}
+
+        if config.uses_transcription:
+            entry = {
+                "id": config.model,
+                "label": "Qwen3-Omni comprehension",
+                "backend": "qwen3-omni-adapter",
+                "isActive": True,
+                "liveEligible": True,
+                "liveReason": None,
+            }
+            existing = [
+                model
+                for model in (asr.get("models") or [])
+                if isinstance(model, dict) and model.get("id") != config.model
+            ]
+            asr = {**asr, "models": [entry] + ([] if exclusive else existing)}
+        return tts, asr
+
+    def _omni_voice_presets(self) -> list[dict[str, object]]:
+        if self._omni is None:
+            return []
+        loaded = self._omni._voice_profile()
+        if not loaded:
+            return []
+        presets = loaded[0].get("presets")
+        return [item for item in presets if isinstance(item, dict)] if isinstance(presets, list) else []
 
     async def asr_catalog(self) -> dict[str, object]:
         timeout = aiohttp.ClientTimeout(total=15)
