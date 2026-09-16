@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -14,13 +15,17 @@ import time
 import wave
 import zlib
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 
 import aiohttp
 import numpy as np
 
 from egg_companion.config import OmniusConfig
+from egg_companion.services.residency import (
+    LANGUAGE_COMPONENT,
+    WeightResidencyManager,
+)
 from egg_companion.adapters.omni import (
     OmniAdapterClient,
     OmniAdapterError,
@@ -63,9 +68,16 @@ class OmniusClient:
     )
 
     def __init__(
-        self, config: OmniusConfig, omni: OmniAdapterClient | None = None
+        self,
+        config: OmniusConfig,
+        omni: OmniAdapterClient | None = None,
+        residency: "WeightResidencyManager | None" = None,
     ) -> None:
         self.config = config
+        # The parent manager that keeps the module inside its memory budget.
+        # Every generation below ends at the same Ollama runner, so without
+        # this those loads are invisible to it.
+        self._residency = residency
         # Optional Qwen Omni adapter. When present and healthy it answers the
         # perceptual stages it is genuinely better at -- speech/sound
         # separation, environmental audio in language, Qwen3-TTS speech --
@@ -191,7 +203,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
             "tools": False,
         }
-        async with self._model_gate:
+        async with self._language_lane(self._model_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/chat",
@@ -220,6 +232,30 @@ class OmniusClient:
         if not isinstance(payload, dict):
             raise RuntimeError("Omnius voice state is not an object")
         return payload
+
+    @contextlib.asynccontextmanager
+    async def _language_lane(self, gate: asyncio.Lock) -> AsyncIterator[None]:
+        """Hold ``gate`` and the language weights for one generation.
+
+        Every generation here ends at the same Ollama runner, whether it is
+        reached directly or by way of the Omnius daemon. Taking only the gate
+        left those loads unaccounted for: the manager would admit the 16.7 GiB
+        comprehension worker for a transcription, the reply would then pull
+        14.3 GiB of language weights in beside it, and the kernel would kill
+        the companion part-way through the turn. Acquiring the component makes
+        a reply evict comprehension rather than stack on top of it.
+
+        A refusal is left to propagate. There is no safe way to generate
+        anyway when the weights do not fit, and failing the turn is much
+        better than taking the machine down with it.
+        """
+
+        async with gate:
+            if self._residency is None or not self._residency.manages(LANGUAGE_COMPONENT):
+                yield
+                return
+            async with self._residency.require(LANGUAGE_COMPONENT):
+                yield
 
     async def voice_catalog(self, *, force: bool = False) -> dict[str, object]:
         # Model discovery may stat several local model trees on first access.
@@ -2641,7 +2677,9 @@ class OmniusClient:
             "language": evidence.get("requested_language"),
             "segments": [],
         }
-        rejection_reason = self.transcription_rejection_reason(payload, evidence)
+        rejection_reason = self.transcription_rejection_reason(
+            payload, evidence, engine=OMNI_BACKEND
+        )
         if not text:
             rejection_reason = "empty transcript"
         self.last_transcription_metadata = {
@@ -2679,14 +2717,35 @@ class OmniusClient:
 
     @staticmethod
     def transcription_is_grounded(
-        payload: dict[str, object], acoustic_evidence: dict[str, object] | None = None
+        payload: dict[str, object],
+        acoustic_evidence: dict[str, object] | None = None,
+        *,
+        engine: str = "",
     ) -> bool:
-        return OmniusClient.transcription_rejection_reason(payload, acoustic_evidence) is None
+        return (
+            OmniusClient.transcription_rejection_reason(
+                payload, acoustic_evidence, engine=engine
+            )
+            is None
+        )
 
     @staticmethod
     def transcription_rejection_reason(
-        payload: dict[str, object], acoustic_evidence: dict[str, object] | None = None
+        payload: dict[str, object],
+        acoustic_evidence: dict[str, object] | None = None,
+        *,
+        engine: str = "",
     ) -> str | None:
+        """Why this transcript should not be trusted, or None to accept it.
+
+        Most of these tests are calibrated for Whisper and its failure modes,
+        and several read segment-level metadata only Whisper produces. The
+        omni package returns what was said and nothing else, so the checks
+        that assume the other engine are skipped for it rather than silently
+        discarding good transcripts -- which is what "it cannot hear me" was:
+        a clean transcript thrown away by a heuristic written for a different
+        model, with the audio at an unmistakable 0.24 RMS.
+        """
         backend_rejection = payload.get("rejection_reason")
         if isinstance(backend_rejection, str) and backend_rejection.strip():
             return backend_rejection.strip()
@@ -2734,6 +2793,7 @@ class OmniusClient:
         duration = evidence.get("duration", payload.get("duration"))
         if (
             isinstance(text, str)
+            and engine != OMNI_BACKEND
             and evidence.get("boundary_reason") == "max_utterance"
             and isinstance(duration, (int, float))
             and float(duration) >= 4
@@ -3009,7 +3069,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._background_gate:
+        async with self._language_lane(self._background_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -3101,7 +3161,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._background_gate:
+        async with self._language_lane(self._background_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat", json=payload
@@ -3160,7 +3220,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._background_gate:
+        async with self._language_lane(self._background_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -3236,7 +3296,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._background_gate:
+        async with self._language_lane(self._background_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -3346,7 +3406,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._background_gate:
+        async with self._language_lane(self._background_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -3469,7 +3529,7 @@ class OmniusClient:
             "keep_alive": self.config.chat_keep_alive,
         }
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-        async with self._conversational_gate:
+        async with self._language_lane(self._conversational_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat", json=payload
@@ -3909,7 +3969,7 @@ class OmniusClient:
         timeout = aiohttp.ClientTimeout(
             total=max(self.config.timeout_seconds, 60.0)
         )
-        async with self._background_gate:
+        async with self._language_lane(self._background_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.vision_base_url).rstrip('/')}/api/chat",
@@ -4631,7 +4691,7 @@ class OmniusClient:
                 "max_tokens": bounded_tokens,
             },
         }
-        async with self._model_gate:
+        async with self._language_lane(self._model_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/chat",
@@ -4677,7 +4737,7 @@ class OmniusClient:
                 "max_tokens": bounded_max_tokens,
             },
         }
-        async with self._model_gate:
+        async with self._language_lane(self._model_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/chat",
@@ -4997,7 +5057,7 @@ class OmniusClient:
     async def _realtime_chat_once(
         self, url: str, payload: dict[str, object], timeout: aiohttp.ClientTimeout
     ) -> dict[str, object]:
-        async with self._model_gate:
+        async with self._language_lane(self._model_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=self._headers()) as response:
                     if response.status >= 400:
@@ -5021,7 +5081,7 @@ class OmniusClient:
     ) -> dict[str, object]:
         content_parts: list[str] = []
         tool_calls_by_index: dict[int, dict[str, object]] = {}
-        async with self._model_gate:
+        async with self._language_lane(self._model_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=self._headers()) as response:
                     if response.status >= 400:
@@ -5216,7 +5276,7 @@ class OmniusClient:
                 "max_tokens": 80,
             },
         }
-        async with self._model_gate:
+        async with self._language_lane(self._model_gate):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{str(self.config.base_url).rstrip('/')}/v1/chat",

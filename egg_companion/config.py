@@ -454,6 +454,17 @@ class OmniAdapterConfig(BaseModel):
     def uses_speech(self) -> bool:
         return self._capability(self.speech_enabled)
 
+    @property
+    def silences_discrete_voice(self) -> bool:
+        """Whether the discrete speech and ASR services are stopped on purpose.
+
+        When this holds, configuring those services is not merely wasted: the
+        calls fail against something deliberately absent, and any that succeed
+        bring a replaced backend back into the turn.
+        """
+
+        return self.enabled and self.exclusive
+
 
 class SystemServiceConfig(BaseModel):
     base_url: HttpUrl

@@ -235,7 +235,7 @@ class CompanionRuntime:
         # only place in the runtime that retains motion over time, and it is
         # bounded by both frame count and width so four cameras stay cheap.
         self._video_buffers: dict[str, deque[tuple[np.ndarray, float]]] = {}
-        self._omnius = OmniusClient(config.omnius, self._omni_adapter)
+        self._omnius = OmniusClient(config.omnius, self._omni_adapter, self._residency)
         self._conversation_turns = ConversationTurnController(history_limit=2000)
         self._last_system_prompt_assessment_at: float = 0.0
         self._system_service = SystemServiceClient(config.system_service) if config.system_service else None
@@ -1026,24 +1026,41 @@ class CompanionRuntime:
                 await asyncio.sleep(1)
 
     async def _maintain_omnius(self) -> None:
+        # In exclusive omni mode the single weights package answers speech and
+        # transcription, and the discrete services behind these calls are
+        # stopped on purpose. Configuring them anyway means asking a dead
+        # Whisper for a model switch on every pass -- a connection refused to
+        # 11436 that fails the whole readiness component and retries forever,
+        # and the surest way to have the old stack creep back.
+        discrete_voice = not self.config.omni_adapter.silences_discrete_voice
+
         await self._omnius.health()
-        await self._omnius.ensure_voice_ready()
-        await self._omnius.configure_supertonic_voice(self.config.omnius.voice_name)
-        await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
-        if (
-            self.config.omnius.asr_base_url is not None
-            and self.config.omnius.asr_base_url != self.config.omnius.base_url
-        ):
-            await self._omnius.pause_daemon_listen()
+        if discrete_voice:
+            await self._omnius.ensure_voice_ready()
+            await self._omnius.configure_supertonic_voice(self.config.omnius.voice_name)
+            await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
+        await self._pause_daemon_listen_if_separate()
         while True:
             await asyncio.sleep(60)
             await self._omnius.health()
-            await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
-            if (
-                self.config.omnius.asr_base_url is not None
-                and self.config.omnius.asr_base_url != self.config.omnius.base_url
-            ):
-                await self._omnius.pause_daemon_listen()
+            if discrete_voice:
+                await self._omnius.ensure_asr_model(self.config.transcription.asr_model)
+            await self._pause_daemon_listen_if_separate()
+
+    async def _pause_daemon_listen_if_separate(self) -> None:
+        """Stop the voice daemon listening on its own.
+
+        Egg captures the microphone itself, so a daemon that is also listening
+        holds a second ASR worker resident for nothing. In omni mode that is
+        the Whisper worker the single weights package is meant to replace.
+        """
+
+        separate_asr = (
+            self.config.omnius.asr_base_url is not None
+            and self.config.omnius.asr_base_url != self.config.omnius.base_url
+        )
+        if separate_asr or self.config.omni_adapter.silences_discrete_voice:
+            await self._omnius.pause_daemon_listen()
 
     def _buffer_video_frame(self, camera_id: str, frame: np.ndarray, now: float) -> None:
         """Retain a decimated, downscaled clip window for this camera."""
@@ -3074,6 +3091,17 @@ class CompanionRuntime:
         finally:
             tasks.discard(task)
 
+    async def _release_think_ring(self) -> None:
+        """Put the ring back when a turn ends without a reply.
+
+        "think" is only ever cleared by going on to speak, so an utterance
+        that produced no transcript left the ReSpeaker animating forever --
+        telling the room that Egg is working on something at exactly the
+        moment it has given up on it.
+        """
+
+        await asyncio.to_thread(self._direction.try_set_led_state, "trace")
+
     async def _process_speech(self) -> None:
         while True:
             segment = await self._speech_segments.get()
@@ -3103,6 +3131,7 @@ class CompanionRuntime:
                 if segment.barge_id:
                     await self._resume_barge(segment.barge_id, "asr_failed")
                 self._record_voice_transition("asr_failed")
+                await self._release_think_ring()
                 continue
             if not transcript:
                 self._turn_visual_snapshots.pop(segment.utterance_id, None)
@@ -3115,6 +3144,7 @@ class CompanionRuntime:
                 if segment.barge_id:
                     await self._resume_barge(segment.barge_id, "asr_empty")
                 self._record_voice_transition("asr_empty")
+                await self._release_think_ring()
                 continue
             self._last_valid_speech_at = time.monotonic()
             semantic_task = self._active_narrative_semantic_task

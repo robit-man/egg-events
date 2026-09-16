@@ -39,3 +39,6 @@ vendor/
 
 # Local database/config snapshots taken before risky migrations
 backups/
+
+# Runtime logs captured from the systemd unit
+logs/

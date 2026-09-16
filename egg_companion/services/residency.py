@@ -40,6 +40,10 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# The Ollama runner that serves Egg's language generations. Named here so the
+# component that registers it and the callers that must hold it agree.
+LANGUAGE_COMPONENT = "ollama_language"
+
 _MEMINFO = "/proc/meminfo"
 
 

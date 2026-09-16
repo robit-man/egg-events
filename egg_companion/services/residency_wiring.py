@@ -15,6 +15,7 @@ import aiohttp
 
 from egg_companion.config import EggConfig
 from egg_companion.services.residency import (
+    LANGUAGE_COMPONENT,
     Component,
     WeightResidencyManager,
     systemd_component,
@@ -98,7 +99,7 @@ def ollama_component(
         )
 
     return Component(
-        name="ollama_language",
+        name=LANGUAGE_COMPONENT,
         cost_gib=cost_gib,
         load=load,
         unload=unload,
