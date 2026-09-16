@@ -87,7 +87,13 @@ class Component:
     cost_gib: float
     load: Callable[[], Awaitable[None]]
     unload: Callable[[], Awaitable[None]]
+    # Ready to serve a request. Stricter than holding memory.
     is_loaded: Callable[[], Awaitable[bool]]
+    # Holding memory, ready or not. A worker part-way through loading its
+    # weights occupies the pool without answering yet; treating it as absent
+    # makes it both unusable and unreclaimable, which is how a request ends up
+    # refused for want of memory that something else is sitting on.
+    is_resident: Callable[[], Awaitable[bool]] | None = None
     # Higher survives eviction longer. The component that is most expensive to
     # reload should outrank the ones that are cheap to bring back.
     priority: int = 0
@@ -187,14 +193,28 @@ class WeightResidencyManager:
         }
 
     async def _loaded_components(self) -> list[Component]:
-        loaded = []
+        """Components that are ready to serve."""
+
+        return await self._probe(lambda item: item.is_loaded)
+
+    async def _resident_components(self) -> list[Component]:
+        """Components holding memory, whether or not they can serve yet.
+
+        This is the set eviction may draw on: a half-loaded worker is still
+        occupying the pool, and reclaiming it is exactly what makes room.
+        """
+
+        return await self._probe(lambda item: item.is_resident or item.is_loaded)
+
+    async def _probe(self, selector) -> list[Component]:
+        found = []
         for component in self._components.values():
             try:
-                if await component.is_loaded():
-                    loaded.append(component)
+                if await selector(component)():
+                    found.append(component)
             except Exception as error:  # noqa: BLE001 - probing must not raise
                 logger.debug("residency probe failed for %s: %s", component.name, error)
-        return loaded
+        return found
 
     async def _make_room(self, target: Component) -> None:
         """Evict until ``target`` fits, or refuse.
@@ -219,7 +239,7 @@ class WeightResidencyManager:
 
         candidates = [
             item
-            for item in await self._loaded_components()
+            for item in await self._resident_components()
             if item.name != target.name and not item.pinned
         ]
         candidates.sort(key=lambda item: (item.priority, item._last_used))
@@ -286,7 +306,7 @@ class WeightResidencyManager:
                 return
             candidates = [
                 item
-                for item in await self._loaded_components()
+                for item in await self._resident_components()
                 if item.name != exclude and not item.pinned
             ]
             candidates.sort(key=lambda item: (item.priority, item._last_used))
@@ -408,12 +428,18 @@ def systemd_component(
             return await ready()
         return await systemctl("is-active", "--quiet", unit) == 0
 
+    async def is_resident() -> bool:
+        # An active unit holds its memory even while the model is still
+        # loading and the readiness probe is still failing.
+        return await systemctl("is-active", "--quiet", unit) == 0
+
     return Component(
         name=name,
         cost_gib=cost_gib,
         load=load,
         unload=unload,
         is_loaded=is_loaded,
+        is_resident=is_resident,
         priority=priority,
         load_timeout_seconds=load_timeout_seconds,
         idle_release_seconds=idle_release_seconds,

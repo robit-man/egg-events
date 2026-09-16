@@ -353,3 +353,87 @@ def test_memory_released_during_the_settle_window_avoids_eviction(monkeypatch) -
     # The memory arrived while settling, so nothing had to be torn down.
     assert evicted == []
     assert state["language"] is True
+
+
+def test_a_loading_component_can_still_be_reclaimed(monkeypatch) -> None:
+    """A worker part-way through loading holds memory and must be evictable.
+
+    Treating it as absent makes it both unusable and unreclaimable, so a
+    request is refused for want of memory that something else is sitting on.
+    """
+
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 5.2)
+    manager = WeightResidencyManager(
+        total_gib=30.0, reserve_gib=2.0, settle_seconds=0
+    )
+    evicted: list[str] = []
+
+    async def never_ready() -> bool:
+        return False
+
+    async def holding_memory() -> bool:
+        return True
+
+    async def unload() -> None:
+        evicted.append("comprehension")
+
+    manager.register(
+        Component(
+            name="comprehension",
+            cost_gib=16.7,
+            load=lambda: asyncio.sleep(0),
+            unload=unload,
+            is_loaded=never_ready,     # still loading: cannot serve
+            is_resident=holding_memory,  # but the memory is gone
+            priority=10,
+        )
+    )
+
+    async def scenario() -> None:
+        await manager.ensure_headroom(7.0, exclude="omni_speech")
+
+    # It cannot free enough on its own here, but it must at least have tried.
+    try:
+        asyncio.run(scenario())
+    except ResidencyRefused:
+        pass
+    assert evicted == ["comprehension"]
+
+
+def test_readiness_still_gates_use_not_just_residency(monkeypatch) -> None:
+    """Holding memory is not the same as being able to answer."""
+
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
+    manager = WeightResidencyManager(
+        total_gib=30.0, reserve_gib=2.0, settle_seconds=0
+    )
+    loads: list[str] = []
+
+    async def not_ready() -> bool:
+        return False
+
+    async def resident() -> bool:
+        return True
+
+    async def load() -> None:
+        loads.append("loaded")
+
+    manager.register(
+        Component(
+            name="comprehension",
+            cost_gib=16.7,
+            load=load,
+            unload=lambda: asyncio.sleep(0),
+            is_loaded=not_ready,
+            is_resident=resident,
+            priority=10,
+        )
+    )
+
+    async def scenario() -> None:
+        async with manager.require("comprehension"):
+            pass
+
+    asyncio.run(scenario())
+    # Resident but not ready: require() must still drive it to readiness.
+    assert loads == ["loaded"]

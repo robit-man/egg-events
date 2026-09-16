@@ -36,3 +36,6 @@ data/
 
 # Vendored adapter runtime, cloned by scripts/bootstrap-omni-adapters.sh
 vendor/
+
+# Local database/config snapshots taken before risky migrations
+backups/
