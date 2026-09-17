@@ -107,6 +107,11 @@ class Component:
     # it squats memory another component needs and nothing ever asks it to
     # leave. 0 means "hold until evicted".
     idle_release_seconds: float = 0.0
+    # Never evict and never release this one. Set when a component is the
+    # floor the rest of the system stands on: the adapter cannot serve any
+    # task without it, so reclaiming it does not free capacity, it removes
+    # the capability and takes everything depending on it down with it.
+    always_resident: bool = False
 
     _in_use: int = field(default=0, init=False)
     _loaded_at: float = field(default=0.0, init=False)
@@ -114,7 +119,7 @@ class Component:
 
     @property
     def pinned(self) -> bool:
-        return self._in_use > 0
+        return self._in_use > 0 or self.always_resident
 
 
 class WeightResidencyManager:
@@ -205,6 +210,16 @@ class WeightResidencyManager:
                 for name, item in self._components.items()
             },
         }
+
+    async def _is_resident(self, component: Component) -> bool:
+        """Whether this component is holding memory right now."""
+
+        probe = component.is_resident or component.is_loaded
+        try:
+            return await probe()
+        except Exception as error:  # noqa: BLE001 - probing must not raise
+            logger.debug("residency probe failed for %s: %s", component.name, error)
+            return False
 
     async def _loaded_components(self) -> list[Component]:
         """Components that are ready to serve."""
@@ -368,7 +383,14 @@ class WeightResidencyManager:
             raise ResidencyRefused(f"no such component: {name}")
 
         async with self._lock:
-            if not await component.is_loaded():
+            # Whether a load is needed is a question about residency, not
+            # readiness. A worker busy serving a request fails its readiness
+            # probe -- llama.cpp answers 503, and under load may not answer
+            # within the probe timeout at all -- while its weights are very
+            # much present. Reading that as "absent" made the manager try to
+            # load something already resident, then refuse the turn because
+            # 16.7 GiB would not fit beside the 16.7 GiB already there.
+            if not await self._is_resident(component):
                 await self._make_room(component)
                 logger.info(
                     "residency: loading %s (%.1f GiB); available %.1f GiB",
@@ -409,6 +431,7 @@ def systemd_component(
     ready: Callable[[], Awaitable[bool]] | None = None,
     load_timeout_seconds: float = 600.0,
     idle_release_seconds: float = 0.0,
+    always_resident: bool = False,
 ) -> Component:
     """A component whose lifetime is a systemd user unit.
 
@@ -457,4 +480,5 @@ def systemd_component(
         priority=priority,
         load_timeout_seconds=load_timeout_seconds,
         idle_release_seconds=idle_release_seconds,
+        always_resident=always_resident,
     )

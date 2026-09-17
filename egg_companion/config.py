@@ -250,7 +250,9 @@ class ResidencyConfig(BaseModel):
     # while actually speaking.
     # Measured while cloning: 6.4 GiB for the worker, not the 1.4 GiB of
     # weights -- the speaker-embedding encoder is most of it.
-    speech_cost_gib: float = Field(default=6.4, gt=0, le=32)
+    # Measured on a 30 GiB Orin: the speech worker peaks at 6.7 GiB, and a
+    # desktop session holds ~6.4 GiB of the module, leaving 23.6 usable.
+    speech_cost_gib: float = Field(default=6.7, gt=0, le=32)
     speech_unit: str = "egg-omni-adapters.service"
     speech_priority: int = 5
     speech_load_timeout_seconds: float = Field(default=300, gt=0, le=3600)
@@ -392,6 +394,36 @@ class OmniAdapterConfig(BaseModel):
         "vendor/qwen-omni-adapters/runtime-data/state/access-token.txt"
     )
     portal_timeout_seconds: float = Field(default=45, gt=0, le=300)
+    # The context the language worker actually has per request. Prompts are
+    # trimmed to fit it: a llama.cpp server refuses an over-long prompt
+    # outright rather than truncating, so a turn that overruns gets no reply.
+    # Must match the comprehension worker's per-slot context; the runtime
+    # warns when they disagree.
+    language_context_tokens: int = Field(default=4096, ge=1024, le=131072)
+    # Which process answers language for the adapter.
+    #
+    # "comprehension" points the adapter's language stage at the comprehension
+    # worker, which is already serving an OpenAI-shaped /v1/chat/completions
+    # and already holds these weights. That is the whole point of a single
+    # weights package: the alternative, "ollama", loads the same model a
+    # second time in a second runtime, and 16.7 + 15.6 + 6.4 GiB does not fit
+    # in 30, so every turn pays a full reload to swap between hearing and
+    # answering.
+    #
+    # This must match OMNI_LANGUAGE_API/OMNI_LANGUAGE_URL in the adapter unit;
+    # the runtime warns when the two disagree, because the mismatch is
+    # invisible until the budget is wrong.
+    language_stage: Literal["comprehension", "ollama"] = "comprehension"
+
+    @property
+    def language_component(self) -> str:
+        """The residency component whose weights answer a generation."""
+
+        return (
+            "omni_comprehension"
+            if self.mode == "omni" and self.language_stage == "comprehension"
+            else "ollama_language"
+        )
 
     # Per-capability pins. None follows `mode`; True/False override it, which is
     # how a host runs (say) Qwen3-TTS speech while leaving comprehension on the

@@ -400,16 +400,23 @@ def test_a_loading_component_can_still_be_reclaimed(monkeypatch) -> None:
     assert evicted == ["comprehension"]
 
 
-def test_readiness_still_gates_use_not_just_residency(monkeypatch) -> None:
-    """Holding memory is not the same as being able to answer."""
+def test_a_resident_worker_is_not_reloaded_because_it_is_busy(monkeypatch) -> None:
+    """Whether to load is a question about residency, not readiness.
 
-    monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
+    A llama.cpp worker serving a request answers 503, and under load may not
+    answer its health probe inside the timeout at all, while its weights are
+    very much present. Reading that as "absent" made the manager try to load
+    16.7 GiB beside the 16.7 GiB already there, then refuse the turn because
+    it would not fit.
+    """
+
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 6.0)
     manager = WeightResidencyManager(
         total_gib=30.0, reserve_gib=2.0, settle_seconds=0
     )
     loads: list[str] = []
 
-    async def not_ready() -> bool:
+    async def busy_so_not_ready() -> bool:
         return False
 
     async def resident() -> bool:
@@ -424,7 +431,7 @@ def test_readiness_still_gates_use_not_just_residency(monkeypatch) -> None:
             cost_gib=16.7,
             load=load,
             unload=lambda: asyncio.sleep(0),
-            is_loaded=not_ready,
+            is_loaded=busy_so_not_ready,
             is_resident=resident,
             priority=10,
         )
@@ -434,6 +441,44 @@ def test_readiness_still_gates_use_not_just_residency(monkeypatch) -> None:
         async with manager.require("comprehension"):
             pass
 
+    # Admitted without a reload, and without refusing for want of room its
+    # own resident weights were occupying.
     asyncio.run(scenario())
-    # Resident but not ready: require() must still drive it to readiness.
+    assert loads == []
+
+
+def test_a_component_that_is_not_resident_is_still_loaded(monkeypatch) -> None:
+    """The other half of the contract: absent weights are brought in."""
+
+    monkeypatch.setattr(residency, "available_memory_gib", lambda: 25.0)
+    manager = WeightResidencyManager(
+        total_gib=30.0, reserve_gib=2.0, settle_seconds=0
+    )
+    loads: list[str] = []
+    present = {"value": False}
+
+    async def is_resident() -> bool:
+        return present["value"]
+
+    async def load() -> None:
+        loads.append("loaded")
+        present["value"] = True
+
+    manager.register(
+        Component(
+            name="comprehension",
+            cost_gib=16.7,
+            load=load,
+            unload=lambda: asyncio.sleep(0),
+            is_loaded=is_resident,
+            is_resident=is_resident,
+            priority=10,
+        )
+    )
+
+    async def scenario() -> None:
+        async with manager.require("comprehension"):
+            pass
+
+    asyncio.run(scenario())
     assert loads == ["loaded"]

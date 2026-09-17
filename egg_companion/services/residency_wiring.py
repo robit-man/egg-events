@@ -25,14 +25,30 @@ logger = logging.getLogger(__name__)
 
 
 def _http_ready(url: str, timeout_seconds: float = 2.0):
+    """Probe a worker's health endpoint for "its weights are usable".
+
+    A llama.cpp server answers 503 for two very different situations: the
+    model is still loading, and every slot is busy right now. Only the first
+    means the weights are absent. Treating a busy server as unloaded makes
+    the manager try to load a component that is already resident -- and when
+    that component is pinned it cannot be evicted to make room for itself, so
+    the turn is refused against weights that were there the whole time.
+    """
+
     async def ready() -> bool:
         try:
             timeout = aiohttp.ClientTimeout(total=timeout_seconds)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as response:
-                    return response.status < 400
+                    if response.status < 400:
+                        return True
+                    if response.status != 503:
+                        return False
+                    body = (await response.text())[:300].lower()
         except Exception:  # noqa: BLE001 - an unreachable probe means not ready
             return False
+        # Busy is usable; still loading is not.
+        return "loading" not in body
 
     return ready
 
@@ -140,6 +156,35 @@ def _warn_on_context_drift(settings) -> None:
         )
 
 
+def _warn_on_language_stage_drift(config: EggConfig) -> None:
+    """Complain if the adapter answers language somewhere the budget ignores.
+
+    The budget follows `omni_adapter.language_stage`; the adapter follows
+    OMNI_LANGUAGE_API in its unit. When they disagree the weights are real but
+    unaccounted, which is the failure that over-commits the module and takes
+    the companion down mid-turn rather than refusing a turn.
+    """
+
+    unit_path = (
+        Path.home() / ".config/systemd/user" / config.omni_adapter.autostart_unit
+    )
+    try:
+        text = unit_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    on_comprehension = "OMNI_LANGUAGE_API=openai" in text
+    expected = config.omni_adapter.language_stage == "comprehension"
+    if on_comprehension != expected:
+        logger.warning(
+            "residency: %s answers language on %s but the budget assumes %s; "
+            "set omni_adapter.language_stage and the unit's OMNI_LANGUAGE_API "
+            "to agree, or the weights it loads will be unaccounted",
+            config.omni_adapter.autostart_unit,
+            "the comprehension worker" if on_comprehension else "Ollama",
+            config.omni_adapter.language_stage,
+        )
+
+
 def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
     """Register every heavy component this deployment can load.
 
@@ -155,6 +200,7 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
 
     manager = WeightResidencyManager(reserve_gib=settings.reserve_gib)
     _warn_on_context_drift(settings)
+    _warn_on_language_stage_drift(config)
     adapter_base = str(config.omni_adapter.base_url).rstrip("/")
 
     manager.register(
@@ -169,6 +215,13 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
             ready=_http_ready("http://127.0.0.1:8901/health"),
             load_timeout_seconds=settings.comprehension_load_timeout_seconds,
             idle_release_seconds=settings.comprehension_idle_release_seconds,
+            # Not always_resident: measured on this module, comprehension
+            # (16.7 GiB) and speech (6.7 GiB) come to 23.4 of 23.6 usable, so
+            # pinning it means speech can never be admitted and a turn ends
+            # without a voice. It is evicted for speech and reloaded for the
+            # next utterance -- the one reload a turn costs, rather than the
+            # two it paid when language lived in a second runtime.
+            always_resident=False,
         )
     )
     manager.register(
@@ -182,15 +235,25 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
             idle_release_seconds=settings.speech_idle_release_seconds,
         )
     )
-    manager.register(
-        ollama_component(
-            str(config.omnius.vision_base_url),
-            config.omnius.model,
-            settings.language_cost_gib,
-            priority=settings.language_priority,
-            keep_alive=config.omnius.chat_keep_alive,
+    if config.omni_adapter.language_component == LANGUAGE_COMPONENT:
+        manager.register(
+            ollama_component(
+                str(config.omnius.vision_base_url),
+                config.omnius.model,
+                settings.language_cost_gib,
+                priority=settings.language_priority,
+                keep_alive=config.omnius.chat_keep_alive,
+            )
         )
-    )
+    else:
+        # Language runs on the comprehension worker, which is already
+        # registered and already holds these weights. Registering a second
+        # Ollama slot for the same model would budget for two copies and
+        # invite the manager to swap between them every turn.
+        logger.info(
+            "residency: language runs on %s; no separate Ollama slot is budgeted",
+            config.omni_adapter.language_component,
+        )
     logger.info(
         "residency: %.1f GiB total, %.1f GiB reserved, components %s",
         manager.total_gib,

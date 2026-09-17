@@ -223,15 +223,35 @@ class OmniusClient:
         return content.strip()
 
     async def voice_state(self) -> dict[str, object]:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.get(
-                f"{str(self.config.base_url).rstrip('/')}/v1/voice/state", headers=self._headers()
-            ) as response:
-                response.raise_for_status()
-                payload = await response.json()
+        """Report the voice daemon's state, or an empty state when it is down.
+
+        Exclusive omni mode stops that daemon on purpose, and an absent
+        service is a legitimate state rather than a fault. Raising here took
+        the whole voice page down with a 500 -- the same failure this already
+        avoids for the Whisper container, arrived at from the other side.
+        """
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as session:
+                async with session.get(
+                    f"{str(self.config.base_url).rstrip('/')}/v1/voice/state",
+                    headers=self._headers(),
+                ) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            if not self._daemon_is_stopped_on_purpose():
+                raise
+            logger.debug("voice daemon is stopped; reporting an empty state: %s", error)
+            return {}
         if not isinstance(payload, dict):
             raise RuntimeError("Omnius voice state is not an object")
         return payload
+
+    def _daemon_is_stopped_on_purpose(self) -> bool:
+        return self._omni is not None and self._omni.config.silences_voice_daemon
 
     @contextlib.asynccontextmanager
     async def _language_lane(self, gate: asyncio.Lock) -> AsyncIterator[None]:
@@ -250,11 +270,16 @@ class OmniusClient:
         better than taking the machine down with it.
         """
 
+        component = (
+            self._omni.config.language_component
+            if self._omni is not None
+            else LANGUAGE_COMPONENT
+        )
         async with gate:
-            if self._residency is None or not self._residency.manages(LANGUAGE_COMPONENT):
+            if self._residency is None or not self._residency.manages(component):
                 yield
                 return
-            async with self._residency.require(LANGUAGE_COMPONENT):
+            async with self._residency.require(component):
                 yield
 
     async def voice_catalog(self, *, force: bool = False) -> dict[str, object]:
@@ -303,7 +328,11 @@ class OmniusClient:
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             tts, asr, supertonic, dedicated_asr_state = await asyncio.gather(
-                get_json(session, "/v1/voice/models"),
+                get_json(
+                    session,
+                    "/v1/voice/models",
+                    unavailable={"models": []},
+                ),
                 get_json(
                     session,
                     "/v1/voice/asr-models",
@@ -2111,24 +2140,50 @@ class OmniusClient:
         follow-up completion -- is unchanged by where the search ran.
         """
 
+        wanted = max(1, min(int(num_results), 8))
         result = await self._omni.execute_tool(
-            "web_search", {"query": query[:300], "max_results": max(1, min(int(num_results), 8))}
+            "web_search", {"query": query[:300], "max_results": wanted}
         )
-        entries = result.get("results")
-        if not isinstance(entries, list) or not entries:
+        entries = [
+            entry
+            for entry in (result.get("results") or [])
+            if isinstance(entry, dict) and str(entry.get("url") or "").strip()
+        ][:wanted]
+        if not entries:
             raise RuntimeError("omni web_search returned no evidence")
-        lines: list[str] = []
-        for entry in entries[: max(1, min(int(num_results), 8))]:
-            if not isinstance(entry, dict):
+
+        # Discovery returns titles and links; most snippets come back empty.
+        # Answering a question needs the page, so read the best result the way
+        # the portal's own loop does. A reply built on link text alone is what
+        # "I cannot pull a headline from those results" sounds like.
+        body = ""
+        for entry in entries:
+            try:
+                page = await self._omni.execute_tool(
+                    "web_fetch",
+                    {"url": str(entry["url"]).strip()[:400], "max_length": 4000},
+                )
+            except Exception as error:  # noqa: BLE001 - one bad page is not fatal
+                logger.debug("omni web_fetch failed for %s: %s", entry.get("url"), error)
                 continue
+            text = page.get("text") or page.get("content") or page.get("excerpt")
+            if isinstance(text, str) and text.strip():
+                body = " ".join(text.split())[:4000]
+                entry["_fetched"] = True
+                break
+
+        lines: list[str] = []
+        for entry in entries:
             title = " ".join(str(entry.get("title") or "").split())[:200]
             url = str(entry.get("url") or "").strip()[:400]
             snippet = " ".join(str(entry.get("snippet") or "").split())[:400]
-            if not (title or snippet):
-                continue
-            lines.append(f"- {title} ({url})" + (f": {snippet}" if snippet else ""))
-        if not lines:
-            raise RuntimeError("omni web_search returned no usable results")
+            marker = " [read]" if entry.get("_fetched") else ""
+            lines.append(
+                f"- {title} ({url}){marker}" + (f": {snippet}" if snippet else "")
+            )
+        if body:
+            lines.append("")
+            lines.append(f"Page contents: {body}")
         return "\n".join(lines)[:10000]
 
     async def web_fetch(self, url: str, *, max_characters: int = 1700) -> str:
@@ -5136,7 +5191,11 @@ class OmniusClient:
                 list(messages),
                 tools=tools if isinstance(tools, list) and tools else None,
                 think=think,
-                num_ctx=self.config.model_num_ctx,
+                # Deliberately not model_num_ctx: that is the window Egg would
+                # like, and Ollama silently truncated to whatever it had. The
+                # adapter's worker refuses an over-long prompt instead, so the
+                # figure that matters is the context it actually has, which
+                # the client fills in and trims against.
                 num_predict=num_predict,
                 timeout_seconds=self.config.timeout_seconds,
             )

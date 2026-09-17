@@ -499,6 +499,85 @@ class OmniAdapterClient:
 
     # -- language --------------------------------------------------------
 
+    @staticmethod
+    def _estimated_tokens(
+        messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> int:
+        # Deliberately pessimistic: ~3 characters per token rather than the
+        # usual 4, so the estimate errs towards trimming one turn too many
+        # instead of one too few. Tool schemas are rendered into the prompt by
+        # the chat template and count against the same budget -- leaving them
+        # out is how an estimate that said "fits" produced a 4152-token
+        # request against a 4096-token worker.
+        characters = sum(
+            len(str(message.get("content") or "")) + 8 for message in messages
+        )
+        if tools:
+            characters += len(json.dumps(tools))
+        return characters // 3
+
+    @classmethod
+    def _fit_to_context(
+        cls,
+        messages: list[dict[str, Any]],
+        context_tokens: int,
+        reply_tokens: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Drop the oldest exchanges until the prompt fits the worker.
+
+        Ollama silently truncates an over-long prompt; a llama.cpp server
+        refuses it outright -- "request (4108 tokens) exceeds the available
+        context size (4096 tokens)" -- and the turn ends with no reply at
+        all. Growing the worker instead is not free here: measured on this
+        module, going from 4096 to 6144 tokens per slot costs 3.5 GiB, which
+        is half the room the speech worker needs.
+
+        The system message and the most recent turn are never dropped: losing
+        either changes what was asked rather than how much context it has.
+        """
+
+        budget = max(256, context_tokens - reply_tokens)
+        if cls._estimated_tokens(messages, tools) <= budget:
+            return messages
+
+        head = [message for message in messages if message.get("role") == "system"]
+        rest = [message for message in messages if message.get("role") != "system"]
+        dropped = 0
+        while len(rest) > 1 and cls._estimated_tokens(head + rest, tools) > budget:
+            rest.pop(0)
+            dropped += 1
+
+        # History alone was not the problem. Here the bulk is the system
+        # message -- Egg's instructions followed by accumulated world context
+        # -- so the tail is cut back until it fits. The instructions live at
+        # the head and survive; what is lost is the oldest observed detail,
+        # which is the right thing to lose.
+        truncated = 0
+        if head and cls._estimated_tokens(head + rest, tools) > budget:
+            overflow = cls._estimated_tokens(head + rest, tools) - budget
+            content = str(head[-1].get("content") or "")
+            keep = max(256, len(content) - (overflow * 3) - 512)
+            if keep < len(content):
+                truncated = len(content) - keep
+                head = head[:-1] + [
+                    {
+                        **head[-1],
+                        "content": content[:keep].rstrip()
+                        + "\n[earlier context omitted to fit the model's context window]",
+                    }
+                ]
+
+        trimmed = head + rest
+        logger.info(
+            "omni chat: fit prompt to %d tokens (dropped %d message(s), "
+            "cut %d characters of context)",
+            context_tokens,
+            dropped,
+            truncated,
+        )
+        return trimmed
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -524,6 +603,10 @@ class OmniAdapterClient:
         wants deltas gets the finished reply in one piece.
         """
 
+        context_tokens = num_ctx or self.config.language_context_tokens
+        messages = self._fit_to_context(
+            messages, context_tokens, num_predict or 256, tools
+        )
         payload = self._request(
             task="chat",
             messages=messages,
@@ -531,7 +614,7 @@ class OmniAdapterClient:
             options={
                 key: value
                 for key, value in (
-                    ("num_ctx", num_ctx),
+                    ("num_ctx", context_tokens),
                     ("num_predict", num_predict),
                     ("temperature", temperature),
                 )
@@ -541,7 +624,7 @@ class OmniAdapterClient:
         )
         if tools:
             payload["tools"] = tools
-        async with self._resident(self.LANGUAGE_COMPONENT):
+        async with self._resident(self.config.language_component):
             result = await self._post(
                 payload,
                 timeout_seconds=(

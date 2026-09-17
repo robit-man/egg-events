@@ -289,8 +289,13 @@ def test_web_search_survives_stopping_the_daemon() -> None:
     assert "search_current_web" in names
 
 
-def test_web_search_executes_on_the_adapter_when_the_daemon_is_stopped() -> None:
-    """And it must actually run there, not just be advertised."""
+def test_web_search_reads_a_page_rather_than_returning_bare_links() -> None:
+    """Discovery returns titles and URLs; most snippets come back empty.
+
+    Answering a question needs the page itself, so the search is followed by
+    a fetch the way the portal's own loop does it. Evidence made of link text
+    alone is what "I cannot pull a headline from those results" sounds like.
+    """
 
     from egg_companion.adapters.omni import OmniAdapterClient
     from egg_companion.adapters.omnius import OmniusClient
@@ -298,25 +303,48 @@ def test_web_search_executes_on_the_adapter_when_the_daemon_is_stopped() -> None
     config = omni_config()
     adapter = OmniAdapterClient(config.omni_adapter)
     client = OmniusClient(config.omnius, adapter)
-    called: dict[str, object] = {}
+    calls: list[tuple[str, dict]] = []
 
     async def execute_tool(name, arguments):
-        called["name"] = name
-        called["arguments"] = arguments
-        return {
-            "results": [
-                {"title": "Starship", "url": "https://example.test/s", "snippet": "flew"},
-                {"title": "Launches", "url": "https://example.test/l", "snippet": ""},
-            ]
-        }
+        calls.append((name, dict(arguments)))
+        if name == "web_search":
+            return {
+                "results": [
+                    {"title": "Starship", "url": "https://example.test/s", "snippet": ""},
+                    {"title": "Launches", "url": "https://example.test/l", "snippet": ""},
+                ]
+            }
+        return {"text": "Starship completed its eleventh flight test on Tuesday."}
 
     adapter.execute_tool = execute_tool
     evidence = asyncio.run(client.web_search("starship latest flight", num_results=4))
 
-    assert called["name"] == "web_search"
-    assert called["arguments"]["query"] == "starship latest flight"
+    assert [name for name, _ in calls] == ["web_search", "web_fetch"]
+    assert calls[0][1]["query"] == "starship latest flight"
+    assert calls[1][1]["url"] == "https://example.test/s"
     assert "https://example.test/s" in evidence
-    assert "flew" in evidence
+    assert "eleventh flight test" in evidence
+
+
+def test_a_page_that_will_not_load_does_not_fail_the_search() -> None:
+    """One bad result must not cost the turn its evidence."""
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+    from egg_companion.adapters.omnius import OmniusClient
+
+    config = omni_config()
+    adapter = OmniAdapterClient(config.omni_adapter)
+    client = OmniusClient(config.omnius, adapter)
+
+    async def execute_tool(name, arguments):
+        if name == "web_search":
+            return {"results": [{"title": "Starship", "url": "https://example.test/s"}]}
+        raise RuntimeError("connection reset")
+
+    adapter.execute_tool = execute_tool
+    evidence = asyncio.run(client.web_search("starship", num_results=2))
+
+    assert "https://example.test/s" in evidence
 
 
 def test_replies_are_generated_through_the_adapter_in_omni_mode() -> None:
@@ -344,3 +372,173 @@ def test_replies_are_generated_through_the_adapter_in_omni_mode() -> None:
     assert seen["messages"] == [{"role": "user", "content": "hi"}]
     # Reasoning stays off so tokens are not spent before the reply.
     assert seen["think"] is False
+
+
+# -- one worker answers everything -----------------------------------------
+
+
+def test_language_is_charged_to_the_worker_that_holds_the_weights() -> None:
+    """Comprehension and language are the same weights in the same process.
+
+    Budgeting a separate Ollama slot for them means accounting for two copies
+    of one model. They do not both fit, so the manager swaps between hearing
+    and answering on every turn and each turn pays a full reload.
+    """
+
+    assert omni_config().omni_adapter.language_component == "omni_comprehension"
+    assert (
+        omni_config(language_stage="ollama").omni_adapter.language_component
+        == "ollama_language"
+    )
+
+
+def test_no_separate_ollama_slot_is_budgeted_for_the_same_model(monkeypatch) -> None:
+    from egg_companion.services.residency_wiring import build_residency_manager
+
+    manager = build_residency_manager(omni_config())
+    assert manager is not None
+    assert "ollama_language" not in manager._components
+    assert {"omni_comprehension", "omni_speech"} <= set(manager._components)
+
+
+def test_speech_can_always_be_admitted_for_a_reply(monkeypatch) -> None:
+    """Comprehension must stay evictable, or a turn ends without a voice.
+
+    Measured on this module: comprehension 16.7 GiB and speech 6.7 GiB come
+    to 23.4 of 23.6 usable, the desktop session holding the rest. Pinning
+    comprehension -- tempting, since it answers both hearing and language --
+    means speech can never be admitted and every reply is silent.
+    """
+
+    from egg_companion.services.residency_wiring import build_residency_manager
+
+    manager = build_residency_manager(omni_config())
+    assert manager is not None
+    comprehension = manager._components["omni_comprehension"]
+    assert comprehension.always_resident is False
+    assert comprehension.pinned is False
+
+    # Speech outranks nothing; it is reclaimed first when idle. What matters
+    # is that the expensive worker can give way to it at all.
+    assert comprehension.priority > manager._components["omni_speech"].priority
+
+
+def test_a_busy_worker_is_not_mistaken_for_an_absent_one() -> None:
+    """llama.cpp answers 503 both while loading and while every slot is busy.
+
+    Reading "busy" as "unloaded" made the manager try to load a component
+    that was already resident -- and a pinned component cannot be evicted to
+    make room for itself, so the turn was refused with "only 6.2 GiB is
+    available (pinned: omni_comprehension)" against weights that were there.
+    """
+
+    import aiohttp
+    from aiohttp import web
+
+    from egg_companion.services.residency_wiring import _http_ready
+
+    async def scenario() -> None:
+        async def busy(_request):
+            return web.json_response({"error": {"message": "no slot available"}}, status=503)
+
+        async def loading(_request):
+            return web.json_response({"error": {"message": "Loading model"}}, status=503)
+
+        app = web.Application()
+        app.router.add_get("/busy", busy)
+        app.router.add_get("/loading", loading)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        try:
+            assert await _http_ready(f"http://127.0.0.1:{port}/busy")() is True
+            assert await _http_ready(f"http://127.0.0.1:{port}/loading")() is False
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_a_long_prompt_is_trimmed_rather_than_refused() -> None:
+    """llama.cpp refuses an over-long prompt; Ollama quietly truncated it.
+
+    A turn that overran the worker's context got no reply at all:
+    "request (4108 tokens) exceeds the available context size (4096)".
+    Growing the worker is not the answer here -- 4096 to 6144 tokens per slot
+    was measured at 3.5 GiB, half the room the speech worker needs.
+    """
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+
+    system = {"role": "system", "content": "You are Egg."}
+    old = [
+        {"role": "user", "content": "x" * 6000},
+        {"role": "assistant", "content": "y" * 6000},
+    ]
+    latest = {"role": "user", "content": "What did you just hear?"}
+
+    fitted = OmniAdapterClient._fit_to_context(
+        [system, *old, latest], context_tokens=4096, reply_tokens=160
+    )
+
+    # The system prompt and the live question always survive.
+    assert fitted[0] == system
+    assert fitted[-1] == latest
+    assert OmniAdapterClient._estimated_tokens(fitted) <= 4096 - 160
+
+
+def test_a_prompt_that_already_fits_is_left_alone() -> None:
+    from egg_companion.adapters.omni import OmniAdapterClient
+
+    messages = [
+        {"role": "system", "content": "You are Egg."},
+        {"role": "user", "content": "Hello."},
+    ]
+    assert (
+        OmniAdapterClient._fit_to_context(messages, 4096, 160) == messages
+    )
+
+
+def test_an_oversized_system_prompt_is_cut_back() -> None:
+    """History alone is not always the problem.
+
+    Egg's system message carries its instructions followed by accumulated
+    world context, and that block alone can overrun the worker. Trimming only
+    conversation left a 4152-token request against a 4096-token worker and no
+    reply at all.
+    """
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+
+    system = {"role": "system", "content": "INSTRUCTIONS. " + ("world detail. " * 2000)}
+    latest = {"role": "user", "content": "What did you just hear?"}
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "inspect_current_camera", "description": "d" * 400},
+        }
+    ]
+
+    fitted = OmniAdapterClient._fit_to_context(
+        [system, latest], context_tokens=4096, reply_tokens=160, tools=tools
+    )
+
+    assert OmniAdapterClient._estimated_tokens(fitted, tools) <= 4096 - 160
+    # The instructions at the head survive; the question is untouched.
+    assert str(fitted[0]["content"]).startswith("INSTRUCTIONS.")
+    assert fitted[-1] == latest
+
+
+def test_tool_schemas_count_against_the_context_budget() -> None:
+    """They are rendered into the prompt, so ignoring them understates it."""
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+
+    messages = [{"role": "user", "content": "hi"}]
+    tools = [{"type": "function", "function": {"name": "t", "description": "d" * 3000}}]
+
+    assert OmniAdapterClient._estimated_tokens(messages, tools) > (
+        OmniAdapterClient._estimated_tokens(messages) + 500
+    )
