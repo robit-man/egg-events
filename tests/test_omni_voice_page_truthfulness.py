@@ -246,7 +246,10 @@ def test_a_managed_reload_clears_a_stale_failure_cooldown() -> None:
         return None
 
     adapter._residency = SimpleNamespace(
-        require=require, ensure_headroom=ensure_headroom, manages=lambda name: True
+        require=require,
+        ensure_headroom=ensure_headroom,
+        manages=lambda name: True,
+        reserve_gib=2.0,
     )
     adapter._cooldown_until = time.monotonic() + 3600
     adapter._last_error = "ClientConnectorError: Cannot connect"

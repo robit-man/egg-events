@@ -404,10 +404,9 @@ def test_no_separate_ollama_slot_is_budgeted_for_the_same_model(monkeypatch) -> 
 def test_speech_can_always_be_admitted_for_a_reply(monkeypatch) -> None:
     """Comprehension must stay evictable, or a turn ends without a voice.
 
-    Measured on this module: comprehension 16.7 GiB and speech 6.7 GiB come
-    to 23.4 of 23.6 usable, the desktop session holding the rest. Pinning
-    comprehension -- tempting, since it answers both hearing and language --
-    means speech can never be admitted and every reply is silent.
+    Comprehension normally stays loaded across ASR and language. It must still
+    be evictable when current free memory cannot hold the measured TTS peak
+    plus reserve, or the safe response would be a silent fallback.
     """
 
     from egg_companion.services.residency_wiring import build_residency_manager
@@ -421,6 +420,21 @@ def test_speech_can_always_be_admitted_for_a_reply(monkeypatch) -> None:
     # Speech outranks nothing; it is reclaimed first when idle. What matters
     # is that the expensive worker can give way to it at all.
     assert comprehension.priority > manager._components["omni_speech"].priority
+
+
+def test_adapter_controller_is_not_budgeted_as_resident_tts_weights() -> None:
+    """An idle HTTP service is not the transient 4 GiB generation worker."""
+
+    from egg_companion.services.residency_wiring import build_residency_manager
+
+    config = omni_config()
+    manager = build_residency_manager(config)
+    assert manager is not None
+    controller = manager._components["omni_speech"]
+
+    assert controller.cost_gib == config.residency.adapter_service_cost_gib
+    assert controller.cost_gib < config.residency.speech_cost_gib
+    assert controller.always_resident is True
 
 
 def test_a_busy_worker_is_not_mistaken_for_an_absent_one() -> None:

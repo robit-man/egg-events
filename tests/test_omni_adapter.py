@@ -1129,11 +1129,13 @@ def test_speech_reserves_worker_headroom_before_attempting(monkeypatch) -> None:
         WeightResidencyManager,
     )
 
-    monkeypatch.setattr(residency_module, "available_memory_gib", lambda: 2.8)
-    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=3.0)
-    # The service probes as loaded, but nothing can be reclaimed.
+    # The 4.2 GiB worker itself would fit in 5 GiB. It is still refused because
+    # doing so would spend the manager's 2 GiB safety reserve.
+    monkeypatch.setattr(residency_module, "available_memory_gib", lambda: 5.0)
+    manager = WeightResidencyManager(total_gib=30.0, reserve_gib=2.0)
+    # The lightweight service probes as loaded, but nothing can be reclaimed.
     manager.register(
-        _residency_component("omni_speech", 4.0, loaded=True, fits=True)
+        _residency_component("omni_speech", 0.25, loaded=True, fits=True)
     )
     client = OmniAdapterClient(
         OmniAdapterConfig(mode="omni", speech_enabled=True), manager

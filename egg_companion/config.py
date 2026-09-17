@@ -250,9 +250,18 @@ class ResidencyConfig(BaseModel):
     # while actually speaking.
     # Measured while cloning: 6.4 GiB for the worker, not the 1.4 GiB of
     # weights -- the speaker-embedding encoder is most of it.
-    # Measured on a 30 GiB Orin: the speech worker peaks at 6.7 GiB, and a
-    # desktop session holds ~6.4 GiB of the module, leaving 23.6 usable.
-    speech_cost_gib: float = Field(default=6.7, gt=0, le=32)
+    # Measured on a 30 GiB Orin, sampling MemAvailable through a synthesis
+    # with the comprehension worker resident: the speech worker peaks at 4.0
+    # GiB. Earlier figures of 6.4 and 6.7 were read against a moving baseline
+    # and were high by two thirds, which mattered: the manager evicted 16.7
+    # GiB of comprehension every turn to reserve room for something that
+    # needed far less, and the turn then paid to load it back.
+    speech_cost_gib: float = Field(default=4.0, gt=0, le=32)
+    # The adapter HTTP/TTS wrapper holds no model weights while idle. Keep its
+    # small controller footprint separate from the transient TTS worker cost,
+    # or merely starting the endpoint is budgeted as if speech were already
+    # generating and needlessly evicts comprehension.
+    adapter_service_cost_gib: float = Field(default=0.25, gt=0, le=4)
     speech_unit: str = "egg-omni-adapters.service"
     speech_priority: int = 5
     speech_load_timeout_seconds: float = Field(default=300, gt=0, le=3600)
@@ -335,10 +344,14 @@ class OmniAdapterConfig(BaseModel):
     # Comprehension of a bounded speech segment on the integrated Jetson GPU.
     timeout_seconds: float = Field(default=45, gt=0, le=300)
     speech_timeout_seconds: float = Field(default=90, gt=0, le=600)
-    # Room the non-persistent Qwen3-TTS worker needs to spawn. Reserved before
-    # each utterance, because the speech service being up is not the same as
-    # the worker fitting -- measured at ~4 GiB plus the manager's reserve.
-    speech_headroom_gib: float = Field(default=7.0, ge=1, le=32)
+    # Memory used by the non-persistent Qwen3-TTS worker. Reserved before each
+    # utterance in addition to the residency manager's safety reserve, because
+    # the lightweight speech service being up is not the same as its worker
+    # fitting. The measured 4.0 GiB peak plus a small load-time margin. Set too
+    # high, this evicts the worker that answers everything on every turn; set
+    # too low, the TTS process is admitted into memory it does not fit and
+    # dies with a CUDA allocation failure part-way through speaking.
+    speech_headroom_gib: float = Field(default=4.2, ge=1, le=32)
     video_timeout_seconds: float = Field(default=180, gt=0, le=900)
     health_timeout_seconds: float = Field(default=3, gt=0, le=30)
     # The startup audit probes once, while the machine is at its busiest

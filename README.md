@@ -125,7 +125,7 @@ ONNX, no separate Whisper container, no YAMNet, no Supertonic. The
 capabilities that exist only to consume discrete-model output (identity
 galleries, object learning, voxel occupancy, local OCR, identity dreams) are
 switched off with it rather than left running against an empty detector. On a
-32 GB module this is not just cleaner — it is the only way the 18.5 GiB
+32 GB module this is not just cleaner — it is the only way the 16.7 GiB
 comprehension component fits at all.
 
 Switching back is one line (`mode: traditional`) plus a restart; the
@@ -138,7 +138,11 @@ adapter cannot answer.
 The adapter starts **with the companion** — `_maintain_omni_adapter` brings up
 `egg-omni-adapters.service` and keeps it up, and `egg-companion.service`
 declares `Wants=`/`After=` on it — so it is part of Egg, not a sidecar you
-start by hand.
+start by hand. That service is only the lightweight HTTP/controller layer: it
+does not run a generation or load weights at startup. The separate
+`egg-omni-comprehension.service` is static and admitted on demand. ASR and the
+language reply share that one resident process; Qwen3-TTS is non-persistent
+and starts only after its measured peak plus the memory reserve fits.
 
 What the adapter answers better than the traditional path:
 
@@ -224,7 +228,8 @@ it.
 The script pulls `robit/ornith-1.5-omni:q4km` (34 GB: a 6.1 GiB Ornith 1.5 9B
 base, an 18.5 GiB Qwen3-Omni-30B-A3B comprehension component, and a 1.4 GiB
 Qwen3-TTS component), builds llama.cpp with CUDA kernels pinned to this SoC,
-and installs `egg-omni-adapters.service` on loopback with no public tunnel.
+and installs the lightweight `egg-omni-adapters.service` plus the demand-only
+`egg-omni-comprehension.service` on loopback with no public tunnel.
 `scripts/bootstrap-jetson.sh` re-runs it automatically once the adapter is
 enabled in config.
 

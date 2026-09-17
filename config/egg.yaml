@@ -171,9 +171,10 @@ omni_adapter:
   # ASR, environmental audio, video and vision all come from the omni package.
   # The discrete stack is silenced -- no YOLOE/SAM/CLIP, no Whisper container,
   # no YAMNet -- both because that is the point and because its memory is
-  # needed elsewhere. Egg's replies still come from Omnius -> Ollama, so the
-  # residency manager swaps Ollama and the 16.8 GiB comprehension worker in
-  # and out around each turn.
+  # needed elsewhere. ASR and the reply's language pass share the same
+  # comprehension process; the non-persistent TTS worker is admitted only
+  # after that pass, and comprehension is evicted only if speech truly needs
+  # its space.
   exclusive: true
   # The adapter starts with the companion; it is not a sidecar you start by
   # hand. Switching mode back to `traditional` and restarting restores the

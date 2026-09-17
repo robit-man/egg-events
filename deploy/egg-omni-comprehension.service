@@ -16,7 +16,8 @@ WorkingDirectory=@VENDOR_DIR@
 ExecStart=@VENDOR_DIR@/vendor/llama.cpp/build/bin/llama-server \
   -m @VENDOR_DIR@/runtime-data/components/comprehension-model.gguf \
   --mmproj @VENDOR_DIR@/runtime-data/components/comprehension-projector.gguf \
-  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c 4096
+  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c @CONTEXT_TOKENS@ \
+  --threads 4 --threads-batch 4 --poll 0 --poll-batch 0
 Restart=no
 TimeoutStopSec=60
 UMask=0077
@@ -24,6 +25,3 @@ UMask=0077
 # manager is what prevents over-commit; this is only a backstop, and a cap that
 # kills the worker mid-utterance is worse than no cap at all.
 MemoryMax=26G
-
-[Install]
-WantedBy=default.target

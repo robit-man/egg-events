@@ -10,7 +10,7 @@ Measured on a 32 GB AGX Orin, 29.98 GiB usable:
 
     baseline (OS, desktop, companion)          ~8 GiB
     Qwen3-Omni comprehension, 8K context       16.8 GiB
-    Qwen3-TTS worker while cloning              6.7 GiB   (~4 without)
+    Qwen3-TTS worker while cloning              4.0 GiB
     Ollama language on the logical tag          5.6 GiB
 
 Any three of those together exceed the module. A conversational turn does not

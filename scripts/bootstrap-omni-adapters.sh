@@ -24,6 +24,7 @@ omni_model="${EGG_OMNI_MODEL:-robit/ornith-1.5-omni:q4km}"
 # twice and, with OLLAMA_MAX_LOADED_MODELS=1, thrash between them.
 language_model="${EGG_OMNI_LANGUAGE_MODEL:-$omni_model}"
 adapter_port="${EGG_OMNI_ADAPTER_PORT:-8910}"
+comprehension_context_tokens="${EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS:-4096}"
 install_service=1
 start_service=1
 
@@ -37,7 +38,7 @@ Usage: scripts/bootstrap-omni-adapters.sh [options]
 
 Environment: EGG_OMNI_ADAPTERS_DIR, EGG_OMNI_ADAPTERS_REPO,
 EGG_OMNI_ADAPTERS_REF, EGG_OMNI_MODEL, EGG_OMNI_LANGUAGE_MODEL,
-EGG_OMNI_ADAPTER_PORT.
+EGG_OMNI_ADAPTER_PORT, EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS.
 EOF
 }
 
@@ -52,6 +53,13 @@ while (($#)); do
 done
 
 log() { printf '[egg-omni] %s\n' "$*"; }
+
+case "$comprehension_context_tokens" in
+  ''|*[!0-9]*)
+    printf 'EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS must be an integer\n' >&2
+    exit 2
+    ;;
+esac
 
 for command in git cmake ollama ffmpeg; do
   command -v "$command" >/dev/null 2>&1 || {
@@ -108,33 +116,35 @@ log "validating the sidecar attached to $omni_model"
 if ((install_service)); then
   unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir"
-  cat > "$unit_dir/egg-omni-adapters.service" <<EOF
-[Unit]
-Description=Qwen Omni adapter for the Egg companion
-After=network-online.target ollama.service
-Wants=network-online.target
+  escaped_vendor_dir="$(printf '%s' "$vendor_dir" | sed 's/[&|\\]/\\&/g')"
+  escaped_omni_model="$(printf '%s' "$omni_model" | sed 's/[&|\\]/\\&/g')"
+  escaped_language_model="$(printf '%s' "$language_model" | sed 's/[&|\\]/\\&/g')"
+  sed \
+    -e "s|@VENDOR_DIR@|$escaped_vendor_dir|g" \
+    -e "s|@OMNI_MODEL@|$escaped_omni_model|g" \
+    -e "s|@LANGUAGE_MODEL@|$escaped_language_model|g" \
+    -e "s|@ADAPTER_PORT@|$adapter_port|g" \
+    -e "s|@CONTEXT_TOKENS@|$comprehension_context_tokens|g" \
+    "$workspace_dir/deploy/egg-omni-adapters.service" \
+    > "$unit_dir/egg-omni-adapters.service"
+  sed \
+    -e "s|@VENDOR_DIR@|$escaped_vendor_dir|g" \
+    -e "s|@CONTEXT_TOKENS@|$comprehension_context_tokens|g" \
+    "$workspace_dir/deploy/egg-omni-comprehension.service" \
+    > "$unit_dir/egg-omni-comprehension.service"
 
-[Service]
-Type=simple
-WorkingDirectory=$vendor_dir
-Environment=OMNI_REPO_ROOT=$vendor_dir
-Environment=OMNI_MODEL=$omni_model
-Environment=OMNI_LANGUAGE_MODEL=$language_model
-Environment=OMNI_ADAPTER_PORT=$adapter_port
-Environment=PYTHONUNBUFFERED=1
-# --no-tunnel keeps every component on loopback: Egg is the only client, and
-# the portal's public Cloudflare URL is not wanted on this device.
-ExecStart=$vendor_dir/.venv/bin/qwen-omni-daemon serve --allow-direct-gpu --no-tunnel
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=0
-TimeoutStopSec=120
-UMask=0077
-
-[Install]
-WantedBy=default.target
-EOF
+  # Older installs made adapter startup pull in the 16.7 GiB worker through a
+  # Wants= drop-in. That dependency bypasses the residency manager, so remove
+  # this one known-obsolete file and leave any operator-owned drop-ins alone.
+  stale_dependency="$unit_dir/egg-omni-adapters.service.d/20-comprehension.conf"
+  if [[ -f "$stale_dependency" ]]; then
+    log "removing obsolete boot-time comprehension dependency"
+    rm -f -- "$stale_dependency"
+  fi
   systemctl --user daemon-reload
+  # The comprehension unit is demand-only. Disabling is idempotent and does
+  # not stop a worker currently pinned by an in-flight request.
+  systemctl --user disable egg-omni-comprehension.service >/dev/null 2>&1 || true
   systemctl --user enable egg-omni-adapters.service
   if ((start_service)); then
     log "starting egg-omni-adapters.service"

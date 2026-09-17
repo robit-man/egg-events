@@ -214,13 +214,21 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
             # request can be routed to.
             ready=_http_ready("http://127.0.0.1:8901/health"),
             load_timeout_seconds=settings.comprehension_load_timeout_seconds,
-            idle_release_seconds=settings.comprehension_idle_release_seconds,
-            # Not always_resident: measured on this module, comprehension
-            # (16.7 GiB) and speech (6.7 GiB) come to 23.4 of 23.6 usable, so
-            # pinning it means speech can never be admitted and a turn ends
-            # without a voice. It is evicted for speech and reloaded for the
-            # next utterance -- the one reload a turn costs, rather than the
-            # two it paid when language lived in a second runtime.
+            # Releasing this one on idle buys nothing. It answers hearing,
+            # vision and language, so the only thing that ever wants its
+            # memory is the speech worker -- which takes it by eviction when
+            # it needs it. Letting it go after three quiet minutes just means
+            # the next thing said pays a 16.7 GiB reload before Egg can even
+            # transcribe it.
+            idle_release_seconds=(
+                0.0
+                if config.omni_adapter.language_component == "omni_comprehension"
+                else settings.comprehension_idle_release_seconds
+            ),
+            # Not always_resident: if the transient TTS worker cannot fit
+            # beside comprehension, speech may evict it after ASR and language
+            # have both used this same process. That is at most one necessary
+            # transition, not a reload between every stage.
             always_resident=False,
         )
     )
@@ -228,11 +236,19 @@ def build_residency_manager(config: EggConfig) -> WeightResidencyManager | None:
         systemd_component(
             "omni_speech",
             settings.speech_unit,
-            settings.speech_cost_gib,
+            # This unit is only the adapter/controller. Qwen3-TTS is a
+            # non-persistent child whose measured peak is admitted separately
+            # immediately before synthesis.
+            settings.adapter_service_cost_gib,
             priority=settings.speech_priority,
             ready=_http_ready(f"{adapter_base}/healthz"),
             load_timeout_seconds=settings.speech_load_timeout_seconds,
             idle_release_seconds=settings.speech_idle_release_seconds,
+            # Stopping this tiny transport cannot reclaim the TTS weights --
+            # they already exit after each utterance -- and restarting it used
+            # to rerun heavyweight startup smoke. Keep the controller, not the
+            # model, resident.
+            always_resident=True,
         )
     )
     if config.omni_adapter.language_component == LANGUAGE_COMPONENT:

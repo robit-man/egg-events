@@ -478,11 +478,14 @@ class OmniAdapterClient:
                     )
                 elif component == self.SPEECH_COMPONENT:
                     # The TTS worker is non-persistent: the service being up
-                    # says nothing about whether the worker can spawn. Reserve
-                    # the room it actually needs, or fail over before the
-                    # attempt rather than after it.
+                    # says nothing about whether the worker can spawn. Its
+                    # measured peak and the manager's safety reserve must both
+                    # remain free, or fail over before the attempt rather than
+                    # after a CUDA allocation has destabilized the host.
                     await self._residency.ensure_headroom(
-                        self.config.speech_headroom_gib, exclude=component
+                        self.config.speech_headroom_gib
+                        + self._residency.reserve_gib,
+                        exclude=component,
                     )
                 await stack.enter_async_context(self._residency.require(component))
                 # The manager has just brought this component up, which is
