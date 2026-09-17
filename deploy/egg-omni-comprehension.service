@@ -10,13 +10,20 @@ WorkingDirectory=@VENDOR_DIR@
 # admits it only when its measured footprint genuinely fits. Do not enable
 # this unit: booting it unconditionally is what over-commits the module.
 #
-# The context here must match residency.comprehension_context_tokens, which is
-# what the manager budgets against. They drifted once -- the manager sized a
-# 4096 window while this ran 8192 -- and the worker was OOM-killed mid-turn.
-ExecStart=@VENDOR_DIR@/vendor/llama.cpp/build/bin/llama-server \
+# Pick the largest context that fits MemAvailable at each load, while retaining
+# the same reserve used by the residency manager. The configured token value is
+# a ceiling, not a promise to over-commit unified memory.
+Environment=OMNI_COMPREHENSION_CONTEXT_TOKENS=@CONTEXT_TOKENS@
+Environment=OMNI_COMPREHENSION_MIN_CONTEXT_TOKENS=4096
+Environment=OMNI_COMPREHENSION_MEMORY_RESERVE_GIB=3.0
+Environment=OMNI_COMPREHENSION_CONTEXT_FILE=%t/egg-omni-comprehension-context
+ExecStart=@VENDOR_DIR@/.venv/bin/python \
+  @VENDOR_DIR@/runtime/comprehension_launcher.py \
+  --state-file %t/egg-omni-comprehension-context -- \
+  @VENDOR_DIR@/vendor/llama.cpp/build/bin/llama-server \
   -m @VENDOR_DIR@/runtime-data/components/comprehension-model.gguf \
   --mmproj @VENDOR_DIR@/runtime-data/components/comprehension-projector.gguf \
-  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c @CONTEXT_TOKENS@ \
+  --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c {context} \
   --threads 4 --threads-batch 4 --poll 0 --poll-batch 0
 Restart=no
 TimeoutStopSec=60

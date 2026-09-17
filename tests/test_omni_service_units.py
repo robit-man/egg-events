@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -24,7 +23,18 @@ def test_comprehension_is_demand_only_and_does_not_busy_poll() -> None:
 
     assert "WantedBy=default.target" not in unit
     assert "--poll 0 --poll-batch 0" in unit
+    assert "comprehension_launcher.py" in unit
+    assert "-c {context}" in unit
+    assert "OMNI_COMPREHENSION_MEMORY_RESERVE_GIB=3.0" in unit
+    assert "OMNI_COMPREHENSION_CONTEXT_FILE=%t/" in unit
     assert "MemoryMax=26G" in unit
+
+
+def test_adapter_reads_the_context_the_launcher_actually_selected() -> None:
+    unit = (ROOT / "deploy/egg-omni-adapters.service").read_text(encoding="utf-8")
+
+    assert "OMNI_COMPREHENSION_CONTEXT_TOKENS=@CONTEXT_TOKENS@" in unit
+    assert "OMNI_COMPREHENSION_CONTEXT_FILE=%t/" in unit
 
 
 def test_bootstrap_removes_the_legacy_boot_dependency() -> None:

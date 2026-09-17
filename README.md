@@ -140,9 +140,12 @@ The adapter starts **with the companion** — `_maintain_omni_adapter` brings up
 declares `Wants=`/`After=` on it — so it is part of Egg, not a sidecar you
 start by hand. That service is only the lightweight HTTP/controller layer: it
 does not run a generation or load weights at startup. The separate
-`egg-omni-comprehension.service` is static and admitted on demand. ASR and the
-language reply share that one resident process; Qwen3-TTS is non-persistent
-and starts only after its measured peak plus the memory reserve fits.
+`egg-omni-comprehension.service` is admitted on demand. At every load it reads
+current `MemAvailable` and chooses the largest safe context from 4K through the
+configured 64K ceiling while retaining the residency reserve; the adapter
+reads the published choice before fitting a prompt. ASR and the language reply
+share that one resident process; Qwen3-TTS is non-persistent and starts only
+after its measured peak plus the memory reserve fits.
 
 What the adapter answers better than the traditional path:
 

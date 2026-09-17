@@ -226,20 +226,21 @@ class ResidencyConfig(BaseModel):
     # Headroom the manager will not spend. The OS, page cache, and the
     # companion's own allocations move underneath a load that was sized at
     # admission time.
-    reserve_gib: float = Field(default=2.0, ge=0.5, le=16)
+    reserve_gib: float = Field(default=3.0, ge=0.5, le=16)
     # Qwen3-Omni comprehension at an 8K window. The most expensive to reload,
     # so it outranks everything else and is evicted last.
-    # Measured at a 4096 context: 16.7 GiB, against 16.8 at 8192. The KV is
-    # not the driver here, the weights are -- halving the window buys almost
-    # nothing, so do not expect context to be the lever for fitting this.
+    # Measured at a 4096 context: 16.7 GiB. llama.cpp allocates the context for
+    # each of four slots, so a 64K context reaches roughly 22.1 GiB; the
+    # launcher's memory-aware choice accounts for that aggregate KV growth.
     comprehension_cost_gib: float = Field(default=16.7, gt=0, le=64)
     comprehension_unit: str = "egg-omni-comprehension.service"
-    # The context the comprehension worker is started with. The manager budgets
-    # against this, so the unit's -c must match it. They drifted once -- the
-    # manager sized a 4096 window while the unit ran 8192 -- and the worker was
-    # OOM-killed by its own cgroup cap mid-utterance, which looked from outside
-    # like the assistant simply disconnecting.
-    comprehension_context_tokens: int = Field(default=4096, ge=1024, le=131072)
+    # Upper bound for the comprehension context. The systemd launcher chooses
+    # the largest power-of-two window up to this value that the current
+    # MemAvailable can hold while retaining the residency reserve, then
+    # publishes the actual window for prompt fitting. It is deliberately not a
+    # fixed -c: available unified memory changes as speech and other workers
+    # come and go.
+    comprehension_context_tokens: int = Field(default=65536, ge=1024, le=131072)
     comprehension_priority: int = 10
     comprehension_load_timeout_seconds: float = Field(default=420, gt=0, le=3600)
     # Release comprehension after this long unused. Holding 16.8 GiB while

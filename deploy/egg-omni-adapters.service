@@ -19,7 +19,10 @@ Environment=OMNI_KEEP_CACHE=1
 # adapter only points at it; starting this unit must never start weights.
 Environment=OMNI_ENABLE_COMPREHENSION=0
 Environment=OMNI_COMPREHENSION_URL=http://127.0.0.1:8901/v1/chat/completions
+# This is the launcher's upper bound. The state file carries the window it
+# could safely afford at the most recent worker load.
 Environment=OMNI_COMPREHENSION_CONTEXT_TOKENS=@CONTEXT_TOKENS@
+Environment=OMNI_COMPREHENSION_CONTEXT_FILE=%t/egg-omni-comprehension-context
 # The TTS worker exits between utterances instead of staying resident, so its
 # ~4 GiB is only held while actually speaking.
 Environment=OMNI_TTS_PERSISTENT=0

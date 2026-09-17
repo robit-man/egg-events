@@ -126,12 +126,11 @@ def ollama_component(
 
 
 def _warn_on_context_drift(settings) -> None:
-    """Complain if the unit's -c disagrees with what the manager budgets.
+    """Complain if a legacy fixed unit disagrees with the configured ceiling.
 
-    A worker started with a larger window than the manager sized is admitted
-    on a footprint it will exceed, and is then killed by its own cgroup cap
-    part-way through a turn -- which presents as the assistant disconnecting
-    rather than as a memory fault.
+    Current units use ``{context}`` and select from MemAvailable at launch. The
+    check remains for old installations that still bake a numeric ``-c`` into
+    the unit, because those can silently drift from configuration.
     """
 
     unit_path = (
@@ -140,6 +139,8 @@ def _warn_on_context_drift(settings) -> None:
     try:
         text = unit_path.read_text(encoding="utf-8")
     except OSError:
+        return
+    if "comprehension_launcher.py" in text and "-c {context}" in text:
         return
     match = re.search(r"-c\s+(\d+)", text)
     if not match:

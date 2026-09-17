@@ -24,7 +24,9 @@ omni_model="${EGG_OMNI_MODEL:-robit/ornith-1.5-omni:q4km}"
 # twice and, with OLLAMA_MAX_LOADED_MODELS=1, thrash between them.
 language_model="${EGG_OMNI_LANGUAGE_MODEL:-$omni_model}"
 adapter_port="${EGG_OMNI_ADAPTER_PORT:-8910}"
-comprehension_context_tokens="${EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS:-4096}"
+# Upper bound only. The worker launcher chooses the largest safe window up to
+# this ceiling from MemAvailable each time comprehension is loaded.
+comprehension_context_tokens="${EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS:-65536}"
 install_service=1
 start_service=1
 
@@ -38,7 +40,7 @@ Usage: scripts/bootstrap-omni-adapters.sh [options]
 
 Environment: EGG_OMNI_ADAPTERS_DIR, EGG_OMNI_ADAPTERS_REPO,
 EGG_OMNI_ADAPTERS_REF, EGG_OMNI_MODEL, EGG_OMNI_LANGUAGE_MODEL,
-EGG_OMNI_ADAPTER_PORT, EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS.
+EGG_OMNI_ADAPTER_PORT, EGG_OMNI_COMPREHENSION_CONTEXT_TOKENS (maximum window).
 EOF
 }
 
