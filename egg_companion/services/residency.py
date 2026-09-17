@@ -370,6 +370,34 @@ class WeightResidencyManager:
                     f"{available_memory_gib():.1f} GiB available"
                 )
 
+    async def ensure_started(self, name: str) -> bool:
+        """Make sure ``name`` is running, without reserving its budget.
+
+        For a component whose cost is paid by a transient child rather than by
+        existing -- the adapter daemon, whose speech worker spawns per request
+        and exits -- being up costs nothing. Reserving the child's footprint
+        for the daemon's whole lifetime is what made every adapter call hold
+        the speech budget, so a comprehension load found it "pinned" and
+        unreclaimable and the turn was refused.
+        """
+
+        component = self._components.get(name)
+        if component is None:
+            return False
+        async with self._lock:
+            if await self._is_resident(component):
+                return True
+            logger.info("residency: starting %s (transport)", component.name)
+            try:
+                await asyncio.wait_for(
+                    component.load(), timeout=component.load_timeout_seconds
+                )
+            except (asyncio.TimeoutError, Exception) as error:  # noqa: BLE001
+                logger.warning("residency: could not start %s: %s", component.name, error)
+                return False
+            component._loaded_at = time.monotonic()
+        return True
+
     @contextlib.asynccontextmanager
     async def require(self, name: str) -> AsyncIterator[Component]:
         """Ensure ``name`` is resident for the duration of the block.

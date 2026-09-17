@@ -466,16 +466,13 @@ class OmniAdapterClient:
                 if component != self.SPEECH_COMPONENT and self._residency.manages(
                     self.SPEECH_COMPONENT
                 ):
-                    # Every task reaches the weights through the adapter
-                    # daemon, and that daemon is the unit the speech component
-                    # manages. Holding only the comprehension worker let the
-                    # manager evict the daemon to make room for it, tearing
-                    # down the HTTP server the very same request was about to
-                    # use -- which surfaced as the adapter being unreachable
-                    # moments after the manager reported a successful load.
-                    await stack.enter_async_context(
-                        self._residency.require(self.SPEECH_COMPONENT)
-                    )
+                    # The daemon is the transport for every task, so it has to
+                    # be up -- but being up costs nothing here: its speech
+                    # worker spawns per request and exits. Reserving that
+                    # worker's footprint for the daemon's lifetime made this
+                    # call hold the speech budget, and a comprehension load
+                    # then found it pinned and refused the turn.
+                    await self._residency.ensure_started(self.SPEECH_COMPONENT)
                 elif component == self.SPEECH_COMPONENT:
                     # The TTS worker is non-persistent: the service being up
                     # says nothing about whether the worker can spawn. Its
@@ -562,12 +559,21 @@ class OmniAdapterClient:
             content = str(head[-1].get("content") or "")
             keep = max(256, len(content) - (overflow * 3) - 512)
             if keep < len(content):
+                # Cut on a line boundary. Egg's system message is structured
+                # text -- labelled sections, and transcripts introduced by
+                # role-like headings -- and slicing mid-structure left the
+                # model completing the format instead of answering it: a
+                # reply that opened "user\nLocal speech, already verified as
+                # human speech by VAD:" rather than saying anything.
+                boundary = content.rfind("\n", 0, keep)
+                if boundary > 256:
+                    keep = boundary
                 truncated = len(content) - keep
                 head = head[:-1] + [
                     {
                         **head[-1],
                         "content": content[:keep].rstrip()
-                        + "\n[earlier context omitted to fit the model's context window]",
+                        + "\n\n[Earlier context omitted to fit the context window.]",
                     }
                 ]
 

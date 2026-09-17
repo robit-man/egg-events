@@ -556,3 +556,94 @@ def test_tool_schemas_count_against_the_context_budget() -> None:
     assert OmniAdapterClient._estimated_tokens(messages, tools) > (
         OmniAdapterClient._estimated_tokens(messages) + 500
     )
+
+
+def test_the_reload_is_started_while_the_reply_is_still_playing() -> None:
+    """Speaking evicts comprehension; the next utterance should not pay for it.
+
+    The speech worker takes comprehension's memory to run, which is the right
+    trade. But it leaves the next thing said waiting out a 16.7 GiB load
+    before Egg can transcribe it, and that wait is most of a slow turn.
+    Playback and the listener's own pause are free time to spend instead.
+    """
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+    from egg_companion.runtime import CompanionRuntime
+
+    runtime = CompanionRuntime.__new__(CompanionRuntime)
+    runtime._comprehension_prefetch = None
+    required: list[str] = []
+
+    class Manager:
+        def require(self, name):
+            required.append(name)
+
+            class Ctx:
+                async def __aenter__(self_inner):
+                    return None
+
+                async def __aexit__(self_inner, *_):
+                    return False
+
+            return Ctx()
+
+    runtime._residency = Manager()
+
+    async def scenario() -> None:
+        runtime._prefetch_comprehension()
+        # Fire-and-forget: it must not block the caller.
+        assert runtime._comprehension_prefetch is not None
+        await runtime._comprehension_prefetch
+
+    asyncio.run(scenario())
+    assert required == [OmniAdapterClient.COMPREHENSION_COMPONENT]
+
+
+def test_a_prefetch_already_running_is_not_started_twice() -> None:
+    from egg_companion.runtime import CompanionRuntime
+
+    runtime = CompanionRuntime.__new__(CompanionRuntime)
+    runtime._residency = object()
+
+    async def scenario() -> None:
+        pending = asyncio.Future()
+        runtime._comprehension_prefetch = pending
+        runtime._prefetch_comprehension()
+        assert runtime._comprehension_prefetch is pending
+        pending.set_result(None)
+
+    asyncio.run(scenario())
+
+
+def test_without_a_manager_the_prefetch_is_a_no_op() -> None:
+    from egg_companion.runtime import CompanionRuntime
+
+    runtime = CompanionRuntime.__new__(CompanionRuntime)
+    runtime._residency = None
+    runtime._comprehension_prefetch = None
+    runtime._prefetch_comprehension()
+    assert runtime._comprehension_prefetch is None
+
+
+def test_the_system_prompt_is_cut_on_a_line_boundary() -> None:
+    """Egg's system message is structured text, not prose.
+
+    Slicing it mid-structure left the model completing the format instead of
+    answering it -- a reply that opened "user\\nLocal speech, already verified
+    as human speech by VAD:" rather than saying anything.
+    """
+
+    from egg_companion.adapters.omni import OmniAdapterClient
+
+    section = "## Observed\nsomething happened here\n"
+    system = {"role": "system", "content": "INSTRUCTIONS\n" + section * 800}
+    latest = {"role": "user", "content": "What did you hear?"}
+
+    fitted = OmniAdapterClient._fit_to_context([system, latest], 4096, 160)
+    content = str(fitted[0]["content"])
+
+    kept = content.split("\n\n[Earlier context omitted")[0]
+    # Whatever survived ends where a line ended, never part-way through one.
+    assert kept == kept.rstrip()
+    assert content.rstrip().endswith("[Earlier context omitted to fit the context window.]")
+    assert content.startswith("INSTRUCTIONS")

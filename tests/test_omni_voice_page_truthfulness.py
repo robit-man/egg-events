@@ -312,7 +312,13 @@ def test_comprehension_does_not_evict_the_daemon_it_speaks_through(monkeypatch) 
     costs["ollama_language"] = 15.6
     loaded["ollama_language"] = True
 
-    manager.register(component("omni_speech", 5))
+    # The real wiring registers the daemon as a small, always-resident
+    # transport: stopping it reclaims nothing, because its speech worker
+    # already exits after each utterance.
+    costs["omni_speech"] = 0.25
+    transport = component("omni_speech", 5)
+    object.__setattr__(transport, "always_resident", True)
+    manager.register(transport)
     manager.register(component("omni_comprehension", 10))
     manager.register(component("ollama_language", 8))
 
@@ -328,9 +334,12 @@ def test_comprehension_does_not_evict_the_daemon_it_speaks_through(monkeypatch) 
 
     async def use_comprehension() -> None:
         async with client._resident(client.COMPREHENSION_COMPONENT):
-            held.append(
-                manager._components["omni_speech"].pinned and loaded["omni_speech"]
-            )
+            # The daemon is up and serving for the whole request. It is not
+            # pinned by this call: its own always_resident flag protects it,
+            # and pinning it here would reserve the speech worker's budget
+            # for the daemon's lifetime -- which deadlocked the comprehension
+            # load against memory nothing was actually using.
+            held.append(loaded["omni_speech"])
 
     asyncio.run(use_comprehension())
 

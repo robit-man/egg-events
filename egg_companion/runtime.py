@@ -230,6 +230,8 @@ class CompanionRuntime:
         self._residency = build_residency_manager(config)
         self._omni_adapter = OmniAdapterClient(config.omni_adapter, self._residency)
         self._omni_adapter_start_attempt = 0.0
+        # Reload of the comprehension worker started while a reply plays.
+        self._comprehension_prefetch: asyncio.Task | None = None
         # Rolling, downscaled per-camera clips for the Omni video comprehension
         # path. A still frame cannot answer "what just happened"; this is the
         # only place in the runtime that retains motion over time, and it is
@@ -3107,6 +3109,39 @@ class CompanionRuntime:
             raise _BackgroundVisionPreempted from None
         finally:
             tasks.discard(task)
+
+    def _prefetch_comprehension(self) -> None:
+        """Start reloading the comprehension worker now the reply has played.
+
+        Speaking evicts it: comprehension and the speech worker do not fit
+        together on this module, so the reply takes its memory. That is the
+        right trade -- but it leaves the next thing said waiting out a 16.7
+        GiB load before Egg can even transcribe it, which is most of what a
+        slow turn is.
+
+        The moment playback ends, nothing needs that memory and the listener
+        is usually still deciding what to say. Reloading into that gap spends
+        it instead of the speaker's patience. It is deliberately
+        fire-and-forget: a prefetch that fails costs nothing, because the
+        next turn loads it the ordinary way.
+        """
+
+        if self._residency is None:
+            return
+        existing = self._comprehension_prefetch
+        if existing is not None and not existing.done():
+            return
+
+        async def warm() -> None:
+            try:
+                async with self._residency.require(
+                    OmniAdapterClient.COMPREHENSION_COMPONENT
+                ):
+                    pass
+            except Exception as error:  # noqa: BLE001 - best effort by design
+                logger.debug("comprehension prefetch skipped: %s", error)
+
+        self._comprehension_prefetch = asyncio.create_task(warm())
 
     async def _release_think_ring(self) -> None:
         """Put the ring back when a turn ends without a reply.
@@ -9829,6 +9864,7 @@ class CompanionRuntime:
                 await asyncio.to_thread(self._direction.try_set_led_state, "trace")
                 if not self.config.audio.barge_in_enabled:
                     self._asr_holdoff_until = time.monotonic() + 1.5
+                self._prefetch_comprehension()
             if result.outcome == "interrupted":
                 barge = self._conversation_turns.active_barge
                 if barge and barge.playback_id == playback.playback_id:
