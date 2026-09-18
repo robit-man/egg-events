@@ -2,6 +2,9 @@
 Description=Qwen Omni adapter for the Egg companion
 After=network-online.target ollama.service
 Wants=network-online.target
+# Child failure makes the foreground supervisor exit non-zero. Keep retrying;
+# adapter, portal, TTS, and tunnel are one self-healing service boundary.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

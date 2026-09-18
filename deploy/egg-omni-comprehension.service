@@ -2,6 +2,9 @@
 Description=Qwen3-Omni comprehension worker for the Egg companion
 After=network-online.target
 Wants=network-online.target
+# Failed admission is temporary: TTS/CUDA accounting may still be releasing.
+# Retry without a start-limit ceiling until the measured safe window fits.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,14 +13,15 @@ WorkingDirectory=@VENDOR_DIR@
 # admits it only when its measured footprint genuinely fits. Do not enable
 # this unit: booting it unconditionally is what over-commits the module.
 #
-# Pick the largest context that fits MemAvailable at each load, while retaining
-# the same reserve used by the residency manager. The configured token value is
-# a ceiling, not a promise to over-commit unified memory.
+# Pick the largest context from current MemAvailable, GGUF-derived KV growth,
+# and the observed before/after residency of successful loads. The gap to the
+# next standard window is calculated headroom. The configured token value is a
+# model/policy ceiling, not a machine-specific memory estimate.
 Environment=OMNI_COMPREHENSION_CONTEXT_TOKENS=@CONTEXT_TOKENS@
 Environment=OMNI_COMPREHENSION_MIN_CONTEXT_TOKENS=4096
-Environment=OMNI_COMPREHENSION_MEMORY_RESERVE_GIB=3.0
 Environment=OMNI_COMPREHENSION_PARALLEL=1
 Environment=OMNI_COMPREHENSION_CONTEXT_FILE=%t/egg-omni-comprehension-context
+Environment=OMNI_COMPREHENSION_CALIBRATION_FILE=@VENDOR_DIR@/runtime-data/state/comprehension-memory.json
 ExecStart=@VENDOR_DIR@/.venv/bin/python \
   @VENDOR_DIR@/runtime/comprehension_launcher.py \
   --state-file %t/egg-omni-comprehension-context -- \
@@ -27,10 +31,7 @@ ExecStart=@VENDOR_DIR@/.venv/bin/python \
   --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c {context} \
   --parallel {parallel} \
   --threads 4 --threads-batch 4 --poll 0 --poll-batch 0
-Restart=no
+Restart=always
+RestartSec=2
 TimeoutStopSec=60
 UMask=0077
-# Above the measured footprint with room for the load-time peak. The residency
-# manager is what prevents over-commit; this is only a backstop, and a cap that
-# kills the worker mid-utterance is worse than no cap at all.
-MemoryMax=26G

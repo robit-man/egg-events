@@ -14,6 +14,7 @@ def test_adapter_service_starts_no_model_weights_or_smoke_generations() -> None:
     assert "OMNI_LANGUAGE_API=openai" in unit
     assert "Wants=egg-omni-comprehension.service" not in unit
     assert "LLAMA_ARG_POLL=0" in unit
+    assert "StartLimitIntervalSec=0" in unit
 
 
 def test_comprehension_is_demand_only_and_does_not_busy_poll() -> None:
@@ -26,10 +27,14 @@ def test_comprehension_is_demand_only_and_does_not_busy_poll() -> None:
     assert "comprehension_launcher.py" in unit
     assert "-c {context}" in unit
     assert "--parallel {parallel}" in unit
-    assert "OMNI_COMPREHENSION_MEMORY_RESERVE_GIB=3.0" in unit
+    assert "OMNI_COMPREHENSION_MEMORY_RESERVE_GIB" not in unit
+    assert "OMNI_COMPREHENSION_CALIBRATION_FILE=" in unit
     assert "OMNI_COMPREHENSION_PARALLEL=1" in unit
     assert "OMNI_COMPREHENSION_CONTEXT_FILE=%t/" in unit
-    assert "MemoryMax=26G" in unit
+    assert "MemoryMax=" not in unit
+    assert "Restart=always" in unit
+    assert "RestartSec=2" in unit
+    assert "StartLimitIntervalSec=0" in unit
 
 
 def test_adapter_reads_the_context_the_launcher_actually_selected() -> None:
