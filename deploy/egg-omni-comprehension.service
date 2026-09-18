@@ -16,6 +16,7 @@ WorkingDirectory=@VENDOR_DIR@
 Environment=OMNI_COMPREHENSION_CONTEXT_TOKENS=@CONTEXT_TOKENS@
 Environment=OMNI_COMPREHENSION_MIN_CONTEXT_TOKENS=4096
 Environment=OMNI_COMPREHENSION_MEMORY_RESERVE_GIB=3.0
+Environment=OMNI_COMPREHENSION_PARALLEL=1
 Environment=OMNI_COMPREHENSION_CONTEXT_FILE=%t/egg-omni-comprehension-context
 ExecStart=@VENDOR_DIR@/.venv/bin/python \
   @VENDOR_DIR@/runtime/comprehension_launcher.py \
@@ -24,6 +25,7 @@ ExecStart=@VENDOR_DIR@/.venv/bin/python \
   -m @VENDOR_DIR@/runtime-data/components/comprehension-model.gguf \
   --mmproj @VENDOR_DIR@/runtime-data/components/comprehension-projector.gguf \
   --host 127.0.0.1 --port 8901 --jinja -ngl 99 -c {context} \
+  --parallel {parallel} \
   --threads 4 --threads-batch 4 --poll 0 --poll-batch 0
 Restart=no
 TimeoutStopSec=60
